@@ -7,7 +7,21 @@ export const maxDuration = 120
 // POST /api/chat - Send message and get AI response
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json()
+    // Parse request body with timeout protection
+    const body = await Promise.race([
+      request.json(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Request body parse timeout')), 10_000)
+      )
+    ]) as {
+      conversationId?: string
+      message?: string
+      workspaceId?: string
+      databaseId?: string
+      agentMode?: string
+      files?: { name: string; content: string; type: string }[]
+    }
+
     const { conversationId, message, workspaceId, databaseId, agentMode = 'auto', files = [] } = body
 
     if (!message || typeof message !== 'string') {
@@ -72,7 +86,7 @@ export async function POST(request: NextRequest) {
       { role: 'user' as const, content: message + schemaContext + fileContext }
     ]
 
-    // Call AI
+    // Call AI (chatCompletion already has error handling and fallback)
     const response = await chatCompletion({
       messages: [{ role: 'system', content: systemPrompt }, ...chatMessages],
       temperature: 0.7,
@@ -144,9 +158,12 @@ export async function POST(request: NextRequest) {
           }
         })
       } catch (dbError) {
-        console.error('Error updating database:', dbError)
+        console.error('[Chat API] Error updating database:', dbError)
+        // Non-fatal - continue to return response
       }
     }
+
+    const isFallback = response.model === 'synthforge-local-fallback'
 
     return NextResponse.json({
       conversationId: conversation.id,
@@ -160,13 +177,17 @@ export async function POST(request: NextRequest) {
         cost,
         options,
         reasoningSteps,
-        tablesJson
+        tablesJson,
+        isFallback
       }
     })
   } catch (error) {
-    console.error('Chat error:', error)
+    console.error('[Chat API] Unhandled error:', error)
     const msg = error instanceof Error ? error.message : 'Failed to process chat message'
-    return NextResponse.json({ error: msg }, { status: 500 })
+    return NextResponse.json({ 
+      error: msg,
+      hint: 'The AI service may be temporarily unavailable. Please try again.'
+    }, { status: 500 })
   }
 }
 

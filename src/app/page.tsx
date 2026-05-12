@@ -715,8 +715,8 @@ export default function SynthForgeApp() {
     if (isUser) {
       return (
         <motion.div {...messageSlideIn} className="flex justify-end">
-          <div className="max-w-[85%] bg-gradient-to-br from-amber-600 to-red-700 text-white rounded-2xl rounded-br-md px-4 py-2.5 shadow-sm">
-            <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
+          <div className="max-w-[90%] bg-gradient-to-br from-amber-600 to-red-700 text-white rounded-xl rounded-br-sm px-3 py-2 shadow-sm">
+            <p className="text-xs whitespace-pre-wrap">{msg.content}</p>
           </div>
         </motion.div>
       )
@@ -730,13 +730,13 @@ export default function SynthForgeApp() {
 
     return (
       <motion.div {...messageSlideIn} className="flex justify-start">
-        <div className="max-w-[90%] bg-muted/50 rounded-2xl rounded-bl-md px-4 py-3 shadow-sm">
+        <div className="max-w-[95%] bg-muted/50 rounded-xl rounded-bl-sm px-3 py-2.5 shadow-sm">
           {/* Agent Badge */}
-          <div className="flex items-center gap-2 mb-2">
+          <div className="flex items-center gap-1.5 mb-1.5">
             <AgentBadge name={msg.agentName} />
             {msg.tokensIn > 0 && (
-              <span className="text-[10px] text-muted-foreground">
-                {msg.tokensIn + msg.tokensOut} tokens · ${msg.cost.toFixed(4)}
+              <span className="text-[9px] text-muted-foreground">
+                {msg.tokensIn + msg.tokensOut} tok
               </span>
             )}
           </div>
@@ -747,27 +747,27 @@ export default function SynthForgeApp() {
           {/* SQL Code Section */}
           {msg.sqlCode && (
             <Collapsible
-              open={expandedSql[msg.id] ?? true}
+              open={expandedSql[msg.id] ?? false}
               onOpenChange={(o) => setExpandedSql(prev => ({ ...prev, [msg.id]: o }))}
             >
-              <CollapsibleTrigger className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors mt-3 cursor-pointer">
-                {expandedSql[msg.id] ?? true ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+              <CollapsibleTrigger className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors mt-2 cursor-pointer">
+                {expandedSql[msg.id] ?? false ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
                 <Code2 className="h-3 w-3" /> SQL
               </CollapsibleTrigger>
               <CollapsibleContent>
-                <div className="mt-1.5 relative group">
-                  <ScrollArea className="max-h-48">
-                    <pre className="bg-slate-900 text-green-400 p-3 rounded-lg text-xs font-mono overflow-x-auto">
+                <div className="mt-1 relative group">
+                  <ScrollArea className="max-h-36">
+                    <pre className="bg-slate-900 text-green-400 p-2 rounded-md text-[10px] font-mono overflow-x-auto">
                       <code>{msg.sqlCode}</code>
                     </pre>
                   </ScrollArea>
                   <Button
                     variant="ghost"
                     size="sm"
-                    className="absolute top-1.5 right-1.5 h-6 w-6 p-0 opacity-0 group-hover:opacity-100 transition-opacity bg-slate-800 text-slate-300 hover:text-white"
+                    className="absolute top-1 right-1 h-5 w-5 p-0 opacity-0 group-hover:opacity-100 transition-opacity bg-slate-800 text-slate-300 hover:text-white"
                     onClick={() => copyToClipboard(msg.sqlCode)}
                   >
-                    <Copy className="h-3 w-3" />
+                    <Copy className="h-2.5 w-2.5" />
                   </Button>
                 </div>
               </CollapsibleContent>
@@ -786,46 +786,46 @@ export default function SynthForgeApp() {
 
   // ─── Render: Chat Panel ────────────────────────────────
   const ChatPanel = () => (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full border-r">
       {/* Messages Area */}
       <ScrollArea className="flex-1">
-        <div className="p-4 space-y-4">
+        <div className="p-3 space-y-3">
           {messages.length === 0 && !isLoading && (
             <motion.div
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
-              className="flex flex-col items-center justify-center text-center py-16"
+              className="flex flex-col items-center justify-center text-center py-10"
             >
               <motion.div
                 initial={{ rotate: -10 }}
                 animate={{ rotate: 0 }}
                 transition={{ type: 'spring', stiffness: 200 }}
-                className="h-16 w-16 rounded-2xl bg-gradient-to-br from-amber-600 to-red-700 flex items-center justify-center mb-4 shadow-lg"
+                className="h-12 w-12 rounded-xl bg-gradient-to-br from-amber-600 to-red-700 flex items-center justify-center mb-3 shadow-lg"
               >
-                <Sparkles className="h-8 w-8 text-white" />
+                <Sparkles className="h-6 w-6 text-white" />
               </motion.div>
-              <h2 className="text-xl font-bold mb-2">SynthForge AI Data Agent</h2>
-              <p className="text-muted-foreground max-w-sm mb-8 text-sm">
-                Describe the data you need and our AI will generate realistic, privacy-safe synthetic data with proper relationships.
+              <h2 className="text-base font-bold mb-1">SynthForge AI</h2>
+              <p className="text-muted-foreground max-w-[200px] mb-6 text-xs">
+                Describe the data you need. AI generates realistic synthetic data.
               </p>
               <motion.div
                 variants={staggerContainer}
                 initial="initial"
                 animate="animate"
-                className="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full max-w-md"
+                className="grid grid-cols-1 gap-1.5 w-full"
               >
                 {[
-                  { icon: <Hash className="h-3.5 w-3.5" />, text: 'Generate 20 users with realistic profiles' },
-                  { icon: <Table2 className="h-3.5 w-3.5" />, text: 'Create e-commerce orders and products' },
-                  { icon: <Database className="h-3.5 w-3.5" />, text: 'Hospital management database schema' },
-                  { icon: <Code2 className="h-3.5 w-3.5" />, text: 'Student enrollment with courses and grades' }
+                  { icon: <Hash className="h-3 w-3" />, text: 'Generate 20 users' },
+                  { icon: <Table2 className="h-3 w-3" />, text: 'E-commerce orders' },
+                  { icon: <Database className="h-3 w-3" />, text: 'Hospital DB schema' },
+                  { icon: <Code2 className="h-3 w-3" />, text: 'Student enrollment' }
                 ].map((suggestion, i) => (
                   <motion.button
                     key={i}
                     variants={staggerItem}
-                    whileHover={{ scale: 1.02, y: -1 }}
+                    whileHover={{ scale: 1.01, y: -1 }}
                     whileTap={{ scale: 0.98 }}
-                    className="flex items-center gap-2 p-3 rounded-lg border bg-card hover:bg-muted/50 transition-colors text-left text-xs text-muted-foreground hover:text-foreground"
+                    className="flex items-center gap-2 p-2 rounded-md border bg-card hover:bg-muted/50 transition-colors text-left text-xs text-muted-foreground hover:text-foreground"
                     onClick={() => sendMessage(suggestion.text)}
                   >
                     {suggestion.icon}
@@ -847,9 +847,9 @@ export default function SynthForgeApp() {
               animate={{ opacity: 1, y: 0 }}
               className="flex justify-start"
             >
-              <div className="bg-muted/50 rounded-2xl rounded-bl-md px-4 py-3 flex items-center gap-2">
+              <div className="bg-muted/50 rounded-2xl rounded-bl-md px-3 py-2.5 flex items-center gap-2">
                 <Loader2 className="h-4 w-4 animate-spin text-amber-600" />
-                <span className="text-sm text-muted-foreground">AI is thinking<AnimatedDots /></span>
+                <span className="text-sm text-muted-foreground">Thinking<AnimatedDots /></span>
               </div>
             </motion.div>
           )}
@@ -859,23 +859,23 @@ export default function SynthForgeApp() {
       </ScrollArea>
 
       {/* Input Area */}
-      <div className="border-t bg-background p-3 shrink-0">
+      <div className="border-t bg-background p-2.5 shrink-0">
         {/* Attached Files */}
         {attachedFiles.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 mb-2">
+          <div className="flex flex-wrap gap-1 mb-1.5">
             {attachedFiles.map((file, i) => (
-              <Badge key={i} variant="secondary" className="gap-1 text-xs py-1">
-                <Paperclip className="h-3 w-3" />
-                {file.name}
+              <Badge key={i} variant="secondary" className="gap-1 text-[10px] py-0.5 px-1.5">
+                <Paperclip className="h-2.5 w-2.5" />
+                <span className="truncate max-w-[60px]">{file.name}</span>
                 <button onClick={() => removeFile(i)} className="hover:text-destructive transition-colors">
-                  <X className="h-3 w-3" />
+                  <X className="h-2.5 w-2.5" />
                 </button>
               </Badge>
             ))}
           </div>
         )}
 
-        <div className="flex items-end gap-2">
+        <div className="flex items-end gap-1.5">
           <input
             ref={fileInputRef}
             type="file"
@@ -890,10 +890,10 @@ export default function SynthForgeApp() {
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="h-8 w-8 shrink-0"
+                  className="h-7 w-7 shrink-0 p-0"
                   onClick={() => fileInputRef.current?.click()}
                 >
-                  <Paperclip className="h-4 w-4" />
+                  <Paperclip className="h-3.5 w-3.5" />
                 </Button>
               </TooltipTrigger>
               <TooltipContent>Attach files</TooltipContent>
@@ -906,24 +906,21 @@ export default function SynthForgeApp() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Describe the data you need..."
-              className="min-h-[38px] max-h-32 resize-none pr-12 text-sm"
+              placeholder="Describe data..."
+              className="min-h-[34px] max-h-24 resize-none text-xs py-1.5 px-2.5"
               disabled={isLoading}
               rows={1}
             />
-            <span className="absolute bottom-1.5 right-12 text-[10px] text-muted-foreground">
-              {input.length}/4000
-            </span>
           </div>
 
           <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
             <Button
               size="sm"
-              className="h-9 w-9 p-0 bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white shrink-0"
+              className="h-7 w-7 p-0 bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white shrink-0"
               onClick={handleSubmit}
               disabled={isLoading || (!input.trim() && attachedFiles.length === 0)}
             >
-              <Send className="h-4 w-4" />
+              <Send className="h-3.5 w-3.5" />
             </Button>
           </motion.div>
         </div>
@@ -938,22 +935,62 @@ export default function SynthForgeApp() {
 
     return (
       <Tabs value={rightTab} onValueChange={setRightTab} className="flex flex-col h-full">
-        <TabsList className="w-full justify-start rounded-none border-b bg-transparent h-10 px-2 shrink-0">
+        <TabsList className="w-full justify-start rounded-none border-b bg-transparent h-10 px-3 shrink-0">
           <TabsTrigger value="preview" className="text-xs data-[state=active]:bg-muted">Data Preview</TabsTrigger>
           <TabsTrigger value="schema" className="text-xs data-[state=active]:bg-muted">Schema</TabsTrigger>
-          <TabsTrigger value="sql" className="text-xs data-[state=active]:bg-muted">SQL Playground</TabsTrigger>
+          <TabsTrigger value="sql" className="text-xs data-[state=active]:bg-muted">SQL</TabsTrigger>
           <TabsTrigger value="explorer" className="text-xs data-[state=active]:bg-muted">Explorer</TabsTrigger>
         </TabsList>
 
         <TabsContent value="preview" className="flex-1 overflow-auto mt-0">
           <ScrollArea className="h-full">
             <div className="p-4 space-y-4">
-              {Object.keys(allTables).length === 0 ? (
-                <div className="text-center py-16">
-                  <Table2 className="h-10 w-10 mx-auto text-muted-foreground/30 mb-3" />
-                  <p className="text-sm font-medium text-muted-foreground mb-1">No data yet</p>
-                  <p className="text-xs text-muted-foreground">Chat with the AI to generate synthetic data</p>
+              {isLoading && Object.keys(allTables).length === 0 ? (
+                // Loading skeleton for data preview
+                <div className="space-y-4">
+                  {[1, 2].map(i => (
+                    <Card key={i}>
+                      <CardHeader className="pb-2">
+                        <div className="flex items-center justify-between">
+                          <Skeleton className="h-4 w-24" />
+                          <Skeleton className="h-5 w-14" />
+                        </div>
+                      </CardHeader>
+                      <CardContent>
+                        <div className="space-y-2">
+                          <div className="flex gap-4">
+                            {[1, 2, 3, 4].map(j => <Skeleton key={j} className="h-3 w-16" />)}
+                          </div>
+                          {[1, 2, 3, 4, 5].map(j => (
+                            <div key={j} className="flex gap-4">
+                              {[1, 2, 3, 4].map(k => <Skeleton key={k} className="h-3 w-20" />)}
+                            </div>
+                          ))}
+                        </div>
+                      </CardContent>
+                    </Card>
+                  ))}
                 </div>
+              ) : Object.keys(allTables).length === 0 ? (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  className="text-center py-20"
+                >
+                  <div className="h-16 w-16 rounded-2xl bg-gradient-to-br from-amber-100 to-red-50 flex items-center justify-center mx-auto mb-4">
+                    <Table2 className="h-8 w-8 text-amber-700/50" />
+                  </div>
+                  <p className="text-sm font-medium text-muted-foreground mb-1">No data yet</p>
+                  <p className="text-xs text-muted-foreground mb-4">Chat with the AI to generate synthetic data</p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="text-xs"
+                    onClick={() => setMobileStudioTab('chat')}
+                  >
+                    <MessageSquare className="h-3 w-3 mr-1" /> Start Chat
+                  </Button>
+                </motion.div>
               ) : (
                 Object.entries(allTables).map(([tableName, rows]) => (
                   <DataTable key={tableName} tableName={tableName} rows={rows} />
@@ -967,11 +1004,25 @@ export default function SynthForgeApp() {
           <ScrollArea className="h-full">
             <div className="p-4 space-y-4">
               {Object.keys(schemaObj).length === 0 ? (
-                <div className="text-center py-16">
-                  <Columns3 className="h-10 w-10 mx-auto text-muted-foreground/30 mb-3" />
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  className="text-center py-20"
+                >
+                  <div className="h-16 w-16 rounded-2xl bg-gradient-to-br from-amber-100 to-red-50 flex items-center justify-center mx-auto mb-4">
+                    <Columns3 className="h-8 w-8 text-amber-700/50" />
+                  </div>
                   <p className="text-sm font-medium text-muted-foreground mb-1">No schema defined</p>
-                  <p className="text-xs text-muted-foreground">Ask the AI to design a database schema</p>
-                </div>
+                  <p className="text-xs text-muted-foreground mb-4">Ask the AI to design a database schema</p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="text-xs"
+                    onClick={() => setMobileStudioTab('chat')}
+                  >
+                    <MessageSquare className="h-3 w-3 mr-1" /> Start Chat
+                  </Button>
+                </motion.div>
               ) : (
                 Object.entries(schemaObj).map(([tableName, def]) => (
                   <SchemaCard key={tableName} tableName={tableName} columns={(def as { columns: Record<string, string> }).columns} />
@@ -997,6 +1048,7 @@ export default function SynthForgeApp() {
               size="sm"
               className="bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white w-fit"
               onClick={runSqlPlayground}
+              disabled={!sqlQuery.trim()}
             >
               <Play className="h-3 w-3 mr-1" /> Run Query
             </Button>
@@ -1537,19 +1589,19 @@ export default function SynthForgeApp() {
         </header>
 
         {/* Main Studio Content */}
-        {/* Mobile: single panel with tabs */}
+        {/* Mobile: tab-based switching between chat and data */}
         <div className="flex-1 overflow-hidden md:hidden">
           {mobileStudioTab === 'chat' ? <ChatPanel /> : <DataWorkspace />}
         </div>
 
-        {/* Desktop: Resizable Panels */}
+        {/* Desktop: Resizable Panels — Chat 25% | Data 75% */}
         <div className="flex-1 overflow-hidden hidden md:block">
           <ResizablePanelGroup direction="horizontal">
-            <ResizablePanel defaultSize={55} minSize={30}>
+            <ResizablePanel defaultSize={25} minSize={15} maxSize={50}>
               <ChatPanel />
             </ResizablePanel>
             <ResizableHandle withHandle />
-            <ResizablePanel defaultSize={45} minSize={30}>
+            <ResizablePanel defaultSize={75} minSize={40}>
               <DataWorkspace />
             </ResizablePanel>
           </ResizablePanelGroup>
