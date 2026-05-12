@@ -1,35 +1,66 @@
-# Task 1: Frontend Development - SynthForge AI
+# Task: Rebuild SynthForge AI page.tsx
 
 ## Summary
-Built the complete SynthForge AI UI application as a single-page Next.js app at `src/app/page.tsx`.
+Completely rebuilt `/home/z/my-project/src/app/page.tsx` with all required enhancements.
 
-## What was done
-1. **Initialized fullstack environment** - Ran init script, confirmed project structure
-2. **Explored existing codebase** - Read all API routes (`/api/chat`, `/api/databases`, `/api/workspaces`, `/api/projects`, `/api/datasets`, `/api/upload`), the AI layer (`src/lib/ai.ts`), Prisma schema, and all UI components
-3. **Wrote complete page.tsx** (~1500 lines) with all 3 views:
-   - **Landing Page**: Marketing page with hero section (gradient text amber-600 to red-700), interactive demo card, features grid (6 cards), nav bar, footer
-   - **Dashboard View**: Left sidebar (w-72) with databases list and "+ New Database" button, main content with quick action cards and database grid
-   - **Studio View** (most complex): Multi-panel layout with:
-     - Top bar with back button, database name/badge, agent mode selector (Plan/Execute/Auto), export dropdown
-     - Left chat panel (55%): Messages with user/assistant styling, streaming indicator, agent name badges, expandable SQL code, reasoning steps timeline, clarification options, file upload
-     - Right data workspace (45%): 4 tabs (Data Preview, Schema, SQL Playground, Explorer)
+## Changes Made
 
-## Key Features Implemented
-- **Chat System**: SSE streaming via `/api/chat`, parses AI response JSON for structured data
-- **Agent Mode Selector**: Plan/Execute/Auto dropdown in studio header, sends `agentMode` parameter
-- **Interactive Clarification**: When AI responds with options, renders as clickable buttons that directly send the message
-- **Reasoning Steps**: Collapsible timeline with colored status indicators (green=completed, yellow=running, red=failed, gray=pending)
-- **File Upload**: Paperclip button, reads .sql/.csv/.json/.txt files, sends content with chat messages
-- **Data Preview**: Tables with pagination, row count badges
-- **Schema Visualization**: ERD-like overview with FK indicators, individual table cards with column types
-- **SQL Playground**: Monospace textarea, Run button, AI Generate button, results display
-- **Explorer Tab**: Tree view of all tables with row/column counts
-- **Export**: JSON/CSV/SQL dropdown that downloads generated data
-- **React Markdown**: Used for rendering assistant messages
+### 1. Non-Streaming Chat API Integration
+- Changed from SSE streaming to regular JSON response (`fetch` + `await res.json()`)
+- Removed `isStreaming` and `streamingContent` state, replaced with `isLoading`
+- Chat now sends `stream: false` and awaits the full JSON response
+- Response data includes `conversationId`, `message.content`, `message.sqlCode`, `message.agentName`, etc.
+- Added proper error handling with retry button in toast
 
-## Technical Decisions
-- Used `sendMessage()` as core function, `handleSubmit()` wraps it for input-based sends
-- Clarification options call `sendMessage()` directly (not via input state) for reliable message delivery
-- Combined data from both database `dataJson` and message `tablesJson` for comprehensive table display
-- Used `Collapsible` component for reasoning steps and SQL code blocks
-- All imports from `@/components/ui/...` and `lucide-react` as required
+### 2. Resizable Chat Panel
+- Used `ResizablePanelGroup` with `ResizablePanel` and `ResizableHandle` from `@/components/ui/resizable`
+- Left panel (Chat) default 55%, min 30%
+- Right panel (Data workspace) default 45%, min 30%
+- Drag handle with visual grip icon
+
+### 3. Fully Responsive Layout
+- **Mobile (<768px)**: Single column with tab toggle (Chat/Data) in studio header
+- **Desktop (>=768px)**: Full resizable panels layout
+- Dashboard sidebar collapses on mobile with hamburger menu
+- AnimatePresence for sidebar open/close animations
+
+### 4. Smooth Scrolling & Scrollbars
+- All scrollable areas use `ScrollArea` from shadcn/ui
+- Schema cards have max-height scrolling
+- Chat auto-scrolls to bottom on new messages
+- Data tables have scrollable content area
+- SQL playground results are scrollable
+
+### 5. Framer Motion Animations
+- Page transitions between views with fade-in effects
+- Message appear animations (slide in from bottom with spring physics)
+- Card hover effects (lift on hover)
+- Suggestion card stagger animations
+- Loading pulse with animated dots ("AI is thinking...")
+- Button hover transitions (scale + spring)
+- Sidebar slide animations
+- Feature cards stagger on viewport entry
+- Reasoning steps sequential animation
+
+### 6. Better Error Handling & Loading States
+- "AI is thinking..." with animated dots while waiting
+- Error toast with retry button
+- Empty states for all sections (no data, no schema, no tables)
+- Network error handling with user-friendly messages
+- Removed user message on error (optimistic update rollback)
+
+### 7. Spacing & Polish
+- Consistent spacing using Tailwind gap/padding utilities
+- Proper card spacing in dashboard
+- Chat message bubbles with proper max-widths
+- Better typography hierarchy
+- Proper text truncation in tables
+- Badge spacing consistency
+- Amber/red gradient for primary actions (from-amber-600 to-red-700)
+- No blue/indigo as primary colors
+
+## Files Modified
+- `/home/z/my-project/src/app/page.tsx` - Complete rewrite
+
+## Lint Status
+- Clean, no errors or warnings
