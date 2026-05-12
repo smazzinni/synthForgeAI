@@ -1,8 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { chatCompletion, chatCompletionStream, estimateCost, parseAgentResponse, getSystemPrompt, detectPII, scoreDataQuality, inferSchemaFromData } from '@/lib/ai'
+import { chatCompletion, chatCompletionStream, estimateCost, parseAgentResponse, getSystemPrompt, detectPII, scoreDataQuality, inferSchemaFromData, type AgentStep } from '@/lib/ai'
 
 export const maxDuration = 120
+
+// ─── Specialized subagent system prompts ────────────────────────
+const SCHEMA_AGENT_PROMPT = `You are the SynthForge AI Schema Agent. Design a database schema based on the user's request. Return a JSON object with the schema plan including tables, columns, types, and relationships. Use the standard SynthForge AI response format with action "generate".`
+
+const DATA_AGENT_PROMPT = `You are the SynthForge AI Data Generation Agent. Generate realistic synthetic data based on the provided schema and context. Return a JSON object with the generated tables. Use the standard SynthForge AI response format with action "generate". All data must be synthetic and privacy-safe. Maintain referential integrity. Generate at least 5-10 rows per table.`
+
+const QUALITY_AGENT_PROMPT = `You are the SynthForge AI Quality Agent. Review the generated data for quality issues: null values in important fields, duplicate IDs, orphan foreign keys, type mismatches, and data anomalies. If you find issues, suggest fixes and regenerate corrected data. Return a JSON object with action "generate" containing any corrected tables. If no issues, return the data unchanged.`
+
+function getSubagentPrompt(agentName: string): string {
+  if (agentName.includes('schema')) return SCHEMA_AGENT_PROMPT
+  if (agentName.includes('data')) return DATA_AGENT_PROMPT
+  if (agentName.includes('quality')) return QUALITY_AGENT_PROMPT
+  // Default: use the main auto-mode prompt
+  return getSystemPrompt('auto')
+}
 
 // POST /api/chat - Send message and get AI response
 export async function POST(request: NextRequest) {
@@ -112,10 +127,12 @@ export async function POST(request: NextRequest) {
       const conversationId_ = conversation.id
       const databaseId_ = conversation.databaseId
       const dbRef = database
+      const encoder = new TextEncoder()
 
       let fullContent = ''
       let tokensIn = 0
       let tokensOut = 0
+      let multiStepHandled = false
 
       const transformStream = new TransformStream<Uint8Array, Uint8Array>({
         async transform(chunk, controller) {
@@ -130,26 +147,116 @@ export async function POST(request: NextRequest) {
                 const event = JSON.parse(line.slice(6))
                 if (event.type === 'content') {
                   fullContent += event.data
-                } else if (event.type === 'done') {
+                } else if (event.type === 'done' && !multiStepHandled) {
                   tokensIn = event.data?.tokensIn || 0
                   tokensOut = event.data?.tokensOut || 0
 
+                  // Check for multi_step action
+                  const parsed = parseAgentResponse(fullContent)
+
+                  if (parsed?.action === 'multi_step' && parsed.steps && parsed.steps.length > 0) {
+                    // ─── Multi-Step Agent Execution ──────────────────
+                    multiStepHandled = true
+                    const agentSteps: AgentStep[] = parsed.steps
+                    let accumulatedContext = fullContent
+                    let allTables: Record<string, Record<string, unknown>[]> = {}
+
+                    // Emit initial step plan
+                    for (let i = 0; i < agentSteps.length; i++) {
+                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                        type: 'agent_step',
+                        data: { stepIndex: i, agent: agentSteps[i].agent, task: agentSteps[i].task, status: 'pending' }
+                      })}\n\n`))
+                    }
+
+                    // Execute each step sequentially
+                    for (let i = 0; i < agentSteps.length; i++) {
+                      const step = agentSteps[i]
+
+                      // Mark step as running
+                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                        type: 'agent_step',
+                        data: { stepIndex: i, agent: step.agent, task: step.task, status: 'running' }
+                      })}\n\n`))
+
+                      try {
+                        const subagentPrompt = getSubagentPrompt(step.agent)
+                        const stepResponse = await chatCompletion({
+                          messages: [
+                            { role: 'system', content: subagentPrompt },
+                            { role: 'user', content: `Task: ${step.task}\n\nPrevious context:\n${accumulatedContext.slice(-3000)}` }
+                          ],
+                          temperature: 0.7,
+                          maxTokens: 8192
+                        })
+
+                        const stepParsed = parseAgentResponse(stepResponse.content)
+                        const stepOutput = stepParsed?.explanation || stepResponse.content.slice(0, 200)
+
+                        // Accumulate tables from this step
+                        if (stepParsed?.tables) {
+                          allTables = { ...allTables, ...stepParsed.tables }
+                        }
+
+                        // Mark step as completed
+                        controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                          type: 'agent_step',
+                          data: {
+                            stepIndex: i, agent: step.agent, task: step.task,
+                            status: 'completed', output: stepOutput,
+                            tables: stepParsed?.tables ? Object.keys(stepParsed.tables) : []
+                          }
+                        })}\n\n`))
+
+                        accumulatedContext += `\n\nStep ${i + 1} (${step.agent}) output: ${stepOutput}`
+                        tokensIn += stepResponse.tokensIn
+                        tokensOut += stepResponse.tokensOut
+                      } catch (stepErr) {
+                        const stepErrMsg = stepErr instanceof Error ? stepErr.message : 'Step failed'
+                        controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                          type: 'agent_step',
+                          data: { stepIndex: i, agent: step.agent, task: step.task, status: 'failed', output: stepErrMsg }
+                        })}\n\n`))
+                      }
+                    }
+
+                    // If any tables were generated across all steps, emit them as content
+                    if (Object.keys(allTables).length > 0) {
+                      const finalContent = JSON.stringify({
+                        action: 'generate',
+                        agentName: 'orchestrator',
+                        explanation: parsed.explanation + '\n\nAll pipeline steps completed successfully.',
+                        tables: allTables,
+                        steps: agentSteps.map((s, idx) => ({ ...s, status: 'completed' })),
+                        reasoningSteps: parsed.reasoningSteps || []
+                      })
+                      fullContent = finalContent
+
+                      // Emit the final combined content as a content event
+                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                        type: 'content',
+                        data: finalContent
+                      })}\n\n`))
+                    }
+                  }
+
                   // Save the complete response to the database asynchronously
                   const cost = estimateCost(tokensIn, tokensOut)
-                  const parsed = parseAgentResponse(fullContent)
-                  const sqlCode = parsed?.sqlCode || ''
-                  const agentName = parsed?.agentName || currentAgentMode + '-agent'
-                  const options = parsed?.options || []
-                  const reasoningSteps = parsed?.reasoningSteps || []
-                  const tablesJson = parsed?.tables ? JSON.stringify(parsed.tables) : '{}'
+                  const finalParsed = parseAgentResponse(fullContent)
+                  const sqlCode = finalParsed?.sqlCode || ''
+                  const agentName = finalParsed?.agentName || currentAgentMode + '-agent'
+                  const options = finalParsed?.options || []
+                  const reasoningSteps = finalParsed?.reasoningSteps || []
+                  const stepsJson = finalParsed?.steps ? JSON.stringify(finalParsed.steps) : '[]'
+                  const tablesJson = finalParsed?.tables ? JSON.stringify(finalParsed.tables) : '{}'
 
                   // Run PII detection and quality scoring on generated data
                   let piiResult = null
                   let qualityScore = null
-                  if (parsed?.tables && Object.keys(parsed.tables).length > 0) {
+                  if (finalParsed?.tables && Object.keys(finalParsed.tables).length > 0) {
                     try {
-                      piiResult = detectPII(parsed.tables)
-                      qualityScore = scoreDataQuality(parsed.tables)
+                      piiResult = detectPII(finalParsed.tables)
+                      qualityScore = scoreDataQuality(finalParsed.tables)
                     } catch { /* non-fatal */ }
                   }
 
@@ -173,11 +280,11 @@ export async function POST(request: NextRequest) {
                       })
 
                       // Update database schema if tables were generated
-                      if (parsed?.tables && Object.keys(parsed.tables).length > 0 && dbRef) {
+                      if (finalParsed?.tables && Object.keys(finalParsed.tables).length > 0 && dbRef) {
                         try {
                           const currentSchema = JSON.parse(dbRef.schemaJson || '{}')
-                          for (const tableName of Object.keys(parsed.tables)) {
-                            const rows = parsed.tables[tableName]
+                          for (const tableName of Object.keys(finalParsed.tables)) {
+                            const rows = finalParsed.tables[tableName]
                             if (Array.isArray(rows) && rows.length > 0) {
                               const columns: Record<string, string> = {}
                               for (const [key, value] of Object.entries(rows[0])) {
@@ -192,7 +299,7 @@ export async function POST(request: NextRequest) {
                           }
 
                           const currentData = JSON.parse(dbRef.dataJson || '{}')
-                          for (const [tableName, rows] of Object.entries(parsed.tables)) {
+                          for (const [tableName, rows] of Object.entries(finalParsed.tables)) {
                             if (Array.isArray(rows)) currentData[tableName] = rows
                           }
 

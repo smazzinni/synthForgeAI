@@ -139,3 +139,33 @@
     scroll-behavior: smooth;
   }
 }
+
+/* ─── Chat Scrollbar Styling ──────────────────────────── */
+.chat-scroll-area {
+  scrollbar-width: thin;
+  scrollbar-color: #d4a05440 transparent;
+  scroll-behavior: smooth;
+}
+.chat-scroll-area::-webkit-scrollbar {
+  width: 5px;
+}
+.chat-scroll-area::-webkit-scrollbar-track {
+  background: transparent;
+}
+.chat-scroll-area::-webkit-scrollbar-thumb {
+  background: #d4a05440;
+  border-radius: 3px;
+  transition: background 0.2s;
+}
+.chat-scroll-area::-webkit-scrollbar-thumb:hover {
+  background: #d4a05480;
+}
+.dark .chat-scroll-area {
+  scrollbar-color: #d4a05460 transparent;
+}
+.dark .chat-scroll-area::-webkit-scrollbar-thumb {
+  background: #d4a05460;
+}
+.dark .chat-scroll-area::-webkit-scrollbar-thumb:hover {
+  background: #d4a054a0;
+}

@@ -13,7 +13,10 @@ import {
   PanelLeftClose, PanelLeft, Shield, RotateCcw, Gauge, GitBranch,
   Activity, Users, BarChart3, Clock, Layers, Settings,
   FileDown, ClipboardCheck, Rows3, Target, Network, StopCircle,
-  WifiOff
+  WifiOff, ArrowDown, CheckCircle2, XCircle, Ban, HelpCircle,
+  AlignLeft, Terminal, ZoomIn, ZoomOut, Maximize2, Move,
+  GitFork, Sitemap, Search, AlertTriangle, ListOrdered,
+  Wrench, Bug, CheckCheck, Clock3, Bot, Cpu
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -63,6 +66,8 @@ interface Message {
   schemaVersion?: number
   isError?: boolean
   isStreaming?: boolean
+  isCancelled?: boolean
+  generationStatus?: 'thinking' | 'generating' | 'completed' | 'failed' | 'cancelled'
 }
 interface Conversation { id: string; title: string; messages: Message[] }
 
@@ -79,6 +84,27 @@ interface ClarificationOption {
   label: string
   value: string
   description?: string
+}
+
+interface AgentStepUI {
+  agent: string
+  task: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
+  output?: string
+  tables?: string[]
+}
+
+interface QualityReportData {
+  overallScore: number
+  totalTables: number
+  totalRows: number
+  totalIssues: number
+  criticalCount: number
+  warningCount: number
+  infoCount: number
+  tables: { table: string; rowCount: number; columnCount: number; score: number; issues: { table: string; column?: string; type: string; severity: string; message: string; count: number; recoverable: boolean }[] }[]
+  fixesApplied: number
+  fixDetails: { table: string; column?: string; type: string; severity: string; message: string; count: number; recoverable: boolean; before?: unknown; after?: unknown }[]
 }
 
 type View = 'landing' | 'dashboard' | 'studio'
@@ -355,19 +381,40 @@ export default function SynthForgeApp() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [mobileStudioTab, setMobileStudioTab] = useState<'chat' | 'data'>('chat')
   const [schemaVersionCount, setSchemaVersionCount] = useState(0)
-  const [rowCountInput, setRowCountInput] = useState<string>('')
-  const [rowCountError, setRowCountError] = useState<string>('')
   const [isDragOver, setIsDragOver] = useState(false)
   const [totalTokens, setTotalTokens] = useState(0)
   const [showSchemaTemplates, setShowSchemaTemplates] = useState(false)
   const [isOnline, setIsOnline] = useState(true)
   const [isNearBottom, setIsNearBottom] = useState(true)
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false)
+  const [sqlSuggestion, setSqlSuggestion] = useState<string>('')
+  const [showSqlSuggestion, setShowSqlSuggestion] = useState(false)
+  const [sqlValidationError, setSqlValidationError] = useState<string>('')
+  const [explorerView, setExplorerView] = useState<'tree' | 'graph'>('tree')
+  const [topologicalSortResult, setTopologicalSortResult] = useState<string[] | null>(null)
+  const [cutpoints, setCutpoints] = useState<string[] | null>(null)
+  const [selectedGraphNode, setSelectedGraphNode] = useState<string | null>(null)
+  const [reachableTables, setReachableTables] = useState<string[] | null>(null)
+  const [constraintClosureResult, setConstraintClosureResult] = useState<{ from: string; to: string; via: string; cascades: string[] }[] | null>(null)
+  const [qualityReport, setQualityReport] = useState<QualityReportData | null>(null)
+  const [isQualityCheckRunning, setIsQualityCheckRunning] = useState(false)
+  const [showQualityReport, setShowQualityReport] = useState(false)
+  const [agentSteps, setAgentSteps] = useState<AgentStepUI[]>([])
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const graphSvgRef = useRef<SVGSVGElement>(null)
+  const graphTransformRef = useRef({ x: 0, y: 0, scale: 1 })
+  const graphDragRef = useRef<{ isDragging: boolean; startX: number; startY: number; startTransformX: number; startTransformY: number }>({ isDragging: false, startX: 0, startY: 0, startTransformX: 0, startTransformY: 0 })
+  const erSvgRef = useRef<SVGSVGElement>(null)
+  const erTransformRef = useRef({ x: 0, y: 0, scale: 1 })
+  const erDragRef = useRef<{ isDragging: boolean; startX: number; startY: number; startTransformX: number; startTransformY: number; target: string | null }>({ isDragging: false, startX: 0, startY: 0, startTransformX: 0, startTransformY: 0, target: null })
+  const erTablePositionsRef = useRef<Record<string, { x: number; y: number }>>({})
   const chatScrollRef = useRef<HTMLDivElement>(null)
   const chatInputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const abortControllerRef = useRef<AbortController | null>(null)
+  const inputValueRef = useRef<string>('')
+  const streamingIdRef = useRef<string | null>(null)
   const { toast } = useToast()
 
   // ─── Network status tracking ────────────────────────
@@ -388,14 +435,21 @@ export default function SynthForgeApp() {
     loadWorkspaces()
   }, [])
 
-  // ─── Smart auto-scroll: only scroll if near bottom ────
+  // ─── Smart auto-scroll with requestAnimationFrame ──
   useEffect(() => {
-    if (isNearBottom && messagesEndRef.current) {
-      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' })
+    if (isNearBottom && chatScrollRef.current) {
+      requestAnimationFrame(() => {
+        if (chatScrollRef.current) {
+          chatScrollRef.current.scrollTo({
+            top: chatScrollRef.current.scrollHeight,
+            behavior: 'smooth'
+          })
+        }
+      })
     }
   }, [messages, isLoading, isNearBottom])
 
-  // Track scroll position for near-bottom detection
+  // Track scroll position for near-bottom detection & scroll-to-bottom button
   useEffect(() => {
     const scrollContainer = chatScrollRef.current
     if (!scrollContainer) return
@@ -404,6 +458,7 @@ export default function SynthForgeApp() {
       const { scrollTop, scrollHeight, clientHeight } = scrollContainer
       const nearBottom = scrollHeight - scrollTop - clientHeight < 150
       setIsNearBottom(nearBottom)
+      setShowScrollToBottom(!nearBottom)
     }
 
     scrollContainer.addEventListener('scroll', handleScroll, { passive: true })
@@ -424,28 +479,6 @@ export default function SynthForgeApp() {
       }
     }
   }, [])
-
-  // ─── Validate row count ──────────────────────────────
-  const validateRowCount = useCallback((value: string): { valid: boolean; parsed: number | null; error: string } => {
-    if (!value.trim()) return { valid: true, parsed: null, error: '' }
-    const num = Number(value)
-    if (!Number.isInteger(num) || num < 1 || num > 10000) {
-      return { valid: false, parsed: null, error: 'Enter a whole number between 1 and 10,000' }
-    }
-    return { valid: true, parsed: num, error: '' }
-  }, [])
-
-  const handleRowCountChange = useCallback((value: string) => {
-    setRowCountInput(value)
-    const { error } = validateRowCount(value)
-    setRowCountError(error)
-  }, [validateRowCount])
-
-  // ─── Parsed row count (null if empty/invalid) ─────────
-  const parsedRowCount = useMemo((): number | null => {
-    const { valid, parsed } = validateRowCount(rowCountInput)
-    return valid ? parsed : null
-  }, [rowCountInput, validateRowCount])
 
   const loadWorkspaces = async () => {
     try {
@@ -523,10 +556,8 @@ export default function SynthForgeApp() {
 
     const msgText = messageText.trim() || 'Generate data from the attached file(s)'
     setInput('')
+    inputValueRef.current = ''
     setIsLoading(true)
-
-    // Build row context only if user has specified a count
-    const rowContext = parsedRowCount ? ` (Generate approximately ${parsedRowCount} rows per table)` : ''
 
     // Optimistic user message with proper ID format
     const tempId = `usr-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
@@ -565,8 +596,10 @@ export default function SynthForgeApp() {
       reasoningSteps: '[]',
       options: '[]',
       tablesJson: '{}',
-      isStreaming: true
+      isStreaming: true,
+      generationStatus: 'thinking'
     }
+    streamingIdRef.current = streamId
     setMessages(prev => [...prev, streamMsg])
 
     try {
@@ -577,10 +610,9 @@ export default function SynthForgeApp() {
           conversationId: conversation?.id || null,
           databaseId: activeDb.id,
           workspaceId: activeWorkspace?.id,
-          message: msgText + rowContext,
+          message: msgText,
           stream: true,
           agentMode,
-          rowCount: parsedRowCount,
           files: files.map(f => ({ name: f.name, content: f.content, type: f.type }))
         }),
         signal: controller.signal
@@ -622,7 +654,7 @@ export default function SynthForgeApp() {
                 fullContent += event.data
                 setMessages(prev => prev.map(m =>
                   m.id === streamId
-                    ? { ...m, content: fullContent }
+                    ? { ...m, content: fullContent, generationStatus: 'generating' as const }
                     : m
                 ))
               } else if (event.type === 'done') {
@@ -655,6 +687,7 @@ export default function SynthForgeApp() {
                     ? {
                         ...m,
                         isStreaming: false,
+                        generationStatus: 'completed' as const,
                         tokensIn,
                         tokensOut,
                         cost: (tokensIn / 1_000_000) * 0.27 + (tokensOut / 1_000_000) * 1.10,
@@ -670,6 +703,23 @@ export default function SynthForgeApp() {
                 ))
               } else if (event.type === 'error') {
                 throw new Error(event.data || 'Stream error')
+              } else if (event.type === 'agent_step') {
+                // Handle multi-agent pipeline step updates
+                const stepData = event.data as { stepIndex: number; agent: string; task: string; status: string; output?: string; tables?: string[] }
+                setAgentSteps(prev => {
+                  const updated = [...prev]
+                  while (updated.length <= stepData.stepIndex) {
+                    updated.push({ agent: '', task: '', status: 'pending' })
+                  }
+                  updated[stepData.stepIndex] = {
+                    agent: stepData.agent,
+                    task: stepData.task,
+                    status: stepData.status as AgentStepUI['status'],
+                    output: stepData.output,
+                    tables: stepData.tables
+                  }
+                  return updated
+                })
               }
             } catch (parseErr) {
               // Non-JSON line, skip
@@ -683,18 +733,20 @@ export default function SynthForgeApp() {
 
       // If streaming ended without a 'done' event, mark as complete
       setMessages(prev => prev.map(m =>
-        m.id === streamId ? { ...m, isStreaming: false } : m
+        m.id === streamId ? { ...m, isStreaming: false, generationStatus: 'completed' as const } : m
       ))
 
       await refreshDatabase(activeDb.id)
     } catch (error) {
-      // Remove streaming placeholder
-      setMessages(prev => prev.filter(m => m.id !== streamId))
-
       if (error instanceof DOMException && error.name === 'AbortError') {
         structuredLog('info', 'Chat request aborted by user')
-        // Don't show error for user-initiated aborts
+        // Mark streaming message as cancelled (keep partial content)
+        setMessages(prev => prev.map(m =>
+          m.id === streamId ? { ...m, isStreaming: false, isCancelled: true, generationStatus: 'cancelled' as const } : m
+        ))
       } else {
+        // Remove streaming placeholder on real errors
+        setMessages(prev => prev.filter(m => m.id !== streamId))
         const errMsg = error instanceof Error ? error.message : 'Failed to get response'
         structuredLog('error', 'Chat request failed', errMsg)
 
@@ -712,10 +764,11 @@ export default function SynthForgeApp() {
     } finally {
       setIsLoading(false)
       abortControllerRef.current = null
+      streamingIdRef.current = null
       // Return focus to chat input
       chatInputRef.current?.focus()
     }
-  }, [isLoading, activeDb, conversation, activeWorkspace, toast, agentMode, parsedRowCount])
+  }, [isLoading, activeDb, conversation, activeWorkspace, toast, agentMode])
 
   // ─── Abort generation ───────────────────────────────
   const handleAbort = useCallback(() => {
@@ -723,6 +776,13 @@ export default function SynthForgeApp() {
       abortControllerRef.current.abort()
       abortControllerRef.current = null
       setIsLoading(false)
+      // Mark the streaming message as cancelled
+      if (streamingIdRef.current) {
+        setMessages(prev => prev.map(m =>
+          m.id === streamingIdRef.current ? { ...m, isStreaming: false, isCancelled: true, generationStatus: 'cancelled' as const } : m
+        ))
+        streamingIdRef.current = null
+      }
     }
   }, [])
 
@@ -732,8 +792,20 @@ export default function SynthForgeApp() {
     if (!msg) return
     // Remove error state, re-send
     setMessages(prev => prev.map(m => m.id === msgId ? { ...m, isError: false } : m))
-    // Extract original text (strip row context if present)
     const originalText = msg.content.replace(/ \(Generate approximately \d+ rows per table\)/, '')
+    sendMessage(originalText)
+  }, [messages, sendMessage])
+
+  // ─── Regenerate assistant message ─────────────────────
+  const handleRegenerate = useCallback((msgId: string) => {
+    // Find the user message before this assistant message
+    const msgIdx = messages.findIndex(m => m.id === msgId)
+    if (msgIdx < 1) return
+    const prevMsg = messages[msgIdx - 1]
+    if (prevMsg.role !== 'user') return
+    // Remove the current assistant message and resend
+    setMessages(prev => prev.filter(m => m.id !== msgId))
+    const originalText = prevMsg.content.replace(/ \(Generate approximately \d+ rows per table\)/, '')
     sendMessage(originalText)
   }, [messages, sendMessage])
 
@@ -742,10 +814,9 @@ export default function SynthForgeApp() {
     const msgText = input.trim()
     const files = [...attachedFiles]
     if (!msgText && files.length === 0) return
-    if (rowCountError) return
     setAttachedFiles([])
     await sendMessage(msgText, files)
-  }, [input, attachedFiles, sendMessage, rowCountError])
+  }, [input, attachedFiles, sendMessage])
 
   // ─── Memoized computed values ──────────────────────────
   const getTablesFromMessages = useMemo((): Record<string, Record<string, unknown>[]> => {
@@ -1031,6 +1102,35 @@ export default function SynthForgeApp() {
     }
   }
 
+  // ─── SQL Validation ──────────────────────────────────
+  const validateSql = useCallback((sql: string) => {
+    if (!sql.trim()) {
+      setSqlValidationError('')
+      return
+    }
+    // Check for unbalanced parentheses
+    let parenCount = 0
+    for (const char of sql) {
+      if (char === '(') parenCount++
+      if (char === ')') parenCount--
+      if (parenCount < 0) {
+        setSqlValidationError('Unbalanced parentheses: extra closing ")"')
+        return
+      }
+    }
+    if (parenCount > 0) {
+      setSqlValidationError(`Unbalanced parentheses: missing ${parenCount} closing ")"`)
+      return
+    }
+    // Check for common syntax issues
+    const upperSql = sql.toUpperCase().trim()
+    if (upperSql.endsWith('FROM') || upperSql.endsWith('SELECT') || upperSql.endsWith('WHERE') || upperSql.endsWith('JOIN') || upperSql.endsWith('ON')) {
+      setSqlValidationError('Query appears incomplete (ends with a keyword)')
+      return
+    }
+    setSqlValidationError('')
+  }, [])
+
   // ─── Schema templates ────────────────────────────────
   const schemaTemplates: { name: string; desc: string; schema: Record<string, unknown> }[] = useMemo(() => [
     { name: 'E-Commerce', desc: 'Users, Products, Orders', schema: { users: { columns: { id: 'SERIAL', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR', city: 'VARCHAR', state: 'VARCHAR', created_at: 'TIMESTAMP' } }, products: { columns: { id: 'SERIAL', name: 'VARCHAR', category: 'VARCHAR', price: 'DECIMAL', stock: 'INTEGER', description: 'VARCHAR' } }, orders: { columns: { id: 'SERIAL', user_id: 'INTEGER', product_id: 'INTEGER', quantity: 'INTEGER', total_amount: 'DECIMAL', status: 'VARCHAR', order_date: 'TIMESTAMP' } } } },
@@ -1236,13 +1336,496 @@ export default function SynthForgeApp() {
     )
   }
 
-  // ─── Render: Entity-Relationship Diagram (text-based) ──
-  const SchemaVisualization = () => {
+  // ─── Quality Check Handler ────────────────────────────
+  const runQualityCheck = useCallback(async (autoFix = false) => {
+    if (!activeDb || isQualityCheckRunning) return
+    setIsQualityCheckRunning(true)
+    try {
+      const res = await fetch('/api/quality', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ databaseId: activeDb.id, autoFix })
+      })
+      const data = await res.json()
+      if (data.report) {
+        setQualityReport(data.report)
+        setShowQualityReport(true)
+        if (autoFix && data.report.fixesApplied > 0) {
+          toast({ title: 'Fixes Applied', description: `${data.report.fixesApplied} issue(s) auto-fixed` })
+          await refreshDatabase(activeDb.id)
+        }
+      }
+    } catch {
+      toast({ title: 'Error', description: 'Quality check failed', variant: 'destructive' })
+    } finally {
+      setIsQualityCheckRunning(false)
+    }
+  }, [activeDb, isQualityCheckRunning, toast])
+
+  // ─── AgentPipeline Component ─────────────────────────
+  const AgentPipeline = ({ steps }: { steps: AgentStepUI[] }) => {
+    if (!steps || steps.length === 0) return null
+    const completedCount = steps.filter(s => s.status === 'completed' || s.status === 'failed').length
+    const progress = steps.length > 0 ? (completedCount / steps.length) * 100 : 0
+
+    const getAgentIcon = (agentName: string) => {
+      if (agentName.includes('schema')) return <Brain className="h-3.5 w-3.5" />
+      if (agentName.includes('data')) return <Database className="h-3.5 w-3.5" />
+      if (agentName.includes('quality')) return <CheckCheck className="h-3.5 w-3.5" />
+      return <Bot className="h-3.5 w-3.5" />
+    }
+
+    const getStatusIcon = (status: string) => {
+      if (status === 'completed') return <Check className="h-3 w-3 text-green-600" />
+      if (status === 'running') return <Loader2 className="h-3 w-3 text-amber-600 animate-spin" />
+      if (status === 'failed') return <XCircle className="h-3 w-3 text-red-600" />
+      return <Clock3 className="h-3 w-3 text-slate-400" />
+    }
+
+    return (
+      <div className="mt-3 pt-2 border-t border-border/50">
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+            <Cpu className="h-3.5 w-3.5" /> Agent Pipeline
+          </div>
+          <span className="text-[10px] text-muted-foreground">
+            Step {completedCount}/{steps.length} complete
+          </span>
+        </div>
+        {/* Progress bar */}
+        <div className="h-1.5 bg-muted rounded-full overflow-hidden mb-2">
+          <motion.div
+            className="h-full bg-gradient-to-r from-amber-500 to-amber-600 rounded-full"
+            initial={{ width: 0 }}
+            animate={{ width: `${progress}%` }}
+            transition={{ duration: 0.5, ease: 'easeOut' }}
+          />
+        </div>
+        {/* Steps timeline */}
+        <div className="space-y-1.5">
+          {steps.map((step, i) => (
+            <motion.div
+              key={i}
+              initial={{ opacity: 0, x: -8 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ delay: i * 0.1 }}
+              className="flex items-start gap-2"
+            >
+              <div className="mt-0.5 shrink-0">{getStatusIcon(step.status)}</div>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-medium">{getAgentIcon(step.agent)} {step.agent}</span>
+                  <Badge variant="outline" className="text-[9px] px-1 py-0 h-3.5">
+                    {step.status}
+                  </Badge>
+                </div>
+                <p className="text-[11px] text-muted-foreground">{step.task}</p>
+                {step.output && step.status === 'completed' && (
+                  <p className="text-[10px] text-green-700 mt-0.5 font-mono leading-tight truncate max-w-[300px]">
+                    {step.output}
+                  </p>
+                )}
+                {step.output && step.status === 'failed' && (
+                  <p className="text-[10px] text-red-700 mt-0.5 font-mono leading-tight truncate max-w-[300px]">
+                    {step.output}
+                  </p>
+                )}
+              </div>
+            </motion.div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  // ─── Quality Report Panel Component ────────────────────
+  const QualityReportPanel = () => {
+    if (!qualityReport) return null
+    const scoreColor = qualityReport.overallScore >= 80 ? 'text-green-600' : qualityReport.overallScore >= 60 ? 'text-yellow-600' : 'text-red-600'
+    const scoreBg = qualityReport.overallScore >= 80 ? 'bg-green-50 border-green-200' : qualityReport.overallScore >= 60 ? 'bg-yellow-50 border-yellow-200' : 'bg-red-50 border-red-200'
+
+    return (
+      <Dialog open={showQualityReport} onOpenChange={setShowQualityReport}>
+        <DialogContent className="max-w-lg max-h-[80vh] overflow-auto">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Gauge className="h-5 w-5 text-amber-700" />
+              Data Quality Report
+            </DialogTitle>
+            <DialogDescription>
+              Quality analysis of your generated data
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 mt-2">
+            {/* Overall Score */}
+            <div className={`rounded-lg border p-4 text-center ${scoreBg}`}>
+              <div className={`text-4xl font-bold ${scoreColor}`}>{qualityReport.overallScore}</div>
+              <div className="text-xs text-muted-foreground mt-1">Overall Quality Score</div>
+            </div>
+
+            {/* Summary Stats */}
+            <div className="grid grid-cols-4 gap-2">
+              <div className="text-center p-2 rounded bg-muted/50">
+                <div className="text-sm font-semibold">{qualityReport.totalTables}</div>
+                <div className="text-[10px] text-muted-foreground">Tables</div>
+              </div>
+              <div className="text-center p-2 rounded bg-muted/50">
+                <div className="text-sm font-semibold">{qualityReport.totalRows}</div>
+                <div className="text-[10px] text-muted-foreground">Rows</div>
+              </div>
+              <div className="text-center p-2 rounded bg-red-50">
+                <div className="text-sm font-semibold text-red-700">{qualityReport.criticalCount}</div>
+                <div className="text-[10px] text-red-600">Critical</div>
+              </div>
+              <div className="text-center p-2 rounded bg-yellow-50">
+                <div className="text-sm font-semibold text-yellow-700">{qualityReport.warningCount}</div>
+                <div className="text-[10px] text-yellow-600">Warnings</div>
+              </div>
+            </div>
+
+            {/* Per-table breakdown */}
+            {qualityReport.tables.map((t) => (
+              <Card key={t.table} className="overflow-hidden">
+                <CardHeader className="pb-2 px-4 pt-3">
+                  <div className="flex items-center justify-between">
+                    <CardTitle className="text-xs font-semibold flex items-center gap-2">
+                      <Table2 className="h-3.5 w-3.5 text-amber-700" />
+                      {t.table}
+                    </CardTitle>
+                    <div className="flex items-center gap-2">
+                      <Badge variant="secondary" className="text-[10px]">{t.rowCount} rows</Badge>
+                      <Badge className={`text-[10px] ${t.score >= 80 ? 'bg-green-100 text-green-800' : t.score >= 60 ? 'bg-yellow-100 text-yellow-800' : 'bg-red-100 text-red-800'}`}>
+                        {t.score}/100
+                      </Badge>
+                    </div>
+                  </div>
+                </CardHeader>
+                {t.issues.length > 0 && (
+                  <CardContent className="px-4 pb-3 pt-0">
+                    <div className="space-y-1 mt-1">
+                      {t.issues.map((issue, j) => (
+                        <div key={j} className={`text-[11px] px-2 py-1 rounded flex items-start gap-1.5 ${issue.severity === 'critical' ? 'bg-red-50 text-red-800' : issue.severity === 'warning' ? 'bg-yellow-50 text-yellow-800' : 'bg-sky-50 text-sky-800'}`}>
+                          {issue.severity === 'critical' ? <AlertCircle className="h-3 w-3 shrink-0 mt-0.5" /> : issue.severity === 'warning' ? <AlertTriangle className="h-3 w-3 shrink-0 mt-0.5" /> : <Circle className="h-3 w-3 shrink-0 mt-0.5" />}
+                          <span>{issue.message}</span>
+                          {issue.recoverable && <Badge className="text-[8px] ml-1 bg-emerald-100 text-emerald-700 h-3.5 px-1">fixable</Badge>}
+                        </div>
+                      ))}
+                    </div>
+                  </CardContent>
+                )}
+              </Card>
+            ))}
+
+            {/* Fix Details */}
+            {qualityReport.fixesApplied > 0 && (
+              <div className="rounded-lg border border-green-200 bg-green-50 p-3">
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-green-800 mb-2">
+                  <CheckCheck className="h-3.5 w-3.5" />
+                  {qualityReport.fixesApplied} fix(es) applied
+                </div>
+                <div className="space-y-1 max-h-32 overflow-y-auto">
+                  {qualityReport.fixDetails.map((fix, i) => (
+                    <div key={i} className="text-[11px] text-green-700">
+                      <span className="font-medium">{fix.table}.{fix.column || 'row'}</span>: {fix.message}
+                      {fix.before !== undefined && fix.after !== undefined && (
+                        <span className="font-mono ml-1">({String(fix.before).slice(0, 20)} → {String(fix.after).slice(0, 20)})</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Auto-fix button */}
+            {qualityReport.totalIssues > 0 && qualityReport.fixesApplied === 0 && (
+              <Button
+                onClick={() => runQualityCheck(true)}
+                disabled={isQualityCheckRunning}
+                className="w-full gap-2"
+              >
+                <Wrench className="h-4 w-4" />
+                {isQualityCheckRunning ? 'Fixing...' : 'Auto-Fix Recoverable Issues'}
+              </Button>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
+    )
+  }
+
+  // ─── Graph analysis utilities ─────────────────────────
+  const buildDependencyGraph = useCallback(() => {
     const schema = getSchemaFromDb
     const tables = getTablesFromMessages
     const allTableNames = new Set([...Object.keys(tables), ...Object.keys(schema)])
+    const edges: { from: string; to: string; via: string }[] = []
+    const adj: Record<string, string[]> = {}
+    const revAdj: Record<string, string[]> = {}
 
-    if (allTableNames.size === 0) {
+    for (const name of allTableNames) {
+      adj[name] = []
+      revAdj[name] = []
+    }
+
+    for (const tableName of allTableNames) {
+      const tableSchema = schema[tableName]
+      if (tableSchema?.columns) {
+        for (const colName of Object.keys(tableSchema.columns)) {
+          if (colName.endsWith('_id') && colName !== 'id') {
+            const refTableName = colName.replace(/_id$/, '') + 's'
+            if (allTableNames.has(refTableName)) {
+              edges.push({ from: tableName, to: refTableName, via: colName })
+              adj[tableName].push(refTableName)
+              revAdj[refTableName].push(tableName)
+            }
+          }
+        }
+      }
+    }
+
+    return { allTableNames, edges, adj, revAdj }
+  }, [getSchemaFromDb, getTablesFromMessages])
+
+  const topologicalSort = useCallback(() => {
+    const { allTableNames, adj } = buildDependencyGraph()
+    const inDegree: Record<string, number> = {}
+    for (const name of allTableNames) inDegree[name] = 0
+    for (const name of allTableNames) {
+      for (const dep of adj[name]) {
+        inDegree[dep] = (inDegree[dep] || 0) + 1
+      }
+    }
+    // Wait, this is wrong. We want tables with no dependencies first.
+    // adj[A] = [B] means A depends on B (A has FK to B)
+    // So in-degree for topological sort: B has in-degree from A
+    // We want to process tables that have no incoming edges first (no one depends on them)
+    // Actually, for dependency order: tables with no FK deps first
+    // adj[A] contains tables A depends on. So we reverse: revAdj[A] = tables that depend on A
+    // For topo sort: start with tables that have no dependencies (adj[name] is empty)
+    const sorted: string[] = []
+    const queue: string[] = []
+    const visited = new Set<string>()
+
+    // Start with tables that have no dependencies
+    for (const name of allTableNames) {
+      if (adj[name].length === 0) queue.push(name)
+    }
+
+    while (queue.length > 0) {
+      const current = queue.shift()!
+      if (visited.has(current)) continue
+      visited.add(current)
+      sorted.push(current)
+
+      // Find tables that depend on current and check if all their deps are visited
+      const { revAdj: ra } = buildDependencyGraph()
+      for (const dependent of ra[current] || []) {
+        const allDepsVisited = adj[dependent].every((dep: string) => visited.has(dep))
+        if (allDepsVisited && !visited.has(dependent)) {
+          queue.push(dependent)
+        }
+      }
+    }
+
+    // Add any remaining (cycle) tables
+    for (const name of allTableNames) {
+      if (!visited.has(name)) sorted.push(name)
+    }
+
+    setTopologicalSortResult(sorted)
+    return sorted
+  }, [buildDependencyGraph])
+
+  const findCutpoints = useCallback(() => {
+    const { allTableNames, adj } = buildDependencyGraph()
+    if (allTableNames.size <= 2) {
+      setCutpoints(Array.from(allTableNames))
+      return Array.from(allTableNames)
+    }
+
+    // Build undirected adjacency for cutpoint analysis
+    const undirectedAdj: Record<string, Set<string>> = {}
+    for (const name of allTableNames) undirectedAdj[name] = new Set()
+    for (const name of allTableNames) {
+      for (const dep of adj[name]) {
+        undirectedAdj[name].add(dep)
+        undirectedAdj[dep].add(name)
+      }
+    }
+
+    // Tarjan's algorithm for articulation points
+    const disc: Record<string, number> = {}
+    const low: Record<string, number> = {}
+    const parent: Record<string, string | null> = {}
+    const ap: Set<string> = new Set()
+    let time = 0
+
+    const dfs = (u: string) => {
+      let children = 0
+      disc[u] = low[u] = time++
+      for (const v of undirectedAdj[u]) {
+        if (disc[v] === undefined) {
+          children++
+          parent[v] = u
+          dfs(v)
+          low[u] = Math.min(low[u], low[v])
+          // u is AP if parent is null and has 2+ children, or parent is not null and low[v] >= disc[u]
+          if ((parent[u] === null && children > 1) || (parent[u] !== null && low[v] >= disc[u])) {
+            ap.add(u)
+          }
+        } else if (v !== parent[u]) {
+          low[u] = Math.min(low[u], disc[v])
+        }
+      }
+    }
+
+    for (const name of allTableNames) {
+      if (disc[name] === undefined) {
+        parent[name] = null
+        dfs(name)
+      }
+    }
+
+    // Also include isolated nodes (tables with no connections)
+    for (const name of allTableNames) {
+      if (undirectedAdj[name].size === 0) ap.add(name)
+    }
+
+    const result = Array.from(ap)
+    setCutpoints(result)
+    return result
+  }, [buildDependencyGraph])
+
+  const bfsReachable = useCallback((startNode: string) => {
+    const { allTableNames, adj } = buildDependencyGraph()
+    // Build undirected adjacency for reachability
+    const undirectedAdj: Record<string, Set<string>> = {}
+    for (const name of allTableNames) undirectedAdj[name] = new Set()
+    for (const name of allTableNames) {
+      for (const dep of adj[name]) {
+        undirectedAdj[name].add(dep)
+        undirectedAdj[dep].add(name)
+      }
+    }
+
+    const visited = new Set<string>()
+    const queue = [startNode]
+    visited.add(startNode)
+
+    while (queue.length > 0) {
+      const current = queue.shift()!
+      for (const neighbor of undirectedAdj[current]) {
+        if (!visited.has(neighbor)) {
+          visited.add(neighbor)
+          queue.push(neighbor)
+        }
+      }
+    }
+
+    const result = Array.from(visited).filter(n => n !== startNode)
+    setReachableTables(result)
+    setSelectedGraphNode(startNode)
+    return result
+  }, [buildDependencyGraph])
+
+  const computeConstraintClosure = useCallback(() => {
+    const { edges, adj } = buildDependencyGraph()
+    // For each FK edge, trace cascading constraints
+    const result: { from: string; to: string; via: string; cascades: string[] }[] = []
+
+    for (const edge of edges) {
+      const cascades: string[] = []
+      // Follow the chain from edge.to to find all tables that would be affected
+      const visited = new Set<string>()
+      const queue = [edge.to]
+      visited.add(edge.to)
+
+      while (queue.length > 0) {
+        const current = queue.shift()!
+        for (const dep of adj[current]) {
+          if (!visited.has(dep)) {
+            visited.add(dep)
+            cascades.push(dep)
+            queue.push(dep)
+          }
+        }
+      }
+
+      result.push({ from: edge.from, to: edge.to, via: edge.via, cascades })
+    }
+
+    setConstraintClosureResult(result)
+    return result
+  }, [buildDependencyGraph])
+
+  // ─── Render: Interactive ER Diagram (SVG-based) ──
+  const SchemaVisualization = () => {
+    const schema = getSchemaFromDb
+    const tables = getTablesFromMessages
+    const allTableNames = Array.from(new Set([...Object.keys(tables), ...Object.keys(schema)]))
+
+    const [erDragState, setErDragState] = useState<{ isDragging: boolean; target: string | null; startX: number; startY: number; offsetX: number; offsetY: number }>({ isDragging: false, target: null, startX: 0, startY: 0, offsetX: 0, offsetY: 0 })
+    const [erTransform, setErTransform] = useState({ x: 0, y: 0, scale: 1 })
+    const [erIsPanning, setErIsPanning] = useState(false)
+    const [erPanStart, setErPanStart] = useState({ x: 0, y: 0, tx: 0, ty: 0 })
+    const [erTablePositions, setErTablePositions] = useState<Record<string, { x: number; y: number }>>(() => {
+      const positions: Record<string, { x: number; y: number }> = {}
+      const cols = Math.ceil(Math.sqrt(allTableNames.length))
+      allTableNames.forEach((name, i) => {
+        const col = i % cols
+        const row = Math.floor(i / cols)
+        positions[name] = { x: col * 280 + 40, y: row * 220 + 40 }
+      })
+      return positions
+    })
+
+    // Compute relationships
+    const relationships: { from: string; to: string; via: string; type: string }[] = []
+    for (const tableName of allTableNames) {
+      const tableSchema = schema[tableName]
+      if (tableSchema?.columns) {
+        for (const colName of Object.keys(tableSchema.columns)) {
+          if (colName.endsWith('_id') && colName !== 'id') {
+            const refTableName = colName.replace(/_id$/, '') + 's'
+            if (allTableNames.includes(refTableName)) {
+              relationships.push({ from: tableName, to: refTableName, via: colName, type: '1:N' })
+            }
+          }
+        }
+      }
+    }
+
+    // Check for M:N (junction tables)
+    for (const tableName of allTableNames) {
+      const tableSchema = schema[tableName]
+      if (tableSchema?.columns) {
+        const fks = Object.keys(tableSchema.columns).filter(c => c.endsWith('_id') && c !== 'id')
+        if (fks.length >= 2) {
+          for (const rel of relationships) {
+            if (rel.from === tableName) rel.type = 'M:N'
+          }
+        }
+      }
+    }
+
+    const tableWidth = 200
+    const headerHeight = 28
+    const rowHeight = 18
+
+    const getTableHeight = (name: string) => {
+      const tableSchema = schema[name]
+      const colCount = tableSchema?.columns ? Object.keys(tableSchema.columns).length : 1
+      return headerHeight + colCount * rowHeight + 8
+    }
+
+    const relationshipColor = (type: string) => {
+      if (type === '1:1') return '#8b5cf6' // purple
+      if (type === '1:N') return '#0ea5e9' // sky
+      if (type === 'M:N') return '#f59e0b' // amber
+      return '#6b7280' // gray
+    }
+
+    if (allTableNames.length === 0) {
       return (
         <div className="text-center py-20">
           <div className="h-16 w-16 rounded-2xl bg-gradient-to-br from-amber-100 to-red-50 flex items-center justify-center mx-auto mb-4">
@@ -1254,160 +1837,649 @@ export default function SynthForgeApp() {
       )
     }
 
-    const relationships: { from: string; to: string; via: string }[] = []
-    for (const tableName of allTableNames) {
-      const tableSchema = schema[tableName]
-      if (tableSchema?.columns) {
-        for (const colName of Object.keys(tableSchema.columns)) {
-          if (colName.endsWith('_id') && colName !== 'id') {
-            const refTableName = colName.replace(/_id$/, '') + 's'
-            if (allTableNames.has(refTableName)) {
-              relationships.push({ from: tableName, to: refTableName, via: colName })
-            }
-          }
+    // Calculate SVG dimensions
+    const maxX = Math.max(...allTableNames.map(n => (erTablePositions[n]?.x || 0) + tableWidth + 40), 800)
+    const maxY = Math.max(...allTableNames.map(n => (erTablePositions[n]?.y || 0) + getTableHeight(n) + 40), 600)
+
+    const handleErMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
+      const target = (e.target as SVGElement).closest('[data-table]')
+      if (target) {
+        const tableName = target.getAttribute('data-table')!
+        const pos = erTablePositions[tableName]
+        if (pos) {
+          setErDragState({
+            isDragging: true, target: tableName,
+            startX: e.clientX, startY: e.clientY,
+            offsetX: pos.x, offsetY: pos.y
+          })
         }
+      } else {
+        // Start panning
+        setErIsPanning(true)
+        setErPanStart({ x: e.clientX, y: e.clientY, tx: erTransform.x, ty: erTransform.y })
       }
     }
 
+    const handleErMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+      if (erDragState.isDragging && erDragState.target) {
+        const dx = (e.clientX - erDragState.startX) / erTransform.scale
+        const dy = (e.clientY - erDragState.startY) / erTransform.scale
+        setErTablePositions(prev => ({
+          ...prev,
+          [erDragState.target!]: {
+            x: erDragState.offsetX + dx,
+            y: erDragState.offsetY + dy
+          }
+        }))
+      } else if (erIsPanning) {
+        const dx = e.clientX - erPanStart.x
+        const dy = e.clientY - erPanStart.y
+        setErTransform(prev => ({ ...prev, x: erPanStart.tx + dx, y: erPanStart.ty + dy }))
+      }
+    }
+
+    const handleErMouseUp = () => {
+      setErDragState({ isDragging: false, target: null, startX: 0, startY: 0, offsetX: 0, offsetY: 0 })
+      setErIsPanning(false)
+    }
+
+    const handleErWheel = (e: React.WheelEvent<SVGSVGElement>) => {
+      e.preventDefault()
+      const delta = e.deltaY > 0 ? 0.9 : 1.1
+      setErTransform(prev => ({
+        ...prev,
+        scale: Math.max(0.2, Math.min(3, prev.scale * delta))
+      }))
+    }
+
+    // Render edge with cardinality
+    const renderEdge = (rel: { from: string; to: string; via: string; type: string }, idx: number) => {
+      const fromPos = erTablePositions[rel.from]
+      const toPos = erTablePositions[rel.to]
+      if (!fromPos || !toPos) return null
+
+      const fromH = getTableHeight(rel.from)
+      const toH = getTableHeight(rel.to)
+
+      // Calculate edge points (from right side of from table to left side of to table)
+      const fromCenterX = fromPos.x + tableWidth / 2
+      const fromCenterY = fromPos.y + fromH / 2
+      const toCenterX = toPos.x + tableWidth / 2
+      const toCenterY = toPos.y + toH / 2
+
+      // Determine best connection sides
+      let fromX: number, fromY: number, toX: number, toY: number
+      if (fromCenterX < toCenterX) {
+        fromX = fromPos.x + tableWidth
+        toX = toPos.x
+      } else {
+        fromX = fromPos.x
+        toX = toPos.x + tableWidth
+      }
+      fromY = fromCenterY
+      toY = toCenterY
+
+      const color = relationshipColor(rel.type)
+      const midX = (fromX + toX) / 2
+
+      // Cardinality labels
+      const fromCardinality = rel.type === '1:1' ? '1' : rel.type === 'M:N' ? 'N' : 'N'
+      const toCardinality = rel.type === '1:1' ? '1' : '1'
+
+      return (
+        <g key={`edge-${idx}`}>
+          <path
+            d={`M ${fromX} ${fromY} C ${midX} ${fromY}, ${midX} ${toY}, ${toX} ${toY}`}
+            fill="none"
+            stroke={color}
+            strokeWidth={2}
+            strokeOpacity={0.7}
+            markerEnd={`url(#arrow-${rel.type})`}
+          />
+          {/* Cardinality labels */}
+          <text x={fromX + (fromCenterX < toCenterX ? 8 : -12)} y={fromY - 6} fontSize="11" fontWeight="bold" fill={color}>{fromCardinality}</text>
+          <text x={toX + (fromCenterX < toCenterX ? -12 : 8)} y={toY - 6} fontSize="11" fontWeight="bold" fill={color}>{toCardinality}</text>
+          {/* FK label on edge */}
+          <text x={midX} y={(fromY + toY) / 2 - 8} fontSize="9" fill={color} textAnchor="middle" opacity={0.8}>{rel.via}</text>
+        </g>
+      )
+    }
+
+    // Minimap dimensions
+    const minimapW = 160
+    const minimapH = 100
+    const minimapScale = Math.min(minimapW / maxX, minimapH / maxY)
+
     return (
-      <div className="space-y-6">
-        {relationships.length > 0 && (
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-semibold flex items-center gap-2">
-                <Link2 className="h-4 w-4 text-sky-600" />
-                Relationships
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="space-y-2">
-                {relationships.map((rel, i) => (
-                  <div key={i} className="flex items-center gap-2 text-xs bg-muted/30 p-2 rounded-md">
-                    <Badge variant="outline" className="font-mono text-xs">{rel.from}</Badge>
-                    <ArrowRight className="h-3 w-3 text-sky-500" />
-                    <span className="text-muted-foreground font-mono">{rel.via}</span>
-                    <ArrowRight className="h-3 w-3 text-sky-500" />
-                    <Badge variant="outline" className="font-mono text-xs">{rel.to}</Badge>
-                  </div>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
-        )}
+      <div className="flex flex-col h-full">
+        {/* ER Diagram toolbar */}
+        <div className="flex items-center gap-2 p-2 border-b bg-muted/30 shrink-0 flex-wrap">
+          <Badge variant="outline" className="text-[10px] gap-1">
+            <Table2 className="h-3 w-3" /> {allTableNames.length} tables
+          </Badge>
+          <Badge variant="outline" className="text-[10px] gap-1">
+            <Link2 className="h-3 w-3" /> {relationships.length} relationships
+          </Badge>
+          <div className="flex items-center gap-1 ml-auto">
+            {/* Relationship type legend */}
+            <div className="flex items-center gap-1 text-[10px]">
+              <span className="inline-block w-3 h-0.5 bg-sky-500" /> 1:N
+            </div>
+            <div className="flex items-center gap-1 text-[10px] ml-2">
+              <span className="inline-block w-3 h-0.5 bg-amber-500" /> M:N
+            </div>
+            <Button variant="ghost" size="sm" className="h-6 w-6 p-0" onClick={() => setErTransform({ x: 0, y: 0, scale: 1 })} aria-label="Reset view">
+              <Maximize2 className="h-3 w-3" />
+            </Button>
+            <Button variant="ghost" size="sm" className="h-6 w-6 p-0" onClick={() => setErTransform(prev => ({ ...prev, scale: Math.min(3, prev.scale * 1.2) }))} aria-label="Zoom in">
+              <ZoomIn className="h-3 w-3" />
+            </Button>
+            <Button variant="ghost" size="sm" className="h-6 w-6 p-0" onClick={() => setErTransform(prev => ({ ...prev, scale: Math.max(0.2, prev.scale * 0.8) }))} aria-label="Zoom out">
+              <ZoomOut className="h-3 w-3" />
+            </Button>
+          </div>
+        </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          {Array.from(allTableNames).map(tableName => {
-            const tableSchema = schema[tableName]
-            const tableRows = tables[tableName]
-            const columns = tableSchema?.columns || {}
-            const pks = Object.keys(columns).filter(c => c === 'id')
-            const fks = Object.keys(columns).filter(c => c.endsWith('_id') && c !== 'id')
-            const others = Object.keys(columns).filter(c => !pks.includes(c) && !fks.includes(c))
+        {/* Main SVG canvas */}
+        <div className="flex-1 relative overflow-hidden">
+          <svg
+            ref={erSvgRef}
+            className="w-full h-full"
+            style={{ cursor: erDragState.isDragging ? 'grabbing' : erIsPanning ? 'grabbing' : 'grab' }}
+            onMouseDown={handleErMouseDown}
+            onMouseMove={handleErMouseMove}
+            onMouseUp={handleErMouseUp}
+            onMouseLeave={handleErMouseUp}
+            onWheel={handleErWheel}
+          >
+            <defs>
+              <marker id="arrow-1:N" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#0ea5e9" />
+              </marker>
+              <marker id="arrow-M:N" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#f59e0b" />
+              </marker>
+              <marker id="arrow-1:1" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#8b5cf6" />
+              </marker>
+              {/* Grid pattern */}
+              <pattern id="er-grid" width="20" height="20" patternUnits="userSpaceOnUse">
+                <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#e5e7eb" strokeWidth="0.5" />
+              </pattern>
+            </defs>
 
-            return (
-              <Card key={tableName} className="border-2 border-amber-200/50">
-                <CardHeader className="pb-1 pt-3 px-3">
-                  <div className="flex items-center justify-between">
-                    <CardTitle className="text-xs font-bold uppercase tracking-wider text-amber-700 flex items-center gap-1.5">
-                      <Table2 className="h-3.5 w-3.5" />
+            <g transform={`translate(${erTransform.x}, ${erTransform.y}) scale(${erTransform.scale})`}>
+              {/* Background grid */}
+              <rect x="-1000" y="-1000" width={maxX + 2000} height={maxY + 2000} fill="url(#er-grid)" />
+
+              {/* Render edges */}
+              {relationships.map((rel, i) => renderEdge(rel, i))}
+
+              {/* Render table nodes */}
+              {allTableNames.map(tableName => {
+                const tableSchema = schema[tableName]
+                const tableRows = tables[tableName]
+                const columns = tableSchema?.columns || {}
+                const colEntries = Object.entries(columns)
+                const pos = erTablePositions[tableName] || { x: 0, y: 0 }
+                const height = getTableHeight(tableName)
+
+                return (
+                  <g key={tableName} data-table={tableName} transform={`translate(${pos.x}, ${pos.y})`} style={{ cursor: 'move' }}>
+                    {/* Shadow */}
+                    <rect x={2} y={2} width={tableWidth} height={height} rx={6} fill="rgba(0,0,0,0.08)" />
+                    {/* Table body */}
+                    <rect width={tableWidth} height={height} rx={6} fill="white" stroke="#d4a054" strokeWidth={1.5} />
+                    {/* Header */}
+                    <rect width={tableWidth} height={headerHeight} rx={6} fill="#d4a054" />
+                    <rect y={headerHeight - 6} width={tableWidth} height={6} fill="#d4a054" />
+                    {/* Table name */}
+                    <text x={tableWidth / 2} y={18} textAnchor="middle" fontSize="11" fontWeight="bold" fill="white">
                       {tableName}
-                    </CardTitle>
-                    {tableRows && <Badge variant="secondary" className="text-[9px]">{tableRows.length} rows</Badge>}
-                  </div>
-                </CardHeader>
-                <CardContent className="px-3 pb-3">
-                  <div className="space-y-0.5">
-                    {pks.map(col => (
-                      <div key={col} className="flex items-center gap-1.5 text-[11px] py-0.5">
-                        <Key className="h-2.5 w-2.5 text-amber-500" />
-                        <span className="font-mono font-semibold text-amber-700">{col}</span>
-                        <span className="text-muted-foreground ml-auto font-mono">{columns[col]}</span>
-                      </div>
-                    ))}
-                    {fks.map(col => (
-                      <div key={col} className="flex items-center gap-1.5 text-[11px] py-0.5">
-                        <Link2 className="h-2.5 w-2.5 text-sky-500" />
-                        <span className="font-mono text-sky-700">{col}</span>
-                        <span className="text-muted-foreground ml-auto font-mono">{columns[col]}</span>
-                      </div>
-                    ))}
-                    {others.map(col => (
-                      <div key={col} className="flex items-center gap-1.5 text-[11px] py-0.5">
-                        <Columns3 className="h-2.5 w-2.5 text-gray-400" />
-                        <span className="font-mono">{col}</span>
-                        <span className="text-muted-foreground ml-auto font-mono">{columns[col]}</span>
-                      </div>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
-            )
-          })}
+                    </text>
+                    {tableRows && (
+                      <text x={tableWidth - 8} y={18} textAnchor="end" fontSize="9" fill="rgba(255,255,255,0.8)">
+                        {tableRows.length} rows
+                      </text>
+                    )}
+                    {/* Column rows */}
+                    {colEntries.map(([colName, colType], i) => {
+                      const isPK = colName === 'id'
+                      const isFK = colName.endsWith('_id') && colName !== 'id'
+                      const y = headerHeight + 14 + i * rowHeight
+                      return (
+                        <g key={colName}>
+                          <line x1={0} y1={y - 12} x2={tableWidth} y2={y - 12} stroke="#f3f0e7" strokeWidth={0.5} />
+                          {isPK && <text x={8} y={y} fontSize="9" fill="#d4a054">🔑</text>}
+                          {isFK && <text x={8} y={y} fontSize="9" fill="#0ea5e9">🔗</text>}
+                          {!isPK && !isFK && <text x={8} y={y} fontSize="9" fill="#9ca3af">●</text>}
+                          <text x={isPK || isFK ? 22 : 16} y={y} fontSize="10" fontFamily="monospace" fill="#374151">{colName}</text>
+                          <text x={tableWidth - 8} y={y} textAnchor="end" fontSize="9" fontFamily="monospace" fill="#9ca3af">
+                            {colType.split('(')[0]}
+                          </text>
+                        </g>
+                      )
+                    })}
+                  </g>
+                )
+              })}
+            </g>
+          </svg>
+
+          {/* Minimap */}
+          <div className="absolute bottom-3 right-3 border rounded-lg bg-white/90 shadow-lg p-1.5">
+            <svg width={minimapW} height={minimapH}>
+              <rect width={minimapW} height={minimapH} fill="#fafaf9" rx={4} />
+              {allTableNames.map(name => {
+                const pos = erTablePositions[name] || { x: 0, y: 0 }
+                const h = getTableHeight(name)
+                return (
+                  <rect
+                    key={name}
+                    x={pos.x * minimapScale}
+                    y={pos.y * minimapScale}
+                    width={tableWidth * minimapScale}
+                    height={h * minimapScale}
+                    fill="#d4a054"
+                    stroke="#b8860b"
+                    strokeWidth={0.5}
+                    rx={1}
+                    opacity={0.7}
+                  />
+                )
+              })}
+              {/* Viewport indicator */}
+              <rect
+                x={(-erTransform.x / erTransform.scale) * minimapScale}
+                y={(-erTransform.y / erTransform.scale) * minimapScale}
+                width={(800 / erTransform.scale) * minimapScale}
+                height={(500 / erTransform.scale) * minimapScale}
+                fill="none"
+                stroke="#ef4444"
+                strokeWidth={1}
+                strokeDasharray="3 2"
+                rx={2}
+              />
+            </svg>
+          </div>
         </div>
       </div>
     )
   }
 
-  // ─── Render: Explorer Tree ────────────────────────────
+  // ─── Render: Explorer (Tree + Graph) ────────────────────
   const ExplorerTree = () => {
     const tables = getTablesFromMessages
     const schema = getSchemaFromDb
     const allTableNames = new Set([...Object.keys(tables), ...Object.keys(schema)])
 
+    // Graph view state
+    const [graphTransform, setGraphTransform] = useState({ x: 0, y: 0, scale: 1 })
+    const [graphIsPanning, setGraphIsPanning] = useState(false)
+    const [graphPanStart, setGraphPanStart] = useState({ x: 0, y: 0, tx: 0, ty: 0 })
+    const [hoveredNode, setHoveredNode] = useState<string | null>(null)
+
+    // Build dependency data
+    const { edges } = buildDependencyGraph()
+
+    // Calculate node positions using grid layout
+    const graphNodePositions = useMemo(() => {
+      const names = Array.from(allTableNames)
+      const positions: Record<string, { x: number; y: number }> = {}
+      const cols = Math.ceil(Math.sqrt(names.length))
+      names.forEach((name, i) => {
+        const col = i % cols
+        const row = Math.floor(i / cols)
+        positions[name] = { x: col * 160 + 80, y: row * 120 + 60 }
+      })
+      return positions
+    }, [allTableNames])
+
+    const isCutpoint = cutpoints ? (name: string) => cutpoints.includes(name) : () => false
+    const isReachable = reachableTables ? (name: string) => reachableTables.includes(name) : () => false
+
+    // Graph event handlers
+    const handleGraphMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
+      const target = (e.target as SVGElement).closest('[data-node]')
+      if (target) {
+        const nodeName = target.getAttribute('data-node')!
+        // Click on node: show reachable tables
+        bfsReachable(nodeName)
+      } else {
+        // Start panning
+        setGraphIsPanning(true)
+        setGraphPanStart({ x: e.clientX, y: e.clientY, tx: graphTransform.x, ty: graphTransform.y })
+      }
+    }
+
+    const handleGraphMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+      if (graphIsPanning) {
+        const dx = e.clientX - graphPanStart.x
+        const dy = e.clientY - graphPanStart.y
+        setGraphTransform(prev => ({ ...prev, x: graphPanStart.tx + dx, y: graphPanStart.ty + dy }))
+      }
+    }
+
+    const handleGraphMouseUp = () => {
+      setGraphIsPanning(false)
+    }
+
+    const handleGraphWheel = (e: React.WheelEvent<SVGSVGElement>) => {
+      e.preventDefault()
+      const delta = e.deltaY > 0 ? 0.9 : 1.1
+      setGraphTransform(prev => ({
+        ...prev,
+        scale: Math.max(0.3, Math.min(3, prev.scale * delta))
+      }))
+    }
+
+    // SVG dimensions
+    const graphW = Math.max(...Object.values(graphNodePositions).map(p => p.x + 80), 400)
+    const graphH = Math.max(...Object.values(graphNodePositions).map(p => p.y + 60), 300)
+
     return (
-      <div className="space-y-1 p-2">
-        <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground mb-2">
-          <FolderTree className="h-3 w-3" /> DATABASE TABLES
-        </div>
-        {allTableNames.size === 0 ? (
-          <div className="text-center py-12">
-            <Table2 className="h-8 w-8 mx-auto text-muted-foreground/30 mb-2" />
-            <p className="text-xs text-muted-foreground">No tables yet. Chat with AI to generate data.</p>
+      <div className="flex flex-col h-full">
+        {/* View toggle + analysis buttons */}
+        <div className="flex items-center gap-1.5 p-2 border-b bg-muted/30 shrink-0 flex-wrap">
+          <div className="flex items-center bg-muted rounded-md p-0.5">
+            <Button
+              variant={explorerView === 'tree' ? 'default' : 'ghost'}
+              size="sm"
+              className={`h-6 text-[10px] px-2 ${explorerView === 'tree' ? 'bg-amber-700 text-white' : ''}`}
+              onClick={() => setExplorerView('tree')}
+              aria-label="Tree view"
+            >
+              <FolderTree className="h-3 w-3 mr-1" /> Tree
+            </Button>
+            <Button
+              variant={explorerView === 'graph' ? 'default' : 'ghost'}
+              size="sm"
+              className={`h-6 text-[10px] px-2 ${explorerView === 'graph' ? 'bg-amber-700 text-white' : ''}`}
+              onClick={() => setExplorerView('graph')}
+              aria-label="Graph view"
+            >
+              <GitBranch className="h-3 w-3 mr-1" /> Graph
+            </Button>
           </div>
-        ) : (
-          <ScrollArea className="max-h-[calc(100vh-220px)]">
-            {Array.from(allTableNames).map(tableName => {
-              const rows = tables[tableName] || []
-              const schemaDef = schema[tableName]
-              return (
-                <motion.button
-                  key={tableName}
-                  initial={{ opacity: 0, x: -5 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  className="w-full text-left p-2 rounded-md hover:bg-muted/50 transition-colors group"
-                  onClick={() => setRightTab('preview')}
-                  aria-label={`View ${tableName} table`}
-                >
-                  <div className="flex items-center gap-2">
-                    <ChevronRight className="h-3 w-3 text-muted-foreground group-hover:text-foreground" />
-                    <Table2 className="h-3.5 w-3.5 text-amber-700" />
-                    <span className="text-sm font-medium">{tableName}</span>
-                  </div>
-                  <div className="ml-6 mt-0.5 text-[11px] text-muted-foreground">
-                    {rows.length > 0 && <span>{rows.length} rows</span>}
-                    {schemaDef?.columns && <span>{rows.length > 0 ? ' · ' : ''}{Object.keys(schemaDef.columns).length} columns</span>}
-                  </div>
-                  {schemaDef?.columns && (
-                    <div className="ml-6 mt-1 flex flex-wrap gap-1">
-                      {Object.keys(schemaDef.columns).slice(0, 4).map(col => (
-                        <Badge key={col} variant="outline" className="text-[9px] px-1 py-0 font-mono">{col}</Badge>
-                      ))}
-                      {Object.keys(schemaDef.columns).length > 4 && (
-                        <Badge variant="outline" className="text-[9px] px-1 py-0">+{Object.keys(schemaDef.columns).length - 4}</Badge>
-                      )}
+
+          {explorerView === 'graph' && (
+            <div className="flex items-center gap-1 ml-auto flex-wrap">
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="outline" size="sm" className="h-6 text-[10px] px-2 gap-1" onClick={topologicalSort} aria-label="Sort dependencies">
+                      <ListOrdered className="h-3 w-3" /> Sort
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Topological sort (dependency order)</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="outline" size="sm" className="h-6 text-[10px] px-2 gap-1" onClick={findCutpoints} aria-label="Find cutpoints">
+                      <AlertTriangle className="h-3 w-3" /> Cutpoints
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Find critical tables (cutpoints)</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="outline" size="sm" className="h-6 text-[10px] px-2 gap-1" onClick={computeConstraintClosure} aria-label="Show constraints">
+                      <Link2 className="h-3 w-3" /> Constraints
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Show cascading constraints</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+              <Button variant="ghost" size="sm" className="h-6 w-6 p-0" onClick={() => setGraphTransform({ x: 0, y: 0, scale: 1 })} aria-label="Reset graph view">
+                <Maximize2 className="h-3 w-3" />
+              </Button>
+            </div>
+          )}
+        </div>
+
+        {/* Content area */}
+        <div className="flex-1 overflow-hidden">
+          {explorerView === 'tree' ? (
+            <div className="p-2 h-full overflow-y-auto">
+              <div className="flex items-center gap-2 text-xs font-semibold text-muted-foreground mb-2">
+                <FolderTree className="h-3 w-3" /> DATABASE TABLES
+              </div>
+              {allTableNames.size === 0 ? (
+                <div className="text-center py-12">
+                  <Table2 className="h-8 w-8 mx-auto text-muted-foreground/30 mb-2" />
+                  <p className="text-xs text-muted-foreground">No tables yet. Chat with AI to generate data.</p>
+                </div>
+              ) : (
+                <div className="space-y-1">
+                  {/* Topological sort result */}
+                  {topologicalSortResult && (
+                    <div className="mb-3 p-2 border rounded-md bg-sky-50 border-sky-200">
+                      <div className="flex items-center gap-1.5 text-[10px] font-semibold text-sky-800 mb-1.5">
+                        <ListOrdered className="h-3 w-3" /> Dependency Order
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {topologicalSortResult.map((name, i) => (
+                          <React.Fragment key={name}>
+                            <Badge variant="outline" className="text-[9px] font-mono">{name}</Badge>
+                            {i < topologicalSortResult.length - 1 && <span className="text-sky-400 text-[10px]">→</span>}
+                          </React.Fragment>
+                        ))}
+                      </div>
                     </div>
                   )}
-                </motion.button>
-              )
-            })}
-          </ScrollArea>
-        )}
+
+                  {Array.from(allTableNames).map(tableName => {
+                    const rows = tables[tableName] || []
+                    const schemaDef = schema[tableName]
+                    const isCut = isCutpoint(tableName)
+                    return (
+                      <motion.button
+                        key={tableName}
+                        initial={{ opacity: 0, x: -5 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        className={`w-full text-left p-2 rounded-md hover:bg-muted/50 transition-colors group ${isCut ? 'border-l-2 border-red-400 bg-red-50/50' : ''}`}
+                        onClick={() => setRightTab('preview')}
+                        aria-label={`View ${tableName} table`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <ChevronRight className="h-3 w-3 text-muted-foreground group-hover:text-foreground" />
+                          <Table2 className="h-3.5 w-3.5 text-amber-700" />
+                          <span className="text-sm font-medium">{tableName}</span>
+                          {isCut && <AlertTriangle className="h-3 w-3 text-red-500" />}
+                        </div>
+                        <div className="ml-6 mt-0.5 text-[11px] text-muted-foreground">
+                          {rows.length > 0 && <span>{rows.length} rows</span>}
+                          {schemaDef?.columns && <span>{rows.length > 0 ? ' · ' : ''}{Object.keys(schemaDef.columns).length} columns</span>}
+                        </div>
+                        {schemaDef?.columns && (
+                          <div className="ml-6 mt-1 flex flex-wrap gap-1">
+                            {Object.keys(schemaDef.columns).slice(0, 4).map(col => (
+                              <Badge key={col} variant="outline" className="text-[9px] px-1 py-0 font-mono">{col}</Badge>
+                            ))}
+                            {Object.keys(schemaDef.columns).length > 4 && (
+                              <Badge variant="outline" className="text-[9px] px-1 py-0">+{Object.keys(schemaDef.columns).length - 4}</Badge>
+                            )}
+                          </div>
+                        )}
+                      </motion.button>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="h-full flex flex-col">
+              {allTableNames.size === 0 ? (
+                <div className="text-center py-12">
+                  <Network className="h-8 w-8 mx-auto text-muted-foreground/30 mb-2" />
+                  <p className="text-xs text-muted-foreground">No tables to graph. Chat with AI to generate data.</p>
+                </div>
+              ) : (
+                <>
+                  {/* SVG Dependency Graph */}
+                  <div className="flex-1 relative overflow-hidden">
+                    <svg
+                      ref={graphSvgRef}
+                      className="w-full h-full"
+                      style={{ cursor: graphIsPanning ? 'grabbing' : 'pointer' }}
+                      onMouseDown={handleGraphMouseDown}
+                      onMouseMove={handleGraphMouseMove}
+                      onMouseUp={handleGraphMouseUp}
+                      onMouseLeave={handleGraphMouseUp}
+                      onWheel={handleGraphWheel}
+                    >
+                      <defs>
+                        <marker id="graph-arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                          <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8" />
+                        </marker>
+                        <pattern id="graph-grid" width="20" height="20" patternUnits="userSpaceOnUse">
+                          <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#f1f5f9" strokeWidth="0.5" />
+                        </pattern>
+                      </defs>
+
+                      <g transform={`translate(${graphTransform.x}, ${graphTransform.y}) scale(${graphTransform.scale})`}>
+                        <rect x="-500" y="-500" width={graphW + 1000} height={graphH + 1000} fill="url(#graph-grid)" />
+
+                        {/* Edges */}
+                        {edges.map((edge, i) => {
+                          const fromPos = graphNodePositions[edge.from]
+                          const toPos = graphNodePositions[edge.to]
+                          if (!fromPos || !toPos) return null
+                          const midX = (fromPos.x + toPos.x) / 2
+                          const midY = (fromPos.y + toPos.y) / 2
+                          const isHighlighted = selectedGraphNode === edge.from || selectedGraphNode === edge.to
+                          return (
+                            <g key={`ge-${i}`}>
+                              <path
+                                d={`M ${fromPos.x} ${fromPos.y} C ${midX} ${fromPos.y}, ${midX} ${toPos.y}, ${toPos.x} ${toPos.y}`}
+                                fill="none"
+                                stroke={isHighlighted ? '#f59e0b' : '#94a3b8'}
+                                strokeWidth={isHighlighted ? 2 : 1.5}
+                                strokeOpacity={isHighlighted ? 1 : 0.5}
+                                markerEnd="url(#graph-arrow)"
+                              />
+                              <text x={midX} y={midY - 6} fontSize="8" fill="#64748b" textAnchor="middle" opacity={0.7}>{edge.via}</text>
+                            </g>
+                          )
+                        })}
+
+                        {/* Nodes */}
+                        {Array.from(allTableNames).map(name => {
+                          const pos = graphNodePositions[name]
+                          if (!pos) return null
+                          const isCut = isCutpoint(name)
+                          const isReach = isReachable(name)
+                          const isSelected = selectedGraphNode === name
+                          const isHovered = hoveredNode === name
+                          const nodeW = 120
+                          const nodeH = 36
+
+                          let fillColor = '#ffffff'
+                          let strokeColor = '#d4a054'
+                          let textColor = '#374151'
+                          if (isCut) { fillColor = '#fef2f2'; strokeColor = '#ef4444' }
+                          if (isReach) { fillColor = '#ecfdf5'; strokeColor = '#10b981' }
+                          if (isSelected) { fillColor = '#fffbeb'; strokeColor = '#f59e0b'; textColor = '#92400e' }
+                          if (isHovered && !isSelected) { fillColor = '#fefce8' }
+
+                          return (
+                            <g
+                              key={name}
+                              data-node={name}
+                              transform={`translate(${pos.x - nodeW / 2}, ${pos.y - nodeH / 2})`}
+                              onMouseEnter={() => setHoveredNode(name)}
+                              onMouseLeave={() => setHoveredNode(null)}
+                              style={{ cursor: 'pointer' }}
+                            >
+                              <rect width={nodeW} height={nodeH} rx={6} fill={fillColor} stroke={strokeColor} strokeWidth={isSelected ? 2.5 : 1.5} />
+                              <text x={nodeW / 2} y={nodeH / 2 + 4} textAnchor="middle" fontSize="11" fontWeight={isSelected ? 'bold' : '600'} fill={textColor}>
+                                {name}
+                              </text>
+                              {isCut && (
+                                <text x={nodeW - 6} y={12} fontSize="9" fill="#ef4444">⚠</text>
+                              )}
+                              {/* Row count badge */}
+                              {tables[name] && (
+                                <text x={nodeW / 2} y={nodeH - 4} textAnchor="middle" fontSize="7" fill="#9ca3af">{tables[name].length} rows</text>
+                              )}
+                            </g>
+                          )
+                        })}
+                      </g>
+                    </svg>
+                  </div>
+
+                  {/* Analysis results panels */}
+                  <div className="border-t shrink-0 max-h-[40%] overflow-y-auto">
+                    {/* Selected node: Reachable tables (BFS) */}
+                    {selectedGraphNode && reachableTables !== null && (
+                      <div className="p-2 border-b bg-amber-50/50">
+                        <div className="flex items-center gap-1.5 text-[10px] font-semibold text-amber-800 mb-1">
+                          <Search className="h-3 w-3" /> Reachable from <span className="font-mono">{selectedGraphNode}</span>
+                        </div>
+                        {reachableTables.length === 0 ? (
+                          <p className="text-[10px] text-muted-foreground">No reachable tables via FK relationships</p>
+                        ) : (
+                          <div className="flex flex-wrap gap-1">
+                            {reachableTables.map(name => (
+                              <Badge key={name} variant="outline" className="text-[9px] font-mono bg-green-50 border-green-300 text-green-800">{name}</Badge>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Cutpoint result */}
+                    {cutpoints && cutpoints.length > 0 && (
+                      <div className="p-2 border-b bg-red-50/50">
+                        <div className="flex items-center gap-1.5 text-[10px] font-semibold text-red-800 mb-1">
+                          <AlertTriangle className="h-3 w-3" /> Critical Tables (Cutpoints)
+                        </div>
+                        <p className="text-[9px] text-muted-foreground mb-1">Removing these tables would disconnect the schema graph</p>
+                        <div className="flex flex-wrap gap-1">
+                          {cutpoints.map(name => (
+                            <Badge key={name} variant="outline" className="text-[9px] font-mono bg-red-50 border-red-300 text-red-800">{name}</Badge>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Constraint closure result */}
+                    {constraintClosureResult && constraintClosureResult.length > 0 && (
+                      <div className="p-2 bg-sky-50/50">
+                        <div className="flex items-center gap-1.5 text-[10px] font-semibold text-sky-800 mb-1">
+                          <Link2 className="h-3 w-3" /> Cascading Constraints
+                        </div>
+                        <div className="space-y-1">
+                          {constraintClosureResult.map((cc, i) => (
+                            <div key={i} className="text-[9px] bg-white/50 rounded p-1.5 border border-sky-100">
+                              <span className="font-mono text-sky-700">{cc.from}</span>
+                              <span className="text-muted-foreground mx-1">→{cc.via}→</span>
+                              <span className="font-mono text-sky-700">{cc.to}</span>
+                              {cc.cascades.length > 0 && (
+                                <span className="text-muted-foreground ml-1">affects: {cc.cascades.map(c => <span key={c} className="font-mono text-amber-700">{c}</span>).reduce((acc, el, idx) => idx === 0 ? [el] : [...acc, ', ', el], [] as React.ReactNode[])}</span>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+        </div>
       </div>
     )
   }
 
-  // ─── Render: Chat Message ──────────────────────────────
-  const ChatMessage = ({ msg }: { msg: Message }) => {
+  // ─── Render: Chat Message (React.memo moved outside) ──────────────────
+  const ChatMessage = React.memo(function ChatMessage({ msg }: { msg: Message }) {
     const isUser = msg.role === 'user'
 
     if (isUser) {
@@ -1448,6 +2520,46 @@ export default function SynthForgeApp() {
       hasGeneratedTables = Object.keys(tables).length > 0
     } catch { /* */ }
 
+    // Generation status badge
+    const renderStatusBadge = () => {
+      if (msg.isStreaming && !msg.content) {
+        return (
+          <Badge className="text-[10px] bg-amber-100 text-amber-800 border-amber-200 gap-1">
+            <Loader2 className="h-2.5 w-2.5 animate-spin" /> Thinking<AnimatedDots />
+          </Badge>
+        )
+      }
+      if (msg.isStreaming && msg.content) {
+        return (
+          <Badge className="text-[10px] bg-sky-100 text-sky-800 border-sky-200 gap-1">
+            <Loader2 className="h-2.5 w-2.5 animate-spin" /> Generating
+          </Badge>
+        )
+      }
+      if (msg.generationStatus === 'completed') {
+        return (
+          <Badge className="text-[10px] bg-green-100 text-green-800 border-green-200 gap-1">
+            <CheckCircle2 className="h-2.5 w-2.5" /> Completed
+          </Badge>
+        )
+      }
+      if (msg.generationStatus === 'failed' || msg.isError) {
+        return (
+          <Badge className="text-[10px] bg-red-100 text-red-800 border-red-200 gap-1">
+            <XCircle className="h-2.5 w-2.5" /> Failed
+          </Badge>
+        )
+      }
+      if (msg.isCancelled || msg.generationStatus === 'cancelled') {
+        return (
+          <Badge className="text-[10px] bg-gray-100 text-gray-700 border-gray-300 gap-1">
+            <Ban className="h-2.5 w-2.5" /> Cancelled
+          </Badge>
+        )
+      }
+      return null
+    }
+
     return (
       <motion.div {...messageSlideIn} className="flex justify-start">
         <div className="max-w-[95%] bg-muted/50 rounded-xl rounded-bl-sm px-3 py-2.5 shadow-sm">
@@ -1455,15 +2567,30 @@ export default function SynthForgeApp() {
             <AgentBadge name={msg.agentName} />
             {msg.qualityScore && <QualityBadge score={msg.qualityScore.overall} />}
             <PIIShieldBadge piiCheck={msg.piiCheck || null} />
-            {msg.isStreaming && (
-              <Badge className="text-[10px] bg-amber-100 text-amber-800 border-amber-200 gap-1">
-                <Loader2 className="h-2.5 w-2.5 animate-spin" /> Streaming
-              </Badge>
-            )}
+            {renderStatusBadge()}
             {msg.tokensIn > 0 && (
               <span className="text-[9px] text-muted-foreground">
                 {msg.tokensIn + msg.tokensOut} tok
               </span>
+            )}
+            {/* Regenerate button for completed assistant messages */}
+            {!msg.isStreaming && !msg.isCancelled && msg.generationStatus === 'completed' && (
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-5 w-5 p-0 text-muted-foreground hover:text-amber-700 hover:bg-amber-50"
+                      onClick={() => handleRegenerate(msg.id)}
+                      aria-label="Regenerate response"
+                    >
+                      <RefreshCw className="h-2.5 w-2.5" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Regenerate response</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
             )}
           </div>
 
@@ -1473,7 +2600,16 @@ export default function SynthForgeApp() {
               <span>Thinking<AnimatedDots /></span>
             </div>
           ) : (
-            renderAssistantContent(msg.content)
+            <>
+              {renderAssistantContent(msg.content)}
+              {/* Show cancelled notice */}
+              {msg.isCancelled && msg.content && (
+                <div className="mt-2 pt-1.5 border-t border-border/50 flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <Ban className="h-3 w-3" />
+                  <span>Generation was cancelled. Partial content shown above.</span>
+                </div>
+              )}
+            </>
           )}
 
           {msg.sqlCode && (
@@ -1509,12 +2645,15 @@ export default function SynthForgeApp() {
           )}
 
           <ReasoningTimeline steps={parsedSteps} msgId={msg.id} />
+          {/* Agent Pipeline for multi-step tasks */}
+          {agentSteps.length > 0 && <AgentPipeline steps={agentSteps} />}
           <ClarificationOptions options={parsedOptions} />
           {hasGeneratedTables && !msg.isStreaming && <QuickActions msg={msg} />}
         </div>
       </motion.div>
     )
-  }
+  })
+
 
   // ─── Render: Chat Panel ────────────────────────────────
   const ChatPanel = () => (
@@ -1544,7 +2683,7 @@ export default function SynthForgeApp() {
       )}
 
       {/* Messages Area */}
-      <div ref={chatScrollRef} className="flex-1 overflow-y-auto">
+      <div ref={chatScrollRef} className="flex-1 overflow-y-auto chat-scroll-area" style={{ scrollBehavior: 'smooth' }}>
         <div className="p-3 space-y-3">
           {messages.length === 0 && !isLoading && (
             <motion.div
@@ -1613,6 +2752,37 @@ export default function SynthForgeApp() {
 
           <div ref={messagesEndRef} />
         </div>
+
+        {/* Scroll to Bottom Button */}
+        {showScrollToBottom && (
+          <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 10 }}
+            className="absolute bottom-16 left-1/2 -translate-x-1/2 z-10"
+          >
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 w-7 p-0 rounded-full shadow-md bg-background border-amber-200 hover:bg-amber-50"
+                    onClick={() => {
+                      if (chatScrollRef.current) {
+                        chatScrollRef.current.scrollTo({ top: chatScrollRef.current.scrollHeight, behavior: 'smooth' })
+                      }
+                    }}
+                    aria-label="Scroll to bottom"
+                  >
+                    <ArrowDown className="h-3.5 w-3.5 text-amber-700" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Scroll to bottom</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          </motion.div>
+        )}
       </div>
 
       {/* Input Area */}
@@ -1631,29 +2801,6 @@ export default function SynthForgeApp() {
             ))}
           </div>
         )}
-
-        {/* Row count input */}
-        <div className="flex items-center gap-2 mb-1.5">
-          <span className="text-[10px] text-muted-foreground whitespace-nowrap">Rows:</span>
-          <Input
-            type="number"
-            min={1}
-            max={10000}
-            value={rowCountInput}
-            onChange={(e) => handleRowCountChange(e.target.value)}
-            placeholder="Optional"
-            className={`h-5 text-[10px] px-1.5 py-0 w-20 ${rowCountError ? 'border-red-400 focus-visible:ring-red-400' : ''}`}
-            aria-label="Number of rows per table"
-          />
-          {rowCountError && (
-            <span className="text-[9px] text-red-500">{rowCountError}</span>
-          )}
-          {parsedRowCount && (
-            <Badge variant="outline" className="text-[9px] px-1 py-0">
-              {parsedRowCount} rows/table
-            </Badge>
-          )}
-        </div>
 
         <div className="flex items-end gap-1.5">
           <input
@@ -1684,15 +2831,22 @@ export default function SynthForgeApp() {
 
           <div className="flex-1 relative">
             <Textarea
+              key={view === 'studio' ? 'studio-chat' : 'chat'}
               ref={chatInputRef}
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={(e) => {
+                setInput(e.target.value)
+                inputValueRef.current = e.target.value
+                e.stopPropagation()
+              }}
               onKeyDown={handleKeyDown}
               placeholder="Describe data..."
               className="min-h-[34px] max-h-24 resize-none text-xs py-1.5 px-2.5"
               disabled={isLoading}
               rows={1}
               aria-label="Chat message input"
+              onClick={(e) => e.stopPropagation()}
+              onFocus={(e) => e.stopPropagation()}
             />
           </div>
 
@@ -1802,6 +2956,25 @@ export default function SynthForgeApp() {
                       {Object.keys(allTables).length} table{Object.keys(allTables).length !== 1 ? 's' : ''} · {Object.values(allTables).reduce((s, r) => s + r.length, 0)} total rows
                     </span>
                     <div className="ml-auto flex items-center gap-1">
+                      {/* Quality Check Button */}
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="gap-1 text-xs h-7 hover:bg-amber-50 hover:border-amber-300"
+                              onClick={() => runQualityCheck(false)}
+                              disabled={isQualityCheckRunning}
+                              aria-label="Run quality check"
+                            >
+                              {isQualityCheckRunning ? <Loader2 className="h-3 w-3 animate-spin" /> : <Bug className="h-3 w-3" />}
+                              Quality
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Run data quality check</TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
                           <Button variant="outline" size="sm" className="gap-1 text-xs h-7" aria-label="Export all data">
@@ -1918,12 +3091,8 @@ export default function SynthForgeApp() {
           </ScrollArea>
         </TabsContent>
 
-        <TabsContent value="relationships" className="flex-1 overflow-auto mt-0">
-          <ScrollArea className="h-full">
-            <div className="p-4">
-              <SchemaVisualization />
-            </div>
-          </ScrollArea>
+        <TabsContent value="relationships" className="flex-1 mt-0 overflow-hidden">
+          <SchemaVisualization />
         </TabsContent>
 
         <TabsContent value="sql" className="flex-1 flex flex-col mt-0">
@@ -1933,21 +3102,132 @@ export default function SynthForgeApp() {
               <span className="text-sm font-semibold">SQL Playground</span>
               <Badge variant="secondary" className="text-[10px] ml-auto">Preview Mode</Badge>
             </div>
-            <Textarea
-              value={sqlQuery}
-              onChange={(e) => setSqlQuery(e.target.value)}
-              placeholder="SELECT * FROM users LIMIT 10;"
-              className="min-h-[100px] font-mono text-xs flex-1"
-              aria-label="SQL query input"
-            />
-            <Button
-              size="sm"
-              className="bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white w-fit"
-              onClick={runSqlPlayground}
-              disabled={!sqlQuery.trim()}
-            >
-              <Play className="h-3 w-3 mr-1" /> Run Query
-            </Button>
+
+            {/* SQL Suggestion Area */}
+            {showSqlSuggestion && sqlSuggestion && (
+              <motion.div
+                initial={{ opacity: 0, y: -8 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="border border-amber-200 bg-amber-50/50 rounded-lg p-3 space-y-2"
+              >
+                <div className="flex items-center gap-2">
+                  <Sparkles className="h-3.5 w-3.5 text-amber-700" />
+                  <span className="text-xs font-semibold text-amber-800">AI Suggestion</span>
+                </div>
+                <ScrollArea className="max-h-32">
+                  <pre className="text-[11px] font-mono whitespace-pre-wrap text-amber-900">{sqlSuggestion}</pre>
+                </ScrollArea>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 text-[10px] gap-1 border-green-300 text-green-700 hover:bg-green-50"
+                    onClick={() => {
+                      setSqlQuery(sqlSuggestion)
+                      setShowSqlSuggestion(false)
+                      setSqlSuggestion('')
+                      toast({ title: 'SQL Accepted', description: 'AI suggestion applied to editor' })
+                    }}
+                  >
+                    <Check className="h-2.5 w-2.5" /> Accept
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 text-[10px] gap-1 border-red-300 text-red-700 hover:bg-red-50"
+                    onClick={() => {
+                      setShowSqlSuggestion(false)
+                      setSqlSuggestion('')
+                    }}
+                  >
+                    <X className="h-2.5 w-2.5" /> Reject
+                  </Button>
+                </div>
+              </motion.div>
+            )}
+
+            {/* SQL Editor with Syntax Highlighting */}
+            <div className="flex-1 relative">
+              <Textarea
+                value={sqlQuery}
+                onChange={(e) => {
+                  setSqlQuery(e.target.value)
+                  validateSql(e.target.value)
+                  setShowSqlSuggestion(false)
+                }}
+                placeholder={"-- Write a comment like: Get all users older than 30\n-- Or type SQL directly:\nSELECT * FROM users LIMIT 10;"}
+                className="min-h-[120px] font-mono text-xs flex-1"
+                aria-label="SQL query input"
+              />
+              {sqlValidationError && (
+                <div className="absolute bottom-1 left-1 right-1 flex items-center gap-1 text-[10px] text-red-600 bg-red-50 px-2 py-1 rounded">
+                  <AlertCircle className="h-3 w-3 shrink-0" />
+                  {sqlValidationError}
+                </div>
+              )}
+            </div>
+
+            {/* SQL Action Buttons */}
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <Button
+                size="sm"
+                className="bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white h-7 text-xs"
+                onClick={runSqlPlayground}
+                disabled={!sqlQuery.trim()}
+              >
+                <Play className="h-3 w-3 mr-1" /> Run
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs gap-1"
+                onClick={() => {
+                  const commentMatch = sqlQuery.match(/^--\s*(.+)$/m)
+                  if (commentMatch) {
+                    sendMessage(`Generate SQL for: ${commentMatch[1]}`)
+                  } else if (sqlQuery.trim()) {
+                    sendMessage(`Generate an improved or alternative SQL query for: ${sqlQuery.trim()}`)
+                  } else {
+                    toast({ title: 'No query', description: 'Write a comment (-- text) or SQL query first', variant: 'destructive' })
+                  }
+                }}
+                disabled={isLoading || !sqlQuery.trim()}
+              >
+                <Wand2 className="h-3 w-3" /> Ask AI
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs gap-1"
+                onClick={() => {
+                  if (!sqlQuery.trim()) {
+                    toast({ title: 'No query', description: 'Write a SQL query first', variant: 'destructive' })
+                    return
+                  }
+                  sendMessage(`Explain this SQL query in plain English: ${sqlQuery.trim()}`)
+                }}
+                disabled={isLoading || !sqlQuery.trim()}
+              >
+                <HelpCircle className="h-3 w-3" /> Explain
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs gap-1"
+                onClick={() => {
+                  if (!sqlQuery.trim()) return
+                  // Simple SQL formatting
+                  let formatted = sqlQuery
+                    .replace(/\b(SELECT|FROM|WHERE|JOIN|LEFT JOIN|RIGHT JOIN|INNER JOIN|OUTER JOIN|ON|AND|OR|ORDER BY|GROUP BY|HAVING|INSERT INTO|VALUES|UPDATE|SET|DELETE FROM|CREATE TABLE|ALTER TABLE|DROP TABLE|AS|IN|NOT|IS|NULL|LIKE|BETWEEN|EXISTS|DISTINCT|LIMIT|OFFSET|UNION|CASE|WHEN|THEN|ELSE|END)\b/gi, '\n$1')
+                    .replace(/^\n/, '')
+                    .replace(/\n\n+/g, '\n')
+                  setSqlQuery(formatted)
+                }}
+              >
+                <AlignLeft className="h-3 w-3" /> Format
+              </Button>
+            </div>
+
             {sqlResult && (
               <ScrollArea className="max-h-64">
                 <pre className="bg-slate-900 text-green-400 p-3 rounded-lg text-xs font-mono whitespace-pre-wrap">
@@ -1958,7 +3238,7 @@ export default function SynthForgeApp() {
           </div>
         </TabsContent>
 
-        <TabsContent value="explorer" className="flex-1 overflow-auto mt-0">
+        <TabsContent value="explorer" className="flex-1 mt-0 overflow-hidden">
           <ExplorerTree />
         </TabsContent>
       </Tabs>
@@ -2740,6 +4020,7 @@ export default function SynthForgeApp() {
     return null
   }
 
+  // Render Quality Report dialog (must be inside return)
   // Default fallback
-  return null
+  return <>{qualityReport && <QualityReportPanel />}</>
 }

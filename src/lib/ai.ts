@@ -36,8 +36,15 @@ export interface ClarificationOption {
   description?: string
 }
 
+export interface AgentStep {
+  agent: string
+  task: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
+  output?: string
+}
+
 export interface AgentResponse {
-  action: 'generate' | 'modify' | 'clarify' | 'plan' | 'execute' | 'validate' | 'evolve'
+  action: 'generate' | 'modify' | 'clarify' | 'plan' | 'execute' | 'validate' | 'evolve' | 'multi_step'
   agentName: string
   explanation: string
   tables?: Record<string, Record<string, unknown>[]>
@@ -46,6 +53,7 @@ export interface AgentResponse {
   reasoningSteps?: ReasoningStep[]
   options?: ClarificationOption[]
   followUpQuestions?: string[]
+  steps?: AgentStep[]
 }
 
 // ─── Agent System Prompts ──────────────────────────────────────────
@@ -194,7 +202,31 @@ For clarification (when user wants data but hasn't specified row count):
   "reasoningSteps": [
     {"type": "intent", "label": "Intent Analysis", "description": "Understanding request", "status": "completed", "output": "Data generation request, row count not specified"}
   ]
-}`
+}
+
+MULTI-STEP EXECUTION:
+When the user's request is complex and involves multiple distinct capabilities, use the "multi_step" action. This is appropriate for:
+- Complex data generation requiring multiple passes (e.g., schema design + data generation + validation)
+- Data analysis + visualization requests
+- Schema design + data generation + validation pipeline
+- Any request involving more than one distinct capability
+
+For multi-step requests, respond with:
+{
+  "action": "multi_step",
+  "agentName": "orchestrator",
+  "explanation": "I'll break this down into steps...",
+  "steps": [
+    {"agent": "schema-agent", "task": "Design schema for e-commerce platform", "status": "pending"},
+    {"agent": "data-agent", "task": "Generate realistic data for all tables", "status": "pending"},
+    {"agent": "quality-agent", "task": "Validate data quality and fix issues", "status": "pending"}
+  ],
+  "reasoningSteps": [
+    {"type": "intent", "label": "Intent Analysis", "description": "Understanding complex request", "status": "completed", "output": "Multi-step pipeline required"}
+  ]
+}
+
+For simple single-step requests (just generate data, just add a table), continue using the "generate" action directly.`
 
 // ─── Core API Functions using z-ai-web-dev-sdk ──────────────────
 
@@ -533,7 +565,8 @@ export function parseAgentResponse(content: string): AgentResponse | null {
         schemaPlan: parsed.schemaPlan || undefined,
         reasoningSteps: parsed.reasoningSteps || undefined,
         options: parsed.options || undefined,
-        followUpQuestions: parsed.followUpQuestions || undefined
+        followUpQuestions: parsed.followUpQuestions || undefined,
+        steps: parsed.steps || undefined
       }
     }
   } catch {
@@ -793,6 +826,8 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
 
         // Try local fallback for streaming
         try {
+          // Check if controller is still open before writing
+          if (!controller.desiredSize === null) return // already closed
           const fallback = generateLocalFallback(request.messages)
           const chunkSize = 20
           for (let i = 0; i < fallback.content.length; i += chunkSize) {
@@ -802,9 +837,14 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
           }
           controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done', data: { tokensIn: 0, tokensOut: 0, model: 'synthforge-local-fallback' } })}\n\n`))
           controller.close()
-        } catch {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', data: error instanceof Error ? error.message : 'Stream failed' })}\n\n`))
-          controller.close()
+        } catch (innerError) {
+          // Controller might already be closed - silently handle
+          try {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', data: error instanceof Error ? error.message : 'Stream failed' })}\n\n`))
+            controller.close()
+          } catch {
+            // Controller already closed, nothing to do
+          }
         }
       }
     }
