@@ -1,19 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { chatCompletionStream, chatCompletion, estimateCost, parseAgentResponse } from '@/lib/ai'
+import { chatCompletionStream, chatCompletion, estimateCost, parseAgentResponse, getSystemPrompt } from '@/lib/ai'
 
 // POST /api/chat - Send message and get AI response
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { conversationId, message, workspaceId, databaseId, stream = true } = body
+    const { conversationId, message, workspaceId, databaseId, stream = true, agentMode = 'auto', files = [] } = body
 
     if (!message || typeof message !== 'string') {
       return NextResponse.json({ error: 'Message required' }, { status: 400 })
     }
 
     let conversation = conversationId
-      ? await db.conversation.findUnique({ where: { id: conversationId }, include: { messages: true } })
+      ? await db.conversation.findUnique({ where: { id: conversationId }, include: { messages: { orderBy: { createdAt: 'asc' } } } })
       : null
 
     if (!conversation && databaseId) {
@@ -21,7 +21,8 @@ export async function POST(request: NextRequest) {
         data: {
           title: message.slice(0, 60),
           databaseId,
-          workspaceId: workspaceId || ''
+          workspaceId: workspaceId || '',
+          agentMode
         },
         include: { messages: true }
       })
@@ -31,8 +32,16 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Conversation not found and no databaseId provided' }, { status: 400 })
     }
 
+    // Update agent mode if changed
+    if (agentMode && agentMode !== conversation.agentMode) {
+      await db.conversation.update({
+        where: { id: conversation.id },
+        data: { agentMode }
+      })
+    }
+
     // Save user message
-    const userMsg = await db.message.create({
+    await db.message.create({
       data: {
         role: 'user',
         content: message,
@@ -42,27 +51,37 @@ export async function POST(request: NextRequest) {
 
     // Get database schema for context
     const database = await db.database.findUnique({ where: { id: conversation.databaseId } })
-    const schemaContext = database?.schemaJson ? `\n\nCurrent database schema:\n${database.schemaJson}` : ''
+    const schemaContext = database?.schemaJson && database.schemaJson !== '{}' ? `\n\nCurrent database schema:\n${database.schemaJson}` : ''
+    const dataContext = database?.dataJson && database.dataJson !== '{}' ? `\nCurrent data summary:\n${Object.keys(JSON.parse(database.dataJson || '{}')).map(t => `${t} (${Array.isArray((JSON.parse(database.dataJson || '{}')[t])) ? (JSON.parse(database.dataJson || '{}')[t]).length : 0} rows)`).join(', ')}` : ''
 
-    // Build conversation history
-    const previousMessages = conversation.messages
-      .sort((a: { createdAt: Date }, b: { createdAt: Date }) => a.createdAt.getTime() - b.createdAt.getTime())
+    // Build file context
+    let fileContext = ''
+    if (files && files.length > 0) {
+      fileContext = `\n\nAttached files:\n${files.map((f: { name: string; content: string; type: string }) => `--- ${f.name} (${f.type}) ---\n${f.content?.slice(0, 3000)}`).join('\n\n')}`
+    }
+
+    // Build conversation history (last 20 messages for context window)
+    const previousMessages = (conversation.messages || [])
+      .slice(-20)
       .map((m: { role: string; content: string }) => ({
         role: m.role as 'user' | 'assistant',
         content: m.content
       }))
 
+    const currentAgentMode = agentMode || conversation.agentMode || 'auto'
+    const systemPrompt = getSystemPrompt(currentAgentMode)
+
     const chatMessages = [
       ...previousMessages,
-      { role: 'user' as const, content: message + schemaContext }
+      { role: 'user' as const, content: message + schemaContext + dataContext + fileContext }
     ]
 
     if (stream) {
       // Streaming response
       const aiStream = await chatCompletionStream({
-        messages: chatMessages,
+        messages: [{ role: 'system', content: systemPrompt }, ...chatMessages],
         temperature: 0.7,
-        maxTokens: 4096
+        maxTokens: 8192
       })
 
       // We need to collect the full response to save it
@@ -82,10 +101,13 @@ export async function POST(request: NextRequest) {
           }
         },
         async flush() {
-          // Save the assistant message after streaming completes
           try {
             const parsed = parseAgentResponse(fullContent)
             const sqlCode = parsed?.sqlCode || ''
+            const agentName = parsed?.agentName || currentAgentMode + '-agent'
+            const options = parsed?.options || []
+            const reasoningSteps = parsed?.reasoningSteps || []
+            const tablesJson = parsed?.tables ? JSON.stringify(parsed.tables) : '{}'
 
             await db.message.create({
               data: {
@@ -95,17 +117,54 @@ export async function POST(request: NextRequest) {
                 tokensIn: 0,
                 tokensOut: 0,
                 cost: 0,
-                sqlCode
+                sqlCode,
+                agentName,
+                reasoningSteps: JSON.stringify(reasoningSteps),
+                options: JSON.stringify(options),
+                tablesJson
               }
             })
 
             // Update database schema if tables were generated
             if (parsed?.tables && Object.keys(parsed.tables).length > 0 && database) {
               const currentSchema = JSON.parse(database.schemaJson || '{}')
-              const updatedSchema = { ...currentSchema, ...parsed.tables }
+              // Merge schema info from generated data
+              for (const tableName of Object.keys(parsed.tables)) {
+                const rows = parsed.tables[tableName]
+                if (Array.isArray(rows) && rows.length > 0) {
+                  const columns: Record<string, string> = {}
+                  for (const [key, value] of Object.entries(rows[0])) {
+                    columns[key] = typeof value === 'number' ? (Number.isInteger(value) ? 'INTEGER' : 'DECIMAL') : typeof value === 'boolean' ? 'BOOLEAN' : typeof value === 'object' ? 'JSON' : 'VARCHAR(255)'
+                  }
+                  if (!currentSchema[tableName]) {
+                    currentSchema[tableName] = { columns }
+                  }
+                }
+              }
+
+              // Update data
+              const currentData = JSON.parse(database.dataJson || '{}')
+              for (const [tableName, rows] of Object.entries(parsed.tables)) {
+                if (Array.isArray(rows)) {
+                  currentData[tableName] = rows
+                }
+              }
+
               await db.database.update({
                 where: { id: database.id },
-                data: { schemaJson: JSON.stringify(updatedSchema) }
+                data: {
+                  schemaJson: JSON.stringify(currentSchema),
+                  dataJson: JSON.stringify(currentData)
+                }
+              })
+
+              // Create schema version
+              await db.schemaVersion.create({
+                data: {
+                  schemaJson: JSON.stringify(currentSchema),
+                  description: `Auto-generated from ${agentName}`,
+                  databaseId: database.id
+                }
               })
             }
           } catch (e) {
@@ -127,14 +186,18 @@ export async function POST(request: NextRequest) {
     } else {
       // Non-streaming response
       const response = await chatCompletion({
-        messages: chatMessages,
+        messages: [{ role: 'system', content: systemPrompt }, ...chatMessages],
         temperature: 0.7,
-        maxTokens: 4096
+        maxTokens: 8192
       })
 
       const cost = estimateCost(response.tokensIn, response.tokensOut)
       const parsed = parseAgentResponse(response.content)
       const sqlCode = parsed?.sqlCode || ''
+      const agentName = parsed?.agentName || currentAgentMode + '-agent'
+      const options = parsed?.options || []
+      const reasoningSteps = parsed?.reasoningSteps || []
+      const tablesJson = parsed?.tables ? JSON.stringify(parsed.tables) : '{}'
 
       await db.message.create({
         data: {
@@ -144,17 +207,51 @@ export async function POST(request: NextRequest) {
           tokensIn: response.tokensIn,
           tokensOut: response.tokensOut,
           cost,
-          sqlCode
+          sqlCode,
+          agentName,
+          reasoningSteps: JSON.stringify(reasoningSteps),
+          options: JSON.stringify(options),
+          tablesJson
         }
       })
 
       // Update database schema if tables were generated
       if (parsed?.tables && Object.keys(parsed.tables).length > 0 && database) {
         const currentSchema = JSON.parse(database.schemaJson || '{}')
-        const updatedSchema = { ...currentSchema, ...parsed.tables }
+        for (const tableName of Object.keys(parsed.tables)) {
+          const rows = parsed.tables[tableName]
+          if (Array.isArray(rows) && rows.length > 0) {
+            const columns: Record<string, string> = {}
+            for (const [key, value] of Object.entries(rows[0])) {
+              columns[key] = typeof value === 'number' ? (Number.isInteger(value) ? 'INTEGER' : 'DECIMAL') : typeof value === 'boolean' ? 'BOOLEAN' : typeof value === 'object' ? 'JSON' : 'VARCHAR(255)'
+            }
+            if (!currentSchema[tableName]) {
+              currentSchema[tableName] = { columns }
+            }
+          }
+        }
+
+        const currentData = JSON.parse(database.dataJson || '{}')
+        for (const [tableName, rows] of Object.entries(parsed.tables)) {
+          if (Array.isArray(rows)) {
+            currentData[tableName] = rows
+          }
+        }
+
         await db.database.update({
           where: { id: database.id },
-          data: { schemaJson: JSON.stringify(updatedSchema) }
+          data: {
+            schemaJson: JSON.stringify(currentSchema),
+            dataJson: JSON.stringify(currentData)
+          }
+        })
+
+        await db.schemaVersion.create({
+          data: {
+            schemaJson: JSON.stringify(currentSchema),
+            description: `Auto-generated from ${agentName}`,
+            databaseId: database.id
+          }
         })
       }
 
@@ -164,9 +261,13 @@ export async function POST(request: NextRequest) {
           role: 'assistant',
           content: response.content,
           sqlCode,
+          agentName,
           tokensIn: response.tokensIn,
           tokensOut: response.tokensOut,
-          cost
+          cost,
+          options,
+          reasoningSteps,
+          tablesJson
         }
       })
     }
