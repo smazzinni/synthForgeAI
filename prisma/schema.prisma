@@ -1,0 +1,95 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Workspace {
+  id              String   @id @default(cuid())
+  name            String
+  slug            String   @unique
+  agentInstructions String   @default("")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  projects        Project[]
+  conversations   Conversation[]
+  apiKeys         ApiKey[]
+}
+
+model Project {
+  id          String   @id @default(cuid())
+  name        String
+  description String   @default("")
+  workspaceId String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  databases   Database[]
+}
+
+model Database {
+  id          String   @id @default(cuid())
+  name        String
+  dbType      String   @default("sqlite")
+  schemaJson  String   @default("{}")
+  projectId   String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+  datasets    Dataset[]
+}
+
+model Conversation {
+  id          String   @id @default(cuid())
+  title       String   @default("New Conversation")
+  databaseId  String
+  workspaceId String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  database    Database @relation(fields: [databaseId], references: [id], onDelete: Cascade)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  messages    Message[]
+}
+
+model Message {
+  id             String   @id @default(cuid())
+  role           String   @default("user")
+  content        String
+  tokensIn       Int      @default(0)
+  tokensOut      Int      @default(0)
+  cost           Float    @default(0)
+  sqlCode        String   @default("")
+  conversationId String
+  createdAt      DateTime @default(now())
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+}
+
+model Dataset {
+  id          String   @id @default(cuid())
+  name        String
+  version     Int      @default(1)
+  format      String   @default("json")
+  rowCount    Int      @default(0)
+  dataJson    String   @default("[]")
+  schemaJson  String   @default("{}")
+  seed        Int      @default(0)
+  databaseId  String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  database    Database @relation(fields: [databaseId], references: [id], onDelete: Cascade)
+}
+
+model ApiKey {
+  id          String   @id @default(cuid())
+  name        String
+  keyHash     String
+  keyPrefix   String
+  workspaceId String
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+}
