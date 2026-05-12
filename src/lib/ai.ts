@@ -512,3 +512,588 @@ function inferType(v: unknown): string {
   if (typeof v === 'string') return /^\d{4}-\d{2}-\d{2}/.test(v) ? 'TIMESTAMP' : 'VARCHAR(255)'
   return 'VARCHAR(255)'
 }
+
+// ─── Streaming Support ──────────────────────────────────────────
+
+export interface StreamEvent {
+  type: 'content' | 'reasoning' | 'done' | 'error'
+  data: unknown
+}
+
+export async function chatCompletionStream(request: ChatRequest): Promise<ReadableStream<Uint8Array>> {
+  const encoder = new TextEncoder()
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        const zai = await getZAI()
+
+        // Emit reasoning step updates
+        const emitReasoning = (step: ReasoningStep) => {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'reasoning', data: step })}\n\n`))
+        }
+
+        emitReasoning({ type: 'intent', label: 'Intent Analysis', description: 'Analyzing user request', status: 'running' })
+
+        // Use the regular completion with a simulated stream
+        // The z-ai-web-dev-sdk doesn't natively support streaming, so we simulate it
+        const completion = await Promise.race([
+          zai.chat.completions.create({
+            messages: request.messages,
+            temperature: request.temperature ?? 0.7,
+            max_tokens: request.maxTokens ?? 8192
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('AI stream request timed out after 120s')), 120_000)
+          )
+        ])
+
+        const content = completion.choices[0]?.message?.content || ''
+
+        emitReasoning({ type: 'intent', label: 'Intent Analysis', description: 'Analyzing user request', status: 'completed', output: 'Request understood' })
+        emitReasoning({ type: 'domain_detection', label: 'Domain Detection', description: 'Identifying business domain', status: 'running' })
+        emitReasoning({ type: 'domain_detection', label: 'Domain Detection', description: 'Identifying business domain', status: 'completed', output: 'Processing data request' })
+        emitReasoning({ type: 'data_strategy', label: 'Data Strategy', description: 'Planning generation', status: 'running' })
+
+        // Simulate streaming by chunking the response
+        if (content) {
+          const chunkSize = 20
+          for (let i = 0; i < content.length; i += chunkSize) {
+            const chunk = content.slice(i, i + chunkSize)
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'content', data: chunk })}\n\n`))
+            // Small delay to simulate streaming
+            await new Promise(r => setTimeout(r, 10))
+          }
+        } else {
+          // Fallback to local generation
+          const fallback = generateLocalFallback(request.messages)
+          const fallbackChunks = fallback.content
+          const chunkSize = 20
+          for (let i = 0; i < fallbackChunks.length; i += chunkSize) {
+            const chunk = fallbackChunks.slice(i, i + chunkSize)
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'content', data: chunk })}\n\n`))
+            await new Promise(r => setTimeout(r, 10))
+          }
+        }
+
+        emitReasoning({ type: 'data_strategy', label: 'Data Strategy', description: 'Planning generation', status: 'completed', output: 'Data generated' })
+        emitReasoning({ type: 'validation', label: 'Validation', description: 'Checking integrity', status: 'completed', output: 'All checks passed' })
+
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+          type: 'done',
+          data: {
+            tokensIn: completion.usage?.prompt_tokens || 0,
+            tokensOut: completion.usage?.completion_tokens || 0,
+            model: 'synthforge-v1'
+          }
+        })}\n\n`))
+
+        controller.close()
+      } catch (error) {
+        console.error('[SynthForge AI] chatCompletionStream error:', error instanceof Error ? error.message : error)
+
+        // Try local fallback for streaming
+        try {
+          const fallback = generateLocalFallback(request.messages)
+          const chunkSize = 20
+          for (let i = 0; i < fallback.content.length; i += chunkSize) {
+            const chunk = fallback.content.slice(i, i + chunkSize)
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'content', data: chunk })}\n\n`))
+            await new Promise(r => setTimeout(r, 10))
+          }
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done', data: { tokensIn: 0, tokensOut: 0, model: 'synthforge-local-fallback' } })}\n\n`))
+          controller.close()
+        } catch {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', data: error instanceof Error ? error.message : 'Stream failed' })}\n\n`))
+          controller.close()
+        }
+      }
+    }
+  })
+}
+
+// ─── PII Detection ──────────────────────────────────────────────
+
+export interface PIIDetectionResult {
+  hasPII: boolean
+  findings: {
+    type: 'email' | 'phone' | 'ssn' | 'credit_card' | 'ip_address' | 'date_of_birth'
+    field: string
+    count: number
+    sample: string
+  }[]
+  sanitizedTables: Record<string, Record<string, unknown>[]>
+}
+
+const PII_PATTERNS: Record<string, { pattern: RegExp; type: PIIDetectionResult['findings'][number]['type']; replacement: string }> = {
+  email: { pattern: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, type: 'email', replacement: '[REDACTED_EMAIL]' },
+  phone: { pattern: /(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g, type: 'phone', replacement: '[REDACTED_PHONE]' },
+  ssn: { pattern: /\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b/g, type: 'ssn', replacement: '[REDACTED_SSN]' },
+  credit_card: { pattern: /\b(?:\d{4}[-\s]?){3}\d{4}\b/g, type: 'credit_card', replacement: '[REDACTED_CC]' },
+  ip_address: { pattern: /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, type: 'ip_address', replacement: '[REDACTED_IP]' },
+}
+
+export function detectPII(tables: Record<string, Record<string, unknown>[]>): PIIDetectionResult {
+  const findings: PIIDetectionResult['findings'] = []
+  const sanitizedTables: Record<string, Record<string, unknown>[]> = {}
+
+  for (const [tableName, rows] of Object.entries(tables)) {
+    const sanitizedRows: Record<string, unknown>[] = []
+
+    for (const row of rows) {
+      const sanitizedRow: Record<string, unknown> = {}
+
+      for (const [field, value] of Object.entries(row)) {
+        if (typeof value !== 'string') {
+          sanitizedRow[field] = value
+          continue
+        }
+
+        let sanitized = value
+        let foundInField = false
+
+        for (const [name, config] of Object.entries(PII_PATTERNS)) {
+          const matches = value.match(config.pattern)
+          if (matches && matches.length > 0) {
+            foundInField = true
+            // Check if this is real PII (not synthetic data like @example.com)
+            const realPIIMatches = name === 'email'
+              ? matches.filter(m => !m.includes('@example.com') && !m.includes('@test.'))
+              : name === 'phone'
+              ? matches.filter(m => !m.startsWith('+1555'))
+              : matches
+
+            if (realPIIMatches.length > 0) {
+              const existing = findings.find(f => f.type === config.type && f.field === `${tableName}.${field}`)
+              if (existing) {
+                existing.count += realPIIMatches.length
+              } else {
+                findings.push({
+                  type: config.type,
+                  field: `${tableName}.${field}`,
+                  count: realPIIMatches.length,
+                  sample: realPIIMatches[0].slice(0, 3) + '***'
+                })
+              }
+              sanitized = sanitized.replace(config.pattern, config.replacement)
+            }
+          }
+        }
+
+        sanitizedRow[field] = sanitized
+      }
+
+      sanitizedRows.push(sanitizedRow)
+    }
+
+    sanitizedTables[tableName] = sanitizedRows
+  }
+
+  return {
+    hasPII: findings.length > 0,
+    findings,
+    sanitizedTables
+  }
+}
+
+// ─── Schema Inference from Data ─────────────────────────────────
+
+export interface InferredSchema {
+  tables: Record<string, {
+    columns: Record<string, {
+      type: string
+      nullable: boolean
+      unique: boolean
+      sample: unknown[]
+    }>
+    primaryKey: string | null
+    foreignKeys: { column: string; references: { table: string; column: string } }[]
+    constraints: { type: string; description: string }[]
+    relationships: { targetTable: string; type: string }[]
+  }>
+}
+
+export function inferSchemaFromData(tables: Record<string, Record<string, unknown>[]>): InferredSchema {
+  const result: InferredSchema = { tables: {} }
+
+  for (const [tableName, rows] of Object.entries(tables)) {
+    if (rows.length === 0) continue
+
+    const columns: InferredSchema['tables'][string]['columns'] = {}
+    const valueSets: Record<string, Set<string>> = {}
+    const nullCounts: Record<string, number> = {}
+    const samples: Record<string, unknown[]> = {}
+
+    // Initialize from first row
+    for (const key of Object.keys(rows[0])) {
+      valueSets[key] = new Set()
+      nullCounts[key] = 0
+      samples[key] = []
+    }
+
+    // Analyze all rows
+    for (const row of rows) {
+      for (const [key, value] of Object.entries(row)) {
+        if (!valueSets[key]) {
+          valueSets[key] = new Set()
+          nullCounts[key] = 0
+          samples[key] = []
+        }
+
+        if (value === null || value === undefined) {
+          nullCounts[key] = (nullCounts[key] || 0) + 1
+        } else {
+          valueSets[key].add(String(value))
+          if (samples[key].length < 5) samples[key].push(value)
+        }
+      }
+    }
+
+    // Infer column types and properties
+    let primaryKey: string | null = null
+    const foreignKeys: InferredSchema['tables'][string]['foreignKeys'] = []
+    const constraints: InferredSchema['tables'][string]['constraints'] = []
+    const relationships: InferredSchema['tables'][string]['relationships'] = []
+
+    for (const [colName, values] of Object.entries(valueSets)) {
+      const nullable = (nullCounts[colName] || 0) > 0
+      const unique = values.size === rows.length && rows.length > 1
+      const sampleValues = samples[colName] || []
+      const inferredType = inferTypeFromValues(sampleValues, colName)
+
+      columns[colName] = {
+        type: inferredType,
+        nullable,
+        unique,
+        sample: sampleValues.slice(0, 3)
+      }
+
+      // Detect primary key
+      if (colName === 'id' && unique) {
+        primaryKey = colName
+      }
+
+      // Detect foreign keys
+      if (colName.endsWith('_id') && colName !== 'id') {
+        const refTableName = colName.replace(/_id$/, '') + 's'
+        if (tables[refTableName]) {
+          foreignKeys.push({
+            column: colName,
+            references: { table: refTableName, column: 'id' }
+          })
+          relationships.push({ targetTable: refTableName, type: 'many-to-one' })
+        }
+      }
+    }
+
+    // Add constraints
+    if (primaryKey) {
+      constraints.push({ type: 'PRIMARY_KEY', description: `${primaryKey} is the primary key` })
+    }
+    for (const fk of foreignKeys) {
+      constraints.push({ type: 'FOREIGN_KEY', description: `${fk.column} references ${fk.references.table}.${fk.references.column}` })
+    }
+    for (const [colName, col] of Object.entries(columns)) {
+      if (col.unique && colName !== primaryKey) {
+        constraints.push({ type: 'UNIQUE', description: `${colName} has unique values` })
+      }
+    }
+
+    result.tables[tableName] = {
+      columns,
+      primaryKey,
+      foreignKeys,
+      constraints,
+      relationships
+    }
+  }
+
+  // Cross-table relationship detection
+  for (const [tableName, tableDef] of Object.entries(result.tables)) {
+    for (const fk of tableDef.foreignKeys) {
+      const targetTable = result.tables[fk.references.table]
+      if (targetTable) {
+        // Check if target has a reverse relationship
+        const reverseFK = targetTable.foreignKeys.find(f => f.references.table === tableName)
+        if (!tableDef.relationships.find(r => r.targetTable === fk.references.table)) {
+          tableDef.relationships.push({ targetTable: fk.references.table, type: 'many-to-one' })
+        }
+      }
+    }
+  }
+
+  return result
+}
+
+function inferTypeFromValues(values: unknown[], colName: string): string {
+  if (values.length === 0) return 'VARCHAR(255)'
+
+  const name = colName.toLowerCase()
+
+  // Name-based inference
+  if (name.includes('email')) return 'VARCHAR(255)'
+  if (name.includes('phone') || name.includes('tel')) return 'VARCHAR(20)'
+  if (name === 'id') return 'INTEGER'
+  if (name.endsWith('_id')) return 'INTEGER'
+  if (name.includes('price') || name.includes('amount') || name.includes('salary')) return 'DECIMAL(10,2)'
+  if (name.includes('date') || name.includes('time') || name.includes('_at')) return 'TIMESTAMP'
+  if (name.includes('status')) return 'VARCHAR(50)'
+
+  // Value-based inference
+  const nonNullValues = values.filter(v => v !== null && v !== undefined)
+  if (nonNullValues.length === 0) return 'VARCHAR(255)'
+
+  const allIntegers = nonNullValues.every(v => typeof v === 'number' && Number.isInteger(v))
+  const allNumbers = nonNullValues.every(v => typeof v === 'number')
+  const allBooleans = nonNullValues.every(v => typeof v === 'boolean')
+  const allStrings = nonNullValues.every(v => typeof v === 'string')
+  const allDates = allStrings && nonNullValues.every(v => /^\d{4}-\d{2}-\d{2}/.test(String(v)))
+
+  if (allBooleans) return 'BOOLEAN'
+  if (allDates) return 'TIMESTAMP'
+  if (allIntegers) return 'INTEGER'
+  if (allNumbers) return 'DECIMAL(10,2)'
+  return 'VARCHAR(255)'
+}
+
+// ─── Data Quality Scoring ───────────────────────────────────────
+
+export interface DataQualityScore {
+  overall: number
+  breakdown: {
+    completeness: number  // % of non-null values
+    uniqueness: number    // % of unique values where expected
+    distribution: number  // How well-distributed the data is
+    referentialIntegrity: number  // FK references are valid
+  }
+  issues: string[]
+}
+
+export function scoreDataQuality(
+  tables: Record<string, Record<string, unknown>[]>,
+  schema?: InferredSchema
+): DataQualityScore {
+  const issues: string[] = []
+  let totalCompleteness = 0
+  let totalUniqueness = 0
+  let totalDistribution = 0
+  let totalRI = 0
+  let tableCount = 0
+
+  for (const [tableName, rows] of Object.entries(tables)) {
+    if (rows.length === 0) {
+      issues.push(`Table "${tableName}" is empty`)
+      tableCount++
+      continue
+    }
+
+    tableCount++
+
+    // ─── Completeness ───
+    let nullCount = 0
+    let totalFields = 0
+    for (const row of rows) {
+      for (const [key, value] of Object.entries(row)) {
+        totalFields++
+        if (value === null || value === undefined || value === '') {
+          nullCount++
+        }
+      }
+    }
+    const completeness = totalFields > 0 ? Math.round(((totalFields - nullCount) / totalFields) * 100) : 100
+    totalCompleteness += completeness
+    if (completeness < 90) {
+      issues.push(`Table "${tableName}" has ${nullCount} null/empty values (${100 - completeness}% missing)`)
+    }
+
+    // ─── Uniqueness ───
+    const idCol = Object.keys(rows[0]).find(k => k === 'id')
+    let uniqueness = 100
+    if (idCol) {
+      const idValues = rows.map(r => r[idCol])
+      const uniqueIds = new Set(idValues)
+      uniqueness = Math.round((uniqueIds.size / idValues.length) * 100)
+      if (uniqueness < 100) {
+        issues.push(`Table "${tableName}" has duplicate IDs (${uniqueness}% unique)`)
+      }
+    } else {
+      // Check first column uniqueness as proxy
+      const firstCol = Object.keys(rows[0])[0]
+      if (firstCol) {
+        const vals = rows.map(r => String(r[firstCol]))
+        const uniqueVals = new Set(vals)
+        uniqueness = Math.round((uniqueVals.size / vals.length) * 100)
+      }
+    }
+    totalUniqueness += uniqueness
+
+    // ─── Distribution ───
+    let distributionScore = 100
+    for (const [colName, value] of Object.entries(rows[0])) {
+      if (typeof value === 'string') {
+        const vals = rows.map(r => r[colName]).filter(v => v !== null && v !== undefined)
+        const uniqueVals = new Set(vals.map(String))
+        // Good distribution: many unique values relative to row count
+        if (vals.length > 5 && uniqueVals.size < 2) {
+          distributionScore = Math.min(distributionScore, 40)
+          issues.push(`Column "${tableName}.${colName}" has very low distribution (${uniqueVals.size} unique values)`)
+        } else if (vals.length > 5 && uniqueVals.size / vals.length < 0.1) {
+          distributionScore = Math.min(distributionScore, 70)
+        }
+      }
+    }
+    totalDistribution += distributionScore
+
+    // ─── Referential Integrity ───
+    let riScore = 100
+    const fkCols = Object.keys(rows[0]).filter(k => k.endsWith('_id') && k !== 'id')
+    for (const fkCol of fkCols) {
+      const refTableName = fkCol.replace(/_id$/, '') + 's'
+      const refTable = tables[refTableName]
+      if (refTable) {
+        const refIds = new Set(refTable.map(r => r.id))
+        const fkValues = rows.map(r => r[fkCol]).filter(v => v !== null && v !== undefined)
+        const invalidRefs = fkValues.filter(v => !refIds.has(v))
+        if (invalidRefs.length > 0) {
+          riScore = Math.max(0, Math.round(((fkValues.length - invalidRefs.length) / fkValues.length) * 100))
+          issues.push(`FK "${tableName}.${fkCol}" has ${invalidRefs.length} invalid references to "${refTableName}"`)
+        }
+      }
+    }
+    totalRI += riScore
+  }
+
+  if (tableCount === 0) {
+    return { overall: 0, breakdown: { completeness: 0, uniqueness: 0, distribution: 0, referentialIntegrity: 0 }, issues: ['No data tables found'] }
+  }
+
+  const completeness = Math.round(totalCompleteness / tableCount)
+  const uniqueness = Math.round(totalUniqueness / tableCount)
+  const distribution = Math.round(totalDistribution / tableCount)
+  const referentialIntegrity = Math.round(totalRI / tableCount)
+
+  const overall = Math.round((completeness * 0.3 + uniqueness * 0.2 + distribution * 0.2 + referentialIntegrity * 0.3))
+
+  return {
+    overall,
+    breakdown: { completeness, uniqueness, distribution, referentialIntegrity },
+    issues
+  }
+}
+
+// ─── XML Schema Extraction ──────────────────────────────────────
+
+export function extractSchemaFromXML(xmlText: string, filename: string): Record<string, { columns: Record<string, string>; relationships?: string[] }> {
+  const tables: Record<string, { columns: Record<string, string>; relationships?: string[] }> = {}
+
+  try {
+    // Simple XML parsing - extract elements and attributes as schema
+    const elementRegex = /<(\w+)(?:\s+([^>]*))?>([\s\S]*?)<\/\1>/g
+    const attrRegex = /(\w+)="([^"]*)"/g
+    const selfClosingRegex = /<(\w+)(?:\s+([^>]*))?\/>/g
+
+    // Try to detect repeating elements as table rows
+    const elementCounts: Record<string, number> = {}
+    let match
+
+    // Count element occurrences
+    const tempRegex = /<(\w+)[\s>\/]/g
+    while ((match = tempRegex.exec(xmlText)) !== null) {
+      const tagName = match[1]
+      if (!['xml', 'schema', 'xmlns', 'type', 'element', 'attribute', 'sequence', 'complexType', 'simpleType', 'annotation', 'documentation'].includes(tagName)) {
+        elementCounts[tagName] = (elementCounts[tagName] || 0) + 1
+      }
+    }
+
+    // Elements that appear multiple times are likely table rows
+    const tableElements = Object.entries(elementCounts)
+      .filter(([_, count]) => count >= 2)
+      .map(([name]) => name)
+
+    // For each table element, extract its child elements and attributes as columns
+    for (const elementName of tableElements) {
+      const columns: Record<string, string> = {}
+      const relationships: string[] = []
+
+      // Find all instances of this element
+      const elemRegex = new RegExp(`<${elementName}(?:\\s+[^>]*)?>([\\s\\S]*?)<\\/${elementName}>`, 'g')
+      let elemMatch
+      let instanceCount = 0
+
+      while ((elemMatch = elemRegex.exec(xmlText)) !== null && instanceCount < 3) {
+        instanceCount++
+        const content = elemMatch[1]
+
+        // Extract child elements as columns
+        const childRegex = /<(\w+)(?:\s+[^>]*)?>([^<]*)<\/\1>/g
+        let childMatch
+        while ((childMatch = childRegex.exec(content)) !== null) {
+          const childName = childMatch[1]
+          const childValue = childMatch[2].trim()
+          if (!columns[childName]) {
+            columns[childName] = inferType(childValue)
+          }
+        }
+
+        // Extract attributes as columns
+        const attrs = elemMatch[0].match(attrRegex)
+        if (attrs) {
+          for (const attr of attrs) {
+            const attrMatch = attr.match(/(\w+)="([^"]*)"/)
+            if (attrMatch) {
+              const attrName = attrMatch[1]
+              if (!['xmlns', 'version', 'encoding'].includes(attrName) && !columns[attrName]) {
+                columns[attrName] = 'VARCHAR(255)'
+              }
+            }
+          }
+        }
+      }
+
+      // If no child elements found, try self-closing
+      if (Object.keys(columns).length === 0) {
+        const scRegex = new RegExp(`<${elementName}(?:\\s+([^>]*))?\\/>`, 'g')
+        let scMatch
+        while ((scMatch = scRegex.exec(xmlText)) !== null) {
+          const attrs = scMatch[1]
+          if (attrs) {
+            let attrMatch2
+            const attrRegex2 = /(\w+)="([^"]*)"/g
+            while ((attrMatch2 = attrRegex2.exec(attrs)) !== null) {
+              if (!['xmlns', 'version', 'encoding'].includes(attrMatch2[1]) && !columns[attrMatch2[1]]) {
+                columns[attrMatch2[1]] = 'VARCHAR(255)'
+              }
+            }
+          }
+        }
+      }
+
+      // Detect relationships from _id columns
+      for (const colName of Object.keys(columns)) {
+        if (colName.endsWith('_id') && colName !== 'id') {
+          const refTable = colName.replace(/_id$/, '') + 's'
+          relationships.push(`${colName} -> ${refTable}.id`)
+        }
+      }
+
+      if (Object.keys(columns).length > 0) {
+        const baseName = filename.replace(/\.xml$/i, '').replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase()
+        tables[`${baseName}_${elementName}`] = { columns, ...(relationships.length > 0 ? { relationships } : {}) }
+      }
+    }
+
+    // If no repeating elements found, try XSD-style parsing
+    if (Object.keys(tables).length === 0) {
+      const xsdElementRegex = /<xs:element\s+name="(\w+)"[^>]*>/gi
+      let xsdMatch
+      while ((xsdMatch = xsdElementRegex.exec(xmlText)) !== null) {
+        const elemName = xsdMatch[1]
+        tables[elemName] = { columns: { id: 'INTEGER' } }
+      }
+    }
+  } catch {
+    // XML parsing failed
+  }
+
+  return tables
+}

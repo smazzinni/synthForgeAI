@@ -9,18 +9,32 @@ export async function GET(request: NextRequest) {
     if (projectId) {
       const databases = await db.database.findMany({
         where: { projectId },
-        include: { _count: { select: { datasets: true, conversations: true } } },
         orderBy: { updatedAt: 'desc' }
       })
-      return NextResponse.json({ databases })
+      // Add counts separately to avoid Prisma include issues
+      const databasesWithCounts = await Promise.all(databases.map(async (db_item) => {
+        const [datasetCount, conversationCount] = await Promise.all([
+          db.dataset.count({ where: { databaseId: db_item.id } }),
+          db.conversation.count({ where: { databaseId: db_item.id } })
+        ])
+        return { ...db_item, _count: { datasets: datasetCount, conversations: conversationCount } }
+      }))
+      return NextResponse.json({ databases: databasesWithCounts })
     }
 
     const databases = await db.database.findMany({
-      include: { _count: { select: { datasets: true, conversations: true } } },
       orderBy: { updatedAt: 'desc' }
     })
-    return NextResponse.json({ databases })
+    const databasesWithCounts = await Promise.all(databases.map(async (db_item) => {
+      const [datasetCount, conversationCount] = await Promise.all([
+        db.dataset.count({ where: { databaseId: db_item.id } }),
+        db.conversation.count({ where: { databaseId: db_item.id } })
+      ])
+      return { ...db_item, _count: { datasets: datasetCount, conversations: conversationCount } }
+    }))
+    return NextResponse.json({ databases: databasesWithCounts })
   } catch (error) {
+    console.error('[Databases API] Error:', error)
     return NextResponse.json({ error: 'Failed to fetch databases' }, { status: 500 })
   }
 }
