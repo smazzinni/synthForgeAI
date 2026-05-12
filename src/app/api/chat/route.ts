@@ -35,11 +35,17 @@ export async function POST(request: NextRequest) {
       : null
 
     if (!conversation && databaseId) {
+      // Find a valid workspaceId if not provided
+      let validWorkspaceId = workspaceId
+      if (!validWorkspaceId) {
+        const firstWorkspace = await db.workspace.findFirst()
+        validWorkspaceId = firstWorkspace?.id || ''
+      }
       conversation = await db.conversation.create({
         data: {
           title: message.slice(0, 60),
           databaseId,
-          workspaceId: workspaceId || '',
+          workspaceId: validWorkspaceId,
           agentMode
         },
         include: { messages: true }

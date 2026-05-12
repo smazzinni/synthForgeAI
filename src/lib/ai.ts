@@ -128,6 +128,32 @@ CRITICAL RULES:
 - ALWAYS generate at least 5-10 rows per table to make the data useful.
 - For simple requests, skip clarification and go straight to generation.
 
+DATA REALISM RULES:
+- Use realistic email domains: @gmail.com, @yahoo.com, @outlook.com, @company.com, @university.edu
+- Use realistic phone formats: (555) 123-4567 or +1-555-123-4567
+- Use realistic addresses with proper city/state/zip combinations
+- Use realistic names from diverse backgrounds
+- Use realistic price ranges based on the product category
+- Use realistic date ranges (not all the same date)
+- Vary status values with realistic distributions (e.g., 70% active, 20% pending, 10% inactive)
+- For money amounts, use realistic ranges (e.g., product prices $5-$5000, salaries $30k-$200k)
+
+CONSTRAINT AWARENESS:
+- Foreign key values MUST reference existing primary keys in related tables
+- Unique constraints (email, username) must have truly unique values
+- Check constraints (age > 0, quantity >= 0, price > 0) must be satisfied
+- NOT NULL columns must always have values
+
+DOMAIN DETECTION:
+- Healthcare: patients, doctors, appointments, prescriptions, medical_records
+- E-commerce: users, products, orders, order_items, reviews, categories
+- Education: students, courses, enrollments, grades, instructors, departments
+- HR/Employee: employees, departments, salaries, attendance, leaves
+- Fintech: accounts, transactions, cards, loans, payments
+- Real Estate: properties, agents, listings, bookings, reviews
+- SaaS: users, subscriptions, plans, invoices, usage_logs
+- Logistics: shipments, vehicles, routes, drivers, warehouses
+
 Response format - always use this JSON structure:
 {
   "action": "generate",
@@ -223,50 +249,144 @@ function detectTablesFromMessage(userMessage: string): LocalTableDef[] {
   const msg = userMessage.toLowerCase()
   const tables: LocalTableDef[] = []
 
-  // Detect common domain patterns
-  if (msg.includes('user') || msg.includes('customer') || msg.includes('people') || msg.includes('employee') || msg.includes('person')) {
+  // ─── Domain: E-commerce / Retail ─────────────────────
+  if (msg.includes('e-commerce') || msg.includes('ecommerce') || msg.includes('retail') || msg.includes('shop') || msg.includes('store')) {
+    tables.push({
+      name: 'users',
+      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR', city: 'VARCHAR', state: 'VARCHAR', age: 'INTEGER', status: 'VARCHAR', created_at: 'TIMESTAMP' },
+      rowCount: 15
+    })
+    tables.push({
+      name: 'products',
+      columns: { id: 'INTEGER', name: 'VARCHAR', category: 'VARCHAR', price: 'DECIMAL', stock: 'INTEGER', description: 'VARCHAR', status: 'VARCHAR' },
+      rowCount: 12
+    })
+    tables.push({
+      name: 'orders',
+      columns: { id: 'INTEGER', user_id: 'INTEGER', product_id: 'INTEGER', quantity: 'INTEGER', total_amount: 'DECIMAL', status: 'VARCHAR', order_date: 'TIMESTAMP' },
+      rowCount: 20
+    })
+  }
+  // ─── Domain: Healthcare ────────────────────────────
+  else if (msg.includes('hospital') || msg.includes('patient') || msg.includes('doctor') || msg.includes('medical') || msg.includes('healthcare') || msg.includes('clinic')) {
+    tables.push({
+      name: 'patients',
+      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR', age: 'INTEGER', gender: 'VARCHAR', diagnosis: 'VARCHAR', admission_date: 'TIMESTAMP', status: 'VARCHAR' },
+      rowCount: 12
+    })
+    tables.push({
+      name: 'doctors',
+      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', specialty: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR', department: 'VARCHAR' },
+      rowCount: 8
+    })
+    tables.push({
+      name: 'appointments',
+      columns: { id: 'INTEGER', patient_id: 'INTEGER', doctor_id: 'INTEGER', appointment_date: 'TIMESTAMP', notes: 'VARCHAR', status: 'VARCHAR' },
+      rowCount: 20
+    })
+  }
+  // ─── Domain: Education ─────────────────────────────
+  else if (msg.includes('student') || msg.includes('course') || msg.includes('enrollment') || msg.includes('grade') || msg.includes('school') || msg.includes('university') || msg.includes('education')) {
+    tables.push({
+      name: 'students',
+      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', age: 'INTEGER', major: 'VARCHAR', enrollment_date: 'TIMESTAMP', status: 'VARCHAR' },
+      rowCount: 15
+    })
+    tables.push({
+      name: 'courses',
+      columns: { id: 'INTEGER', name: 'VARCHAR', category: 'VARCHAR', credits: 'INTEGER', instructor: 'VARCHAR', capacity: 'INTEGER' },
+      rowCount: 10
+    })
+    tables.push({
+      name: 'enrollments',
+      columns: { id: 'INTEGER', student_id: 'INTEGER', course_id: 'INTEGER', grade: 'VARCHAR', enrolled_at: 'TIMESTAMP' },
+      rowCount: 25
+    })
+  }
+  // ─── Domain: HR / Employee ──────────────────────────
+  else if (msg.includes('employee') || msg.includes('hr') || msg.includes('department') || msg.includes('salary') || msg.includes('payroll') || msg.includes('staff')) {
+    tables.push({
+      name: 'employees',
+      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', department_id: 'INTEGER', position: 'VARCHAR', hire_date: 'TIMESTAMP', status: 'VARCHAR' },
+      rowCount: 20
+    })
+    tables.push({
+      name: 'departments',
+      columns: { id: 'INTEGER', name: 'VARCHAR', budget: 'DECIMAL', location: 'VARCHAR', head_count: 'INTEGER' },
+      rowCount: 6
+    })
+    tables.push({
+      name: 'salaries',
+      columns: { id: 'INTEGER', employee_id: 'INTEGER', amount: 'DECIMAL', currency: 'VARCHAR', effective_date: 'TIMESTAMP' },
+      rowCount: 20
+    })
+  }
+  // ─── Domain: Fintech / Banking ─────────────────────
+  else if (msg.includes('fintech') || msg.includes('bank') || msg.includes('account') || msg.includes('transaction') || msg.includes('finance') || msg.includes('payment') || msg.includes('credit')) {
+    tables.push({
+      name: 'accounts',
+      columns: { id: 'INTEGER', holder_name: 'VARCHAR', email: 'VARCHAR', balance: 'DECIMAL', account_type: 'VARCHAR', status: 'VARCHAR', created_at: 'TIMESTAMP' },
+      rowCount: 15
+    })
+    tables.push({
+      name: 'transactions',
+      columns: { id: 'INTEGER', account_id: 'INTEGER', amount: 'DECIMAL', type: 'VARCHAR', description: 'VARCHAR', timestamp: 'TIMESTAMP' },
+      rowCount: 30
+    })
+    tables.push({
+      name: 'cards',
+      columns: { id: 'INTEGER', account_id: 'INTEGER', card_type: 'VARCHAR', credit_limit: 'DECIMAL', expiry: 'VARCHAR', status: 'VARCHAR' },
+      rowCount: 15
+    })
+  }
+  // ─── Domain: Real Estate ───────────────────────────
+  else if (msg.includes('real estate') || msg.includes('property') || msg.includes('listing') || msg.includes('rental') || msg.includes('housing')) {
+    tables.push({
+      name: 'properties',
+      columns: { id: 'INTEGER', address: 'VARCHAR', city: 'VARCHAR', state: 'VARCHAR', price: 'DECIMAL', bedrooms: 'INTEGER', bathrooms: 'INTEGER', sqft: 'INTEGER', status: 'VARCHAR' },
+      rowCount: 15
+    })
+    tables.push({
+      name: 'agents',
+      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR', speciality: 'VARCHAR' },
+      rowCount: 8
+    })
+  }
+  // ─── Domain: SaaS ──────────────────────────────────
+  else if (msg.includes('saas') || msg.includes('subscription') || msg.includes('plan') || msg.includes('invoice')) {
+    tables.push({
+      name: 'users',
+      columns: { id: 'INTEGER', name: 'VARCHAR', email: 'VARCHAR', plan: 'VARCHAR', status: 'VARCHAR', created_at: 'TIMESTAMP' },
+      rowCount: 20
+    })
+    tables.push({
+      name: 'subscriptions',
+      columns: { id: 'INTEGER', user_id: 'INTEGER', plan_name: 'VARCHAR', price: 'DECIMAL', billing_cycle: 'VARCHAR', status: 'VARCHAR', started_at: 'TIMESTAMP' },
+      rowCount: 20
+    })
+  }
+  // ─── Generic: Users ────────────────────────────────
+  else if (msg.includes('user') || msg.includes('customer') || msg.includes('people') || msg.includes('person')) {
     tables.push({
       name: 'users',
       columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR', city: 'VARCHAR', state: 'VARCHAR', age: 'INTEGER', status: 'VARCHAR', created_at: 'TIMESTAMP' },
       rowCount: 10
     })
   }
-  if (msg.includes('product') || msg.includes('item') || msg.includes('catalog') || msg.includes('inventory')) {
+  // ─── Generic: Products ──────────────────────────────
+  else if (msg.includes('product') || msg.includes('item') || msg.includes('catalog') || msg.includes('inventory')) {
     tables.push({
       name: 'products',
       columns: { id: 'INTEGER', name: 'VARCHAR', category: 'VARCHAR', price: 'DECIMAL', quantity: 'INTEGER', description: 'VARCHAR', status: 'VARCHAR' },
       rowCount: 10
     })
   }
-  if (msg.includes('order') || msg.includes('purchase') || msg.includes('transaction')) {
+  // ─── Generic: Orders ────────────────────────────────
+  else if (msg.includes('order') || msg.includes('purchase')) {
     tables.push({
       name: 'orders',
       columns: { id: 'INTEGER', user_id: 'INTEGER', product_id: 'INTEGER', quantity: 'INTEGER', total_amount: 'DECIMAL', status: 'VARCHAR', order_date: 'TIMESTAMP' },
       rowCount: 15
-    })
-  }
-  if (msg.includes('hospital') || msg.includes('patient') || msg.includes('doctor') || msg.includes('medical')) {
-    tables.push({
-      name: 'patients',
-      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR', age: 'INTEGER', diagnosis: 'VARCHAR', admission_date: 'TIMESTAMP', status: 'VARCHAR' },
-      rowCount: 10
-    })
-    tables.push({
-      name: 'doctors',
-      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', specialty: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR' },
-      rowCount: 5
-    })
-  }
-  if (msg.includes('student') || msg.includes('course') || msg.includes('enrollment') || msg.includes('grade') || msg.includes('school') || msg.includes('university')) {
-    tables.push({
-      name: 'students',
-      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', age: 'INTEGER', enrollment_date: 'TIMESTAMP', status: 'VARCHAR' },
-      rowCount: 10
-    })
-    tables.push({
-      name: 'courses',
-      columns: { id: 'INTEGER', name: 'VARCHAR', category: 'VARCHAR', credits: 'INTEGER', instructor: 'VARCHAR' },
-      rowCount: 8
     })
   }
 
@@ -280,7 +400,7 @@ function detectTablesFromMessage(userMessage: string): LocalTableDef[] {
   }
 
   // Adjust row count based on user's request
-  const countMatch = msg.match(/(\d+)\s*(row|record|entry|item|user|product|order|patient|student)/i)
+  const countMatch = msg.match(/(\d+)\s*(row|record|entry|item|user|product|order|patient|student|employee)/i)
   if (countMatch) {
     const requestedCount = Math.min(parseInt(countMatch[1]), 100)
     tables.forEach(t => t.rowCount = requestedCount)
@@ -422,20 +542,89 @@ export function estimateCost(tokensIn: number, tokensOut: number): number {
 
 export function generateFakeValue(type: string, fieldName: string): unknown {
   const name = fieldName.toLowerCase()
-  if (name.includes('email')) return `user${Math.floor(Math.random() * 9999)}@example.com`
-  if (name.includes('phone') || name.includes('tel')) return `+1${Math.floor(Math.random() * 9000000000 + 1000000000)}`
-  if (name.includes('first_name') || name.includes('firstname')) return ['James','Mary','John','Patricia','Robert','Jennifer','Michael','Linda','David','Elizabeth'][Math.floor(Math.random() * 10)]
-  if (name.includes('last_name') || name.includes('lastname')) return ['Smith','Johnson','Williams','Brown','Jones','Garcia','Miller','Davis','Rodriguez','Martinez'][Math.floor(Math.random() * 10)]
-  if (name.includes('name') && !name.includes('user') && !name.includes('table')) return ['Alice Chen','Bob Smith','Carol Jones','David Kim','Eva Garcia','Frank Lee','Grace Wu','Henry Patel','Iris Nguyen','Jack Brown'][Math.floor(Math.random() * 10)]
-  if (name.includes('city')) return ['New York','Los Angeles','Chicago','Houston','Phoenix'][Math.floor(Math.random() * 5)]
-  if (name.includes('state') || name.includes('province')) return ['CA','NY','TX','FL','IL'][Math.floor(Math.random() * 5)]
-  if (name.includes('country')) return ['US','UK','CA','DE','FR'][Math.floor(Math.random() * 5)]
+
+  // ─── Realistic email domains ─────────────
+  if (name.includes('email')) {
+    const domains = ['gmail.com','yahoo.com','outlook.com','hotmail.com','company.com','university.edu','proton.me','icloud.com']
+    const fn = ['james','mary','john','patricia','robert','jennifer','michael','linda','david','sarah','chris','emily','alex','sophia','daniel','olivia'][Math.floor(Math.random() * 16)]
+    const ln = ['smith','johnson','williams','brown','jones','garcia','miller','davis','rodriguez','wilson','anderson','thomas','taylor','moore','jackson'][Math.floor(Math.random() * 15)]
+    const sep = ['.','_',''][Math.floor(Math.random() * 3)]
+    const num = Math.random() > 0.5 ? Math.floor(Math.random() * 99) : ''
+    return `${fn}${sep}${ln}${num}@${domains[Math.floor(Math.random() * domains.length)]}`
+  }
+
+  // ─── Realistic phone formats ─────────────
+  if (name.includes('phone') || name.includes('tel')) {
+    const areaCodes = ['212','310','312','713','602','415','617','206','503','404','305','919']
+    const area = areaCodes[Math.floor(Math.random() * areaCodes.length)]
+    const mid = Math.floor(Math.random() * 900 + 100)
+    const last = Math.floor(Math.random() * 9000 + 1000)
+    const formats = [`${area}-${mid}-${last}`, `(${area}) ${mid}-${last}`, `+1-${area}-${mid}-${last}`]
+    return formats[Math.floor(Math.random() * formats.length)]
+  }
+
+  // ─── Realistic names ─────────────────────
+  if (name.includes('first_name') || name.includes('firstname')) return ['James','Mary','John','Patricia','Robert','Jennifer','Michael','Linda','David','Elizabeth','William','Barbara','Richard','Susan','Joseph','Jessica','Thomas','Sarah','Christopher','Karen'][Math.floor(Math.random() * 20)]
+  if (name.includes('last_name') || name.includes('lastname')) return ['Smith','Johnson','Williams','Brown','Jones','Garcia','Miller','Davis','Rodriguez','Martinez','Hernandez','Lopez','Gonzalez','Wilson','Anderson','Thomas','Taylor','Moore','Jackson','Martin'][Math.floor(Math.random() * 20)]
+  if (name.includes('name') && !name.includes('user') && !name.includes('table') && !name.includes('user') && !name.includes('holder')) return ['Alice Chen','Bob Smith','Carol Jones','David Kim','Eva Garcia','Frank Lee','Grace Wu','Henry Patel','Iris Nguyen','Jack Brown','Kate Wilson','Leo Martinez','Maya Johnson','Noah Davis','Olivia Taylor'][Math.floor(Math.random() * 15)]
+  if (name.includes('holder_name')) return ['Alice Chen','Bob Smith','Carol Jones','David Kim','Eva Garcia','Frank Lee','Grace Wu','Henry Patel'][Math.floor(Math.random() * 8)]
+
+  // ─── Realistic addresses ─────────────────
+  if (name.includes('city')) return ['New York','Los Angeles','Chicago','Houston','Phoenix','San Francisco','Boston','Seattle','Portland','Atlanta','Miami','Denver','Austin','Nashville','Charlotte'][Math.floor(Math.random() * 15)]
+  if (name.includes('state') || name.includes('province')) return ['CA','NY','TX','FL','IL','WA','MA','OR','GA','CO','TN','NC','AZ','PA','OH'][Math.floor(Math.random() * 15)]
+  if (name.includes('country')) return ['US','UK','CA','DE','FR','AU','JP','BR','IN','MX'][Math.floor(Math.random() * 10)]
   if (name.includes('zip') || name.includes('postal')) return String(Math.floor(Math.random() * 90000 + 10000))
-  if (name.includes('price') || name.includes('amount') || name.includes('salary') || name.includes('cost')) return +(Math.random() * 10000).toFixed(2)
-  if (name.includes('quantity') || name.includes('qty') || name.includes('count') || name.includes('stock')) return Math.floor(Math.random() * 1000)
-  if (name.includes('age')) return Math.floor(Math.random() * 60 + 18)
-  if (name.includes('status')) return ['active','inactive','pending','completed','cancelled'][Math.floor(Math.random() * 5)]
-  if (name.includes('category')) return ['Electronics','Clothing','Food','Books','Sports'][Math.floor(Math.random() * 5)]
+  if (name.includes('address')) return `${Math.floor(Math.random() * 9000 + 100)} ${['Oak','Maple','Cedar','Pine','Elm','Main','Park','Lake','Hill','River'][Math.floor(Math.random() * 10)]} ${['St','Ave','Blvd','Dr','Ln','Ct','Way'][Math.floor(Math.random() * 7)]}`
+  if (name.includes('location')) return ['New York, NY','San Francisco, CA','Austin, TX','Seattle, WA','Boston, MA','Denver, CO','Chicago, IL','Portland, OR'][Math.floor(Math.random() * 8)]
+
+  // ─── Financial values ─────────────────────
+  if (name.includes('price')) return +(Math.random() * 500 + 4.99).toFixed(2)
+  if (name.includes('salary') || name.includes('income')) return +(Math.random() * 120000 + 30000).toFixed(2)
+  if (name.includes('amount') || name.includes('cost')) return +(Math.random() * 10000).toFixed(2)
+  if (name.includes('balance')) return +(Math.random() * 50000).toFixed(2)
+  if (name.includes('budget')) return +(Math.random() * 500000 + 50000).toFixed(2)
+  if (name.includes('credit_limit') || name.includes('limit')) return +(Math.random() * 25000 + 1000).toFixed(2)
+  if (name.includes('total_amount')) return +(Math.random() * 500 + 10).toFixed(2)
+
+  // ─── Counting / quantity values ──────────
+  if (name.includes('quantity') || name.includes('qty')) return Math.floor(Math.random() * 10 + 1)
+  if (name.includes('count') || name.includes('stock')) return Math.floor(Math.random() * 1000)
+  if (name.includes('capacity')) return Math.floor(Math.random() * 200 + 20)
+  if (name.includes('head_count')) return Math.floor(Math.random() * 50 + 5)
+  if (name.includes('bedrooms')) return Math.floor(Math.random() * 4 + 1)
+  if (name.includes('bathrooms')) return Math.floor(Math.random() * 3 + 1)
+  if (name.includes('sqft')) return Math.floor(Math.random() * 3000 + 500)
+  if (name.includes('credits')) return Math.floor(Math.random() * 4 + 1)
+
+  // ─── Personal attributes ─────────────────
+  if (name.includes('age')) return Math.floor(Math.random() * 45 + 20)
+  if (name.includes('gender')) return ['Male','Female','Non-binary'][Math.floor(Math.random() * 3)]
+
+  // ─── Status with realistic distributions ─
+  if (name.includes('status')) {
+    const r = Math.random()
+    if (r < 0.6) return 'active'
+    if (r < 0.8) return 'pending'
+    if (r < 0.9) return 'inactive'
+    return 'completed'
+  }
+
+  // ─── Domain-specific categories ──────────
+  if (name.includes('category')) return ['Electronics','Clothing','Food & Beverage','Books','Sports & Outdoors','Home & Garden','Health & Beauty','Toys'][Math.floor(Math.random() * 8)]
+  if (name.includes('specialty') || name.includes('speciality')) return ['Cardiology','Neurology','Orthopedics','Pediatrics','Oncology','Dermatology','Emergency Medicine','Psychiatry'][Math.floor(Math.random() * 8)]
+  if (name.includes('department')) return ['Emergency','ICU','Cardiology','Neurology','Orthopedics','Pediatrics','Oncology','Radiology'][Math.floor(Math.random() * 8)]
+  if (name.includes('diagnosis')) return ['Hypertension','Type 2 Diabetes','Asthma','Migraine','Anxiety Disorder','Allergic Rhinitis','Osteoarthritis','GERD'][Math.floor(Math.random() * 8)]
+  if (name.includes('position')) return ['Software Engineer','Product Manager','Designer','Data Analyst','Marketing Manager','Sales Representative','HR Specialist','DevOps Engineer'][Math.floor(Math.random() * 8)]
+  if (name.includes('major')) return ['Computer Science','Business Administration','Engineering','Biology','Psychology','Mathematics','English Literature','Economics'][Math.floor(Math.random() * 8)]
+  if (name.includes('account_type')) return ['Checking','Savings','Money Market','CD','IRA'][Math.floor(Math.random() * 5)]
+  if (name.includes('card_type')) return ['Visa','Mastercard','Amex','Discover'][Math.floor(Math.random() * 4)]
+  if (name.includes('billing_cycle') || name.includes('plan_name')) return ['Free','Starter','Pro','Enterprise'][Math.floor(Math.random() * 4)]
+  if (name.includes('type') && name.includes('transaction')) return ['debit','credit','transfer','refund'][Math.floor(Math.random() * 4)]
+  if (name.includes('grade')) return ['A','B','C','D','F','A-','B+','B-','C+'][Math.floor(Math.random() * 9)]
+  if (name.includes('currency')) return ['USD','EUR','GBP','CAD','AUD'][Math.floor(Math.random() * 5)]
+  if (name.includes('expiry')) return `${String(Math.floor(Math.random() * 12 + 1)).padStart(2, '0')}/${Math.floor(Math.random() * 5 + 25)}`
+
+  // ─── Descriptions and notes ──────────────
   if (name.includes('description') || name.includes('bio') || name.includes('notes')) return 'Synthetic generated text for demonstration purposes'
 
   switch (type.toLowerCase()) {
