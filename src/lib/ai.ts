@@ -127,6 +127,8 @@ CRITICAL RULES:
 - Maintain referential integrity across all tables.
 - ALWAYS generate at least 5-10 rows per table to make the data useful.
 - For simple requests, skip clarification and go straight to generation.
+- If the user asks to generate data but does NOT specify a row count, you MUST clarify how many rows they want. Use the "clarify" action with row count options like [10, 25, 50, 100, 500].
+- If the user HAS specified a row count (e.g., in their message or context), honor that count precisely.
 
 DATA REALISM RULES:
 - Use realistic email domains: @gmail.com, @yahoo.com, @outlook.com, @company.com, @university.edu
@@ -176,14 +178,22 @@ Response format - always use this JSON structure:
   "followUpQuestions": ["Would you like to add more tables?"]
 }
 
-For clarification:
+For clarification (when user wants data but hasn't specified row count):
 {
   "action": "clarify",
   "agentName": "auto-agent",
-  "explanation": "I need more info...",
-  "options": [{"id": "opt1", "label": "A", "value": "a", "description": "Desc"}],
+  "explanation": "I'd be happy to generate that data! How many rows would you like per table?",
+  "options": [
+    {"id": "rows10", "label": "10 rows", "value": "Generate 10 rows per table", "description": "Quick sample"},
+    {"id": "rows25", "label": "25 rows", "value": "Generate 25 rows per table", "description": "Standard dataset"},
+    {"id": "rows50", "label": "50 rows", "value": "Generate 50 rows per table", "description": "Larger dataset"},
+    {"id": "rows100", "label": "100 rows", "value": "Generate 100 rows per table", "description": "Full dataset"},
+    {"id": "rows500", "label": "500 rows", "value": "Generate 500 rows per table", "description": "Production-scale"}
+  ],
   "followUpQuestions": [],
-  "reasoningSteps": [...]
+  "reasoningSteps": [
+    {"type": "intent", "label": "Intent Analysis", "description": "Understanding request", "status": "completed", "output": "Data generation request, row count not specified"}
+  ]
 }`
 
 // ─── Core API Functions using z-ai-web-dev-sdk ──────────────────

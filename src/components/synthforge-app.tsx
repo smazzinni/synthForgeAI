@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useEffect, useRef, useCallback } from 'react'
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
@@ -12,7 +12,8 @@ import {
   Columns3, Key, Link2, RefreshCw, Menu, Eye, EyeOff,
   PanelLeftClose, PanelLeft, Shield, RotateCcw, Gauge, GitBranch,
   Activity, Users, BarChart3, Clock, Layers, Settings,
-  FileDown, ClipboardCheck, Rows3, Target, Network
+  FileDown, ClipboardCheck, Rows3, Target, Network, StopCircle,
+  WifiOff
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -35,8 +36,8 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from '@/components/ui/resizable'
-import { Slider } from '@/components/ui/slider'
 import { useToast } from '@/hooks/use-toast'
+import { structuredLog } from '@/components/error-boundary'
 
 // ─── Types ─────────────────────────────────────────────
 interface Workspace { id: string; name: string; slug: string; agentInstructions: string }
@@ -44,7 +45,25 @@ interface Project { id: string; name: string; description: string; workspaceId: 
 interface Database_ { id: string; name: string; dbType: string; schemaJson: string; dataJson: string; projectId: string; updatedAt: string; _count?: { datasets: number; conversations: number } }
 interface QualityScore { overall: number; breakdown: { completeness: number; uniqueness: number; distribution: number; referentialIntegrity: number } }
 interface PIICheck { hasPII: boolean; findings: { type: string; field: string; count: number }[] }
-interface Message { id: string; role: string; content: string; sqlCode: string; tokensIn: number; tokensOut: number; cost: number; createdAt: string; agentName: string; reasoningSteps: string; options: string; tablesJson: string; qualityScore?: QualityScore | null; piiCheck?: PIICheck | null; schemaVersion?: number }
+interface Message {
+  id: string
+  role: string
+  content: string
+  sqlCode: string
+  tokensIn: number
+  tokensOut: number
+  cost: number
+  createdAt: string
+  agentName: string
+  reasoningSteps: string
+  options: string
+  tablesJson: string
+  qualityScore?: QualityScore | null
+  piiCheck?: PIICheck | null
+  schemaVersion?: number
+  isError?: boolean
+  isStreaming?: boolean
+}
 interface Conversation { id: string; title: string; messages: Message[] }
 
 interface ReasoningStep {
@@ -109,6 +128,209 @@ const gradientStyle = `
 }
 `
 
+// ─── React.memo DataTable ───────────────────────────────
+const DataTable = React.memo(function DataTable({
+  tableName,
+  rows,
+  schemaObj,
+  onRegenerate,
+  isLoading,
+  onExportTable,
+  onCopyTable
+}: {
+  tableName: string
+  rows: Record<string, unknown>[]
+  schemaObj: Record<string, { columns: Record<string, string>; relationships?: string[] }>
+  onRegenerate: (name: string) => void
+  isLoading: boolean
+  onExportTable: (name: string, rows: Record<string, unknown>[], format: string) => void
+  onCopyTable: (name: string, rows: Record<string, unknown>[]) => void
+}) {
+  const [page, setPage] = useState(0)
+  const pageSize = 20
+  const totalPages = Math.ceil(rows.length / pageSize)
+  const startIdx = page * pageSize
+  const pageRows = rows.slice(startIdx, startIdx + pageSize)
+  const tableSchema = schemaObj[tableName]
+
+  const getColumnType = (colName: string): string => {
+    if (tableSchema?.columns?.[colName]) return tableSchema.columns[colName]
+    if (colName === 'id') return 'PK'
+    if (colName.endsWith('_id')) return 'FK'
+    return ''
+  }
+
+  const columnTypeColor = (colType: string): string => {
+    if (!colType) return ''
+    if (colType === 'PK' || colType.includes('SERIAL') || colType.includes('PRIMARY')) return 'bg-amber-100 text-amber-800'
+    if (colType === 'FK' || colType.includes('REFERENCES') || colType.includes('INTEGER')) return 'bg-sky-100 text-sky-800'
+    if (colType.includes('VARCHAR') || colType.includes('TEXT')) return 'bg-emerald-100 text-emerald-800'
+    if (colType.includes('DECIMAL') || colType.includes('FLOAT') || colType.includes('NUMERIC')) return 'bg-purple-100 text-purple-800'
+    if (colType.includes('TIMESTAMP') || colType.includes('DATE')) return 'bg-orange-100 text-orange-800'
+    if (colType.includes('BOOLEAN') || colType.includes('BOOL')) return 'bg-pink-100 text-pink-800'
+    return 'bg-gray-100 text-gray-800'
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-sm font-semibold flex items-center gap-2">
+            <Table2 className="h-4 w-4 text-amber-700" />
+            {tableName}
+          </CardTitle>
+          <div className="flex items-center gap-1.5">
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 w-6 p-0 hover:bg-amber-50"
+                    onClick={() => onCopyTable(tableName, rows)}
+                    aria-label={`Copy ${tableName} data`}
+                  >
+                    <Copy className="h-3 w-3 text-muted-foreground" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Copy table data</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="sm" className="h-6 w-6 p-0 hover:bg-amber-50" aria-label={`Export ${tableName}`}>
+                  <Download className="h-3 w-3 text-amber-700" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent>
+                <DropdownMenuItem onClick={() => onExportTable(tableName, rows, 'json')}>
+                  <FileJson className="h-3.5 w-3.5 mr-2" /> Export as JSON
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => onExportTable(tableName, rows, 'csv')}>
+                  <FileText className="h-3.5 w-3.5 mr-2" /> Export as CSV
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={() => onExportTable(tableName, rows, 'sql-insert')}>
+                  <Code2 className="h-3.5 w-3.5 mr-2" /> SQL INSERT
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => onExportTable(tableName, rows, 'sql-full')}>
+                  <Database className="h-3.5 w-3.5 mr-2" /> Full SQL dump
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 w-6 p-0 hover:bg-amber-50"
+                    onClick={() => onRegenerate(tableName)}
+                    disabled={isLoading}
+                    aria-label={`Regenerate ${tableName}`}
+                  >
+                    <RotateCcw className="h-3 w-3 text-amber-700" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Regenerate {tableName}</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+            <Badge variant="secondary" className="text-xs">{rows.length} rows</Badge>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {pageRows.length > 0 ? (
+          <ScrollArea className="max-h-80">
+            <table className="w-full text-xs" role="table">
+              <thead>
+                <tr className="border-b bg-muted/30 sticky top-0">
+                  {Object.keys(pageRows[0]).map(key => {
+                    const colType = getColumnType(key)
+                    return (
+                      <th key={key} className="text-left py-1.5 px-2 whitespace-nowrap" scope="col">
+                        <div className="flex items-center gap-1">
+                          <span className="font-medium text-muted-foreground">{key}</span>
+                          {colType && (
+                            <Badge className={`text-[8px] px-1 py-0 h-3.5 font-mono ${columnTypeColor(colType)}`}>
+                              {colType === 'PK' ? 'PK' : colType === 'FK' ? 'FK' : colType.split('(')[0]}
+                            </Badge>
+                          )}
+                        </div>
+                      </th>
+                    )
+                  })}
+                </tr>
+              </thead>
+              <tbody>
+                {pageRows.map((row, i) => (
+                  <tr key={i} className="border-b last:border-0 hover:bg-amber-50/30 transition-colors">
+                    {Object.entries(row).map(([key, val], j) => {
+                      const colType = getColumnType(key)
+                      const isPK = colType === 'PK' || key === 'id'
+                      const isFK = colType === 'FK' || key.endsWith('_id')
+                      return (
+                        <td key={j} className={`py-1.5 px-2 whitespace-nowrap max-w-[200px] truncate ${isPK ? 'font-mono font-semibold text-amber-700' : isFK ? 'font-mono text-sky-700' : ''}`}>
+                          {val === null ? <span className="text-muted-foreground italic">null</span> : String(val)}
+                        </td>
+                      )
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {totalPages > 1 && (
+              <div className="flex items-center justify-between mt-3 pt-2 border-t">
+                <p className="text-xs text-muted-foreground">Page {page + 1} of {totalPages}</p>
+                <div className="flex gap-1">
+                  <Button variant="outline" size="sm" className="h-6 text-xs" disabled={page === 0} onClick={() => setPage(p => p - 1)} aria-label="Previous page">
+                    Prev
+                  </Button>
+                  <Button variant="outline" size="sm" className="h-6 text-xs" disabled={page >= totalPages - 1} onClick={() => setPage(p => p + 1)} aria-label="Next page">
+                    Next
+                  </Button>
+                </div>
+              </div>
+            )}
+          </ScrollArea>
+        ) : (
+          <p className="text-xs text-muted-foreground">No data rows</p>
+        )}
+      </CardContent>
+    </Card>
+  )
+})
+
+// ─── React.memo SchemaCard ───────────────────────────────
+const SchemaCard = React.memo(function SchemaCard({ tableName, columns }: { tableName: string; columns: Record<string, string> }) {
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm font-semibold flex items-center gap-2">
+          <Table2 className="h-4 w-4 text-amber-700" />
+          {tableName}
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        <ScrollArea className="max-h-48">
+          <div className="space-y-1">
+            {Object.entries(columns).map(([colName, colType]) => (
+              <div key={colName} className="flex items-center justify-between text-xs py-1.5 border-b last:border-0 hover:bg-muted/30 px-1 rounded">
+                <div className="flex items-center gap-2">
+                  {colName.toLowerCase() === 'id' && <Key className="h-3 w-3 text-amber-600" />}
+                  {colName.toLowerCase().endsWith('_id') && <Link2 className="h-3 w-3 text-sky-500" />}
+                  <span className="font-mono font-medium">{colName}</span>
+                </div>
+                <Badge variant="secondary" className="text-[10px] font-mono">{colType}</Badge>
+              </div>
+            ))}
+          </div>
+        </ScrollArea>
+      </CardContent>
+    </Card>
+  )
+})
+
 // ─── Main App ──────────────────────────────────────────
 export default function SynthForgeApp() {
   const [view, setView] = useState<View>('landing')
@@ -133,32 +355,97 @@ export default function SynthForgeApp() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [mobileStudioTab, setMobileStudioTab] = useState<'chat' | 'data'>('chat')
   const [schemaVersionCount, setSchemaVersionCount] = useState(0)
-  const [rowCount, setRowCount] = useState(10)
+  const [rowCountInput, setRowCountInput] = useState<string>('')
+  const [rowCountError, setRowCountError] = useState<string>('')
   const [isDragOver, setIsDragOver] = useState(false)
   const [totalTokens, setTotalTokens] = useState(0)
   const [showSchemaTemplates, setShowSchemaTemplates] = useState(false)
+  const [isOnline, setIsOnline] = useState(true)
+  const [isNearBottom, setIsNearBottom] = useState(true)
+
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const chatScrollRef = useRef<HTMLDivElement>(null)
   const chatInputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const abortControllerRef = useRef<AbortController | null>(null)
   const { toast } = useToast()
+
+  // ─── Network status tracking ────────────────────────
+  useEffect(() => {
+    const handleOnline = () => { setIsOnline(true) ; structuredLog('info', 'Network back online') }
+    const handleOffline = () => { setIsOnline(false) ; structuredLog('warn', 'Network went offline') }
+    setIsOnline(navigator.onLine)
+    window.addEventListener('online', handleOnline)
+    window.addEventListener('offline', handleOffline)
+    return () => {
+      window.removeEventListener('online', handleOnline)
+      window.removeEventListener('offline', handleOffline)
+    }
+  }, [])
 
   // Load workspaces on mount
   useEffect(() => {
     loadWorkspaces()
   }, [])
 
-  // Auto-scroll chat
+  // ─── Smart auto-scroll: only scroll if near bottom ────
   useEffect(() => {
-    if (messagesEndRef.current) {
+    if (isNearBottom && messagesEndRef.current) {
       messagesEndRef.current.scrollIntoView({ behavior: 'smooth' })
     }
-  }, [messages, isLoading])
+  }, [messages, isLoading, isNearBottom])
+
+  // Track scroll position for near-bottom detection
+  useEffect(() => {
+    const scrollContainer = chatScrollRef.current
+    if (!scrollContainer) return
+
+    const handleScroll = () => {
+      const { scrollTop, scrollHeight, clientHeight } = scrollContainer
+      const nearBottom = scrollHeight - scrollTop - clientHeight < 150
+      setIsNearBottom(nearBottom)
+    }
+
+    scrollContainer.addEventListener('scroll', handleScroll, { passive: true })
+    return () => scrollContainer.removeEventListener('scroll', handleScroll)
+  }, [view])
 
   // Track total tokens
   useEffect(() => {
     const total = messages.reduce((sum, m) => sum + m.tokensIn + m.tokensOut, 0)
     setTotalTokens(total)
   }, [messages])
+
+  // Cleanup abort controller on unmount
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort()
+      }
+    }
+  }, [])
+
+  // ─── Validate row count ──────────────────────────────
+  const validateRowCount = useCallback((value: string): { valid: boolean; parsed: number | null; error: string } => {
+    if (!value.trim()) return { valid: true, parsed: null, error: '' }
+    const num = Number(value)
+    if (!Number.isInteger(num) || num < 1 || num > 10000) {
+      return { valid: false, parsed: null, error: 'Enter a whole number between 1 and 10,000' }
+    }
+    return { valid: true, parsed: num, error: '' }
+  }, [])
+
+  const handleRowCountChange = useCallback((value: string) => {
+    setRowCountInput(value)
+    const { error } = validateRowCount(value)
+    setRowCountError(error)
+  }, [validateRowCount])
+
+  // ─── Parsed row count (null if empty/invalid) ─────────
+  const parsedRowCount = useMemo((): number | null => {
+    const { valid, parsed } = validateRowCount(rowCountInput)
+    return valid ? parsed : null
+  }, [rowCountInput, validateRowCount])
 
   const loadWorkspaces = async () => {
     try {
@@ -195,7 +482,7 @@ export default function SynthForgeApp() {
     } catch { /* silent */ }
   }
 
-  const allDatabases = projects.flatMap(p => p.databases || [])
+  const allDatabases = useMemo(() => projects.flatMap(p => p.databases || []), [projects])
 
   const openDatabase = async (db: Database_) => {
     setActiveDb(db)
@@ -230,7 +517,7 @@ export default function SynthForgeApp() {
     } catch { /* silent */ }
   }
 
-  // ─── Core Send Message ────────────────
+  // ─── Core Send Message (with AbortController & SSE streaming) ──
   const sendMessage = useCallback(async (messageText: string, files: { name: string; content: string; type: string }[] = []) => {
     if ((!messageText.trim() && files.length === 0) || isLoading || !activeDb) return
 
@@ -238,13 +525,15 @@ export default function SynthForgeApp() {
     setInput('')
     setIsLoading(true)
 
-    // Add row count context if specified
-    const rowContext = rowCount !== 10 ? ` (Generate ${rowCount} rows per table)` : ''
+    // Build row context only if user has specified a count
+    const rowContext = parsedRowCount ? ` (Generate approximately ${parsedRowCount} rows per table)` : ''
 
+    // Optimistic user message with proper ID format
+    const tempId = `usr-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
     const tempUserMsg: Message = {
-      id: 'temp-' + Date.now(),
+      id: tempId,
       role: 'user',
-      content: msgText + rowContext + (files.length > 0 ? `\n\n[Attached: ${files.map(f => f.name).join(', ')}]` : ''),
+      content: msgText + (files.length > 0 ? `\n\n[Attached: ${files.map(f => f.name).join(', ')}]` : ''),
       sqlCode: '',
       tokensIn: 0,
       tokensOut: 0,
@@ -257,6 +546,29 @@ export default function SynthForgeApp() {
     }
     setMessages(prev => [...prev, tempUserMsg])
 
+    // Create AbortController for this request
+    const controller = new AbortController()
+    abortControllerRef.current = controller
+
+    // Create placeholder assistant message for streaming
+    const streamId = `asst-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+    const streamMsg: Message = {
+      id: streamId,
+      role: 'assistant',
+      content: '',
+      sqlCode: '',
+      tokensIn: 0,
+      tokensOut: 0,
+      cost: 0,
+      createdAt: new Date().toISOString(),
+      agentName: agentMode + '-agent',
+      reasoningSteps: '[]',
+      options: '[]',
+      tablesJson: '{}',
+      isStreaming: true
+    }
+    setMessages(prev => [...prev, streamMsg])
+
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -266,10 +578,12 @@ export default function SynthForgeApp() {
           databaseId: activeDb.id,
           workspaceId: activeWorkspace?.id,
           message: msgText + rowContext,
-          stream: false,
+          stream: true,
           agentMode,
+          rowCount: parsedRowCount,
           files: files.map(f => ({ name: f.name, content: f.content, type: f.type }))
-        })
+        }),
+        signal: controller.signal
       })
 
       if (!res.ok) {
@@ -277,59 +591,164 @@ export default function SynthForgeApp() {
         throw new Error(errData.error || 'Chat request failed')
       }
 
-      const data = await res.json()
-
-      if (!conversation && data.conversationId) {
-        setConversation({ id: data.conversationId, title: msgText.slice(0, 60), messages: [] })
+      if (!conversation) {
+        const convId = res.headers.get('X-Conversation-Id')
+        if (convId) {
+          setConversation({ id: convId, title: msgText.slice(0, 60), messages: [] })
+        }
       }
 
-      const assistantMsg: Message = {
-        id: 'msg-' + Date.now(),
-        role: 'assistant',
-        content: data.message.content,
-        sqlCode: data.message.sqlCode || '',
-        tokensIn: data.message.tokensIn || 0,
-        tokensOut: data.message.tokensOut || 0,
-        cost: data.message.cost || 0,
-        createdAt: new Date().toISOString(),
-        agentName: data.message.agentName || agentMode + '-agent',
-        reasoningSteps: JSON.stringify(data.message.reasoningSteps || []),
-        options: JSON.stringify(data.message.options || []),
-        tablesJson: data.message.tablesJson || '{}',
-        qualityScore: data.message.qualityScore || null,
-        piiCheck: data.message.piiCheck || null,
-        schemaVersion: data.message.schemaVersion || 0
-      }
-      setMessages(prev => [...prev, assistantMsg])
+      // ─── SSE Streaming ─────────────────────────────
+      const reader = res.body?.getReader()
+      if (!reader) throw new Error('No response stream')
 
-      if (data.message.schemaVersion) {
-        setSchemaVersionCount(data.message.schemaVersion)
+      const decoder = new TextDecoder()
+      let fullContent = ''
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const event = JSON.parse(line.slice(6))
+              if (event.type === 'content') {
+                fullContent += event.data
+                setMessages(prev => prev.map(m =>
+                  m.id === streamId
+                    ? { ...m, content: fullContent }
+                    : m
+                ))
+              } else if (event.type === 'done') {
+                const tokensIn = event.data?.tokensIn || 0
+                const tokensOut = event.data?.tokensOut || 0
+
+                // Parse the full content for tables, sql, etc.
+                let parsedTables = '{}'
+                let sqlCode = ''
+                let agentName = agentMode + '-agent'
+                let reasoningSteps = '[]'
+                let options = '[]'
+                let qualityScore: QualityScore | null = null
+                let piiCheck: PIICheck | null = null
+
+                try {
+                  const jsonMatch = fullContent.match(/\{[\s\S]*\}/)
+                  if (jsonMatch) {
+                    const parsed = JSON.parse(jsonMatch[0])
+                    if (parsed.tables) parsedTables = JSON.stringify(parsed.tables)
+                    if (parsed.sqlCode) sqlCode = parsed.sqlCode
+                    if (parsed.agentName) agentName = parsed.agentName
+                    if (parsed.reasoningSteps) reasoningSteps = JSON.stringify(parsed.reasoningSteps)
+                    if (parsed.options) options = JSON.stringify(parsed.options)
+                  }
+                } catch { /* use defaults */ }
+
+                setMessages(prev => prev.map(m =>
+                  m.id === streamId
+                    ? {
+                        ...m,
+                        isStreaming: false,
+                        tokensIn,
+                        tokensOut,
+                        cost: (tokensIn / 1_000_000) * 0.27 + (tokensOut / 1_000_000) * 1.10,
+                        tablesJson: parsedTables,
+                        sqlCode,
+                        agentName,
+                        reasoningSteps,
+                        options,
+                        qualityScore,
+                        piiCheck
+                      }
+                    : m
+                ))
+              } else if (event.type === 'error') {
+                throw new Error(event.data || 'Stream error')
+              }
+            } catch (parseErr) {
+              // Non-JSON line, skip
+              if (parseErr instanceof Error && parseErr.message !== 'Stream error' && !parseErr.message.includes('JSON')) {
+                // Only re-throw actual stream errors
+              }
+            }
+          }
+        }
       }
+
+      // If streaming ended without a 'done' event, mark as complete
+      setMessages(prev => prev.map(m =>
+        m.id === streamId ? { ...m, isStreaming: false } : m
+      ))
 
       await refreshDatabase(activeDb.id)
     } catch (error) {
-      toast({
-        title: 'Error',
-        description: error instanceof Error ? error.message : 'Failed to get response',
-        variant: 'destructive',
-        action: <Button size="sm" variant="outline" onClick={() => sendMessage(msgText, files)}>Retry</Button>
-      })
-      setMessages(prev => prev.filter(m => m.id !== tempUserMsg.id))
+      // Remove streaming placeholder
+      setMessages(prev => prev.filter(m => m.id !== streamId))
+
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        structuredLog('info', 'Chat request aborted by user')
+        // Don't show error for user-initiated aborts
+      } else {
+        const errMsg = error instanceof Error ? error.message : 'Failed to get response'
+        structuredLog('error', 'Chat request failed', errMsg)
+
+        // Mark the user message as failed (keep it with retry button)
+        setMessages(prev => prev.map(m =>
+          m.id === tempId ? { ...m, isError: true } : m
+        ))
+
+        toast({
+          title: 'Error',
+          description: errMsg,
+          variant: 'destructive'
+        })
+      }
     } finally {
       setIsLoading(false)
+      abortControllerRef.current = null
+      // Return focus to chat input
+      chatInputRef.current?.focus()
     }
-  }, [isLoading, activeDb, conversation, activeWorkspace, toast, agentMode, rowCount])
+  }, [isLoading, activeDb, conversation, activeWorkspace, toast, agentMode, parsedRowCount])
+
+  // ─── Abort generation ───────────────────────────────
+  const handleAbort = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+      abortControllerRef.current = null
+      setIsLoading(false)
+    }
+  }, [])
+
+  // ─── Retry failed message ───────────────────────────
+  const handleRetry = useCallback((msgId: string) => {
+    const msg = messages.find(m => m.id === msgId)
+    if (!msg) return
+    // Remove error state, re-send
+    setMessages(prev => prev.map(m => m.id === msgId ? { ...m, isError: false } : m))
+    // Extract original text (strip row context if present)
+    const originalText = msg.content.replace(/ \(Generate approximately \d+ rows per table\)/, '')
+    sendMessage(originalText)
+  }, [messages, sendMessage])
 
   // ─── Chat Submit (from input) ────────────────────────────
   const handleSubmit = useCallback(async () => {
     const msgText = input.trim()
     const files = [...attachedFiles]
     if (!msgText && files.length === 0) return
+    if (rowCountError) return
     setAttachedFiles([])
     await sendMessage(msgText, files)
-  }, [input, attachedFiles, sendMessage])
+  }, [input, attachedFiles, sendMessage, rowCountError])
 
-  const getTablesFromMessages = (): Record<string, Record<string, unknown>[]> => {
+  // ─── Memoized computed values ──────────────────────────
+  const getTablesFromMessages = useMemo((): Record<string, Record<string, unknown>[]> => {
     const allTables: Record<string, Record<string, unknown>[]> = {}
     if (activeDb?.dataJson) {
       try {
@@ -352,28 +771,28 @@ export default function SynthForgeApp() {
       }
     }
     return allTables
-  }
+  }, [activeDb?.dataJson, messages])
 
-  const getSchemaFromDb = (): Record<string, { columns: Record<string, string>; relationships?: string[] }> => {
+  const getSchemaFromDb = useMemo((): Record<string, { columns: Record<string, string>; relationships?: string[] }> => {
     if (!activeDb?.schemaJson) return {}
     try {
       return JSON.parse(activeDb.schemaJson)
     } catch { return {} }
-  }
+  }, [activeDb?.schemaJson])
 
-  const copyToClipboard = (text: string) => {
+  const copyToClipboard = useCallback((text: string) => {
     navigator.clipboard.writeText(text)
     toast({ title: 'Copied!', description: 'Content copied to clipboard' })
-  }
+  }, [toast])
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       handleSubmit()
     }
-  }
+  }, [handleSubmit])
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files
     if (!files) return
 
@@ -388,18 +807,18 @@ export default function SynthForgeApp() {
       reader.readAsText(file)
     })
     if (fileInputRef.current) fileInputRef.current.value = ''
-  }
+  }, [])
 
   // ─── Drag & Drop handler ────────────────────────────
-  const handleDragOver = (e: React.DragEvent) => {
+  const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault()
     setIsDragOver(true)
-  }
-  const handleDragLeave = (e: React.DragEvent) => {
+  }, [])
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
     e.preventDefault()
     setIsDragOver(false)
-  }
-  const handleDrop = (e: React.DragEvent) => {
+  }, [])
+  const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault()
     setIsDragOver(false)
     const files = e.dataTransfer.files
@@ -415,11 +834,11 @@ export default function SynthForgeApp() {
       }
       reader.readAsText(file)
     })
-  }
+  }, [])
 
-  const removeFile = (index: number) => {
+  const removeFile = useCallback((index: number) => {
     setAttachedFiles(prev => prev.filter((_, i) => i !== index))
-  }
+  }, [])
 
   const createDatabase = async () => {
     if (!newDbName.trim() || !projects[0]) return
@@ -474,7 +893,7 @@ export default function SynthForgeApp() {
   }
 
   // ─── Enhanced Export with multiple formats ────────────────
-  const exportData = (tables: Record<string, Record<string, unknown>[]>, format: string) => {
+  const exportData = useCallback((tables: Record<string, Record<string, unknown>[]>, format: string) => {
     let content = ''
     let filename = 'synthforge-data'
     let type = 'text/plain'
@@ -484,7 +903,6 @@ export default function SynthForgeApp() {
       filename += '.json'
       type = 'application/json'
     } else if (format === 'csv') {
-      // Export all tables - each table gets a header
       const parts: string[] = []
       for (const [tableName, rows] of Object.entries(tables)) {
         if (rows?.length > 0) {
@@ -561,10 +979,22 @@ export default function SynthForgeApp() {
     a.click()
     URL.revokeObjectURL(url)
     toast({ title: 'Exported!', description: `Downloaded as ${filename}` })
-  }
+  }, [toast])
+
+  // ─── Per-table export ─────────────────────────────────
+  const exportTable = useCallback((tableName: string, rows: Record<string, unknown>[], format: string) => {
+    exportData({ [tableName]: rows }, format)
+  }, [exportData])
+
+  // ─── Copy table data ──────────────────────────────────
+  const copyTable = useCallback((tableName: string, rows: Record<string, unknown>[]) => {
+    const content = JSON.stringify({ [tableName]: rows }, null, 2)
+    navigator.clipboard.writeText(content)
+    toast({ title: 'Copied!', description: `${tableName} data copied to clipboard` })
+  }, [toast])
 
   // ─── Copy all data to clipboard ──────────────────────
-  const copyAllData = (tables: Record<string, Record<string, unknown>[]>, format: string) => {
+  const copyAllData = useCallback((tables: Record<string, Record<string, unknown>[]>, format: string) => {
     let content = ''
     if (format === 'json') {
       content = JSON.stringify(tables, null, 2)
@@ -588,11 +1018,11 @@ export default function SynthForgeApp() {
     }
     navigator.clipboard.writeText(content)
     toast({ title: 'Copied!', description: 'Data copied to clipboard' })
-  }
+  }, [toast])
 
   const runSqlPlayground = () => {
     if (!sqlQuery.trim()) return
-    const tables = getTablesFromMessages()
+    const tables = getTablesFromMessages
     const tableName = sqlQuery.match(/FROM\s+(\w+)/i)?.[1] || sqlQuery.match(/from\s+(\w+)/i)?.[1]
     if (tableName && tables[tableName]) {
       setSqlResult(`Found ${tables[tableName].length} rows in "${tableName}"\n\n${JSON.stringify(tables[tableName].slice(0, 5), null, 2)}${tables[tableName].length > 5 ? '\n\n... and more' : ''}`)
@@ -602,13 +1032,13 @@ export default function SynthForgeApp() {
   }
 
   // ─── Schema templates ────────────────────────────────
-  const schemaTemplates: { name: string; desc: string; schema: Record<string, unknown> }[] = [
+  const schemaTemplates: { name: string; desc: string; schema: Record<string, unknown> }[] = useMemo(() => [
     { name: 'E-Commerce', desc: 'Users, Products, Orders', schema: { users: { columns: { id: 'SERIAL', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR', city: 'VARCHAR', state: 'VARCHAR', created_at: 'TIMESTAMP' } }, products: { columns: { id: 'SERIAL', name: 'VARCHAR', category: 'VARCHAR', price: 'DECIMAL', stock: 'INTEGER', description: 'VARCHAR' } }, orders: { columns: { id: 'SERIAL', user_id: 'INTEGER', product_id: 'INTEGER', quantity: 'INTEGER', total_amount: 'DECIMAL', status: 'VARCHAR', order_date: 'TIMESTAMP' } } } },
     { name: 'Healthcare', desc: 'Patients, Doctors, Appointments', schema: { patients: { columns: { id: 'SERIAL', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', age: 'INTEGER', diagnosis: 'VARCHAR', admission_date: 'TIMESTAMP', status: 'VARCHAR' } }, doctors: { columns: { id: 'SERIAL', first_name: 'VARCHAR', last_name: 'VARCHAR', specialty: 'VARCHAR', email: 'VARCHAR' } }, appointments: { columns: { id: 'SERIAL', patient_id: 'INTEGER', doctor_id: 'INTEGER', date: 'TIMESTAMP', notes: 'VARCHAR', status: 'VARCHAR' } } } },
     { name: 'Education', desc: 'Students, Courses, Enrollments', schema: { students: { columns: { id: 'SERIAL', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', age: 'INTEGER', enrollment_date: 'TIMESTAMP', status: 'VARCHAR' } }, courses: { columns: { id: 'SERIAL', name: 'VARCHAR', category: 'VARCHAR', credits: 'INTEGER', instructor: 'VARCHAR' } }, enrollments: { columns: { id: 'SERIAL', student_id: 'INTEGER', course_id: 'INTEGER', grade: 'VARCHAR', enrolled_at: 'TIMESTAMP' } } } },
     { name: 'HR/Employee', desc: 'Employees, Departments, Salaries', schema: { employees: { columns: { id: 'SERIAL', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', department_id: 'INTEGER', hire_date: 'TIMESTAMP', status: 'VARCHAR' } }, departments: { columns: { id: 'SERIAL', name: 'VARCHAR', budget: 'DECIMAL', location: 'VARCHAR' } }, salaries: { columns: { id: 'SERIAL', employee_id: 'INTEGER', amount: 'DECIMAL', effective_date: 'TIMESTAMP' } } } },
     { name: 'Fintech', desc: 'Accounts, Transactions, Cards', schema: { accounts: { columns: { id: 'SERIAL', holder_name: 'VARCHAR', email: 'VARCHAR', balance: 'DECIMAL', account_type: 'VARCHAR', created_at: 'TIMESTAMP' } }, transactions: { columns: { id: 'SERIAL', account_id: 'INTEGER', amount: 'DECIMAL', type: 'VARCHAR', description: 'VARCHAR', timestamp: 'TIMESTAMP' } }, cards: { columns: { id: 'SERIAL', account_id: 'INTEGER', card_type: 'VARCHAR', limit: 'DECIMAL', expiry: 'VARCHAR', status: 'VARCHAR' } } } },
-  ]
+  ], [])
 
   // ─── Render Helper: Quality Score Badge ───────────────────
   const QualityBadge = ({ score }: { score: number }) => {
@@ -650,10 +1080,10 @@ export default function SynthForgeApp() {
   }
 
   // ─── Regenerate table data ────────────────────────────────
-  const regenerateTable = async (tableName: string) => {
+  const regenerateTable = useCallback(async (tableName: string) => {
     if (!activeDb || !conversation) return
     await sendMessage(`Regenerate data for the ${tableName} table with different values`)
-  }
+  }, [activeDb, conversation, sendMessage])
 
   // ─── Render Helper: Agent Badge ────────────────────────
   const AgentBadge = ({ name }: { name: string }) => {
@@ -727,6 +1157,7 @@ export default function SynthForgeApp() {
                 size="sm"
                 className="h-auto py-1.5 px-3 text-xs hover:bg-amber-50 hover:border-amber-300 transition-colors"
                 onClick={() => sendMessage(opt.value)}
+                disabled={isLoading}
               >
                 {opt.label}
               </Button>
@@ -739,7 +1170,7 @@ export default function SynthForgeApp() {
 
   // ─── Quick Action Buttons (after generation) ─────────
   const QuickActions = ({ msg }: { msg: Message }) => {
-    const tables = getTablesFromMessages()
+    const tables = getTablesFromMessages
     if (msg.role !== 'assistant' || Object.keys(tables).length === 0) return null
 
     return (
@@ -749,6 +1180,7 @@ export default function SynthForgeApp() {
           size="sm"
           className="h-6 text-[11px] gap-1 hover:bg-amber-50 hover:border-amber-300"
           onClick={() => exportData(tables, 'json')}
+          aria-label="Export as JSON"
         >
           <FileJson className="h-3 w-3" /> Export JSON
         </Button>
@@ -757,6 +1189,7 @@ export default function SynthForgeApp() {
           size="sm"
           className="h-6 text-[11px] gap-1 hover:bg-amber-50 hover:border-amber-300"
           onClick={() => exportData(tables, 'csv')}
+          aria-label="Export as CSV"
         >
           <FileText className="h-3 w-3" /> Export CSV
         </Button>
@@ -765,6 +1198,7 @@ export default function SynthForgeApp() {
           size="sm"
           className="h-6 text-[11px] gap-1 hover:bg-amber-50 hover:border-amber-300"
           onClick={() => copyAllData(tables, 'json')}
+          aria-label="Copy data to clipboard"
         >
           <Copy className="h-3 w-3" /> Copy
         </Button>
@@ -772,8 +1206,9 @@ export default function SynthForgeApp() {
           variant="outline"
           size="sm"
           className="h-6 text-[11px] gap-1 hover:bg-amber-50 hover:border-amber-300"
-          onClick={() => sendMessage('Add 10 more rows to each table')}
+          onClick={() => sendMessage('Add more rows to each table')}
           disabled={isLoading}
+          aria-label="Add more data"
         >
           <Plus className="h-3 w-3" /> Add More
         </Button>
@@ -801,158 +1236,10 @@ export default function SynthForgeApp() {
     )
   }
 
-  // ─── Render: Data Table ───────────────────────────────
-  const DataTable = ({ tableName, rows }: { tableName: string; rows: Record<string, unknown>[] }) => {
-    const [page, setPage] = useState(0)
-    const pageSize = 20
-    const totalPages = Math.ceil(rows.length / pageSize)
-    const startIdx = page * pageSize
-    const pageRows = rows.slice(startIdx, startIdx + pageSize)
-    const schema = getSchemaFromDb()
-    const tableSchema = schema[tableName]
-
-    // Column type highlighting
-    const getColumnType = (colName: string): string => {
-      if (tableSchema?.columns?.[colName]) return tableSchema.columns[colName]
-      if (colName === 'id') return 'PK'
-      if (colName.endsWith('_id')) return 'FK'
-      return ''
-    }
-
-    const columnTypeColor = (colType: string): string => {
-      if (!colType) return ''
-      if (colType === 'PK' || colType.includes('SERIAL') || colType.includes('PRIMARY')) return 'bg-amber-100 text-amber-800'
-      if (colType === 'FK' || colType.includes('REFERENCES') || colType.includes('INTEGER')) return 'bg-sky-100 text-sky-800'
-      if (colType.includes('VARCHAR') || colType.includes('TEXT')) return 'bg-emerald-100 text-emerald-800'
-      if (colType.includes('DECIMAL') || colType.includes('FLOAT') || colType.includes('NUMERIC')) return 'bg-purple-100 text-purple-800'
-      if (colType.includes('TIMESTAMP') || colType.includes('DATE')) return 'bg-orange-100 text-orange-800'
-      if (colType.includes('BOOLEAN') || colType.includes('BOOL')) return 'bg-pink-100 text-pink-800'
-      return 'bg-gray-100 text-gray-800'
-    }
-
-    return (
-      <Card>
-        <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
-            <CardTitle className="text-sm font-semibold flex items-center gap-2">
-              <Table2 className="h-4 w-4 text-amber-700" />
-              {tableName}
-            </CardTitle>
-            <div className="flex items-center gap-1.5">
-              <TooltipProvider>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-6 w-6 p-0 hover:bg-amber-50"
-                      onClick={() => regenerateTable(tableName)}
-                      disabled={isLoading}
-                    >
-                      <RotateCcw className="h-3 w-3 text-amber-700" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Regenerate {tableName}</TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
-              <Badge variant="secondary" className="text-xs">{rows.length} rows</Badge>
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent>
-          {pageRows.length > 0 ? (
-            <ScrollArea className="max-h-80">
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="border-b bg-muted/30 sticky top-0">
-                    {Object.keys(pageRows[0]).map(key => {
-                      const colType = getColumnType(key)
-                      return (
-                        <th key={key} className="text-left py-1.5 px-2 whitespace-nowrap">
-                          <div className="flex items-center gap-1">
-                            <span className="font-medium text-muted-foreground">{key}</span>
-                            {colType && (
-                              <Badge className={`text-[8px] px-1 py-0 h-3.5 font-mono ${columnTypeColor(colType)}`}>
-                                {colType === 'PK' ? 'PK' : colType === 'FK' ? 'FK' : colType.split('(')[0]}
-                              </Badge>
-                            )}
-                          </div>
-                        </th>
-                      )
-                    })}
-                  </tr>
-                </thead>
-                <tbody>
-                  {pageRows.map((row, i) => (
-                    <tr key={i} className="border-b last:border-0 hover:bg-amber-50/30 transition-colors">
-                      {Object.entries(row).map(([key, val], j) => {
-                        const colType = getColumnType(key)
-                        const isPK = colType === 'PK' || key === 'id'
-                        const isFK = colType === 'FK' || key.endsWith('_id')
-                        return (
-                          <td key={j} className={`py-1.5 px-2 whitespace-nowrap max-w-[200px] truncate ${isPK ? 'font-mono font-semibold text-amber-700' : isFK ? 'font-mono text-sky-700' : ''}`}>
-                            {val === null ? <span className="text-muted-foreground italic">null</span> : String(val)}
-                          </td>
-                        )
-                      })}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              {totalPages > 1 && (
-                <div className="flex items-center justify-between mt-3 pt-2 border-t">
-                  <p className="text-xs text-muted-foreground">Page {page + 1} of {totalPages}</p>
-                  <div className="flex gap-1">
-                    <Button variant="outline" size="sm" className="h-6 text-xs" disabled={page === 0} onClick={() => setPage(p => p - 1)}>
-                      Prev
-                    </Button>
-                    <Button variant="outline" size="sm" className="h-6 text-xs" disabled={page >= totalPages - 1} onClick={() => setPage(p => p + 1)}>
-                      Next
-                    </Button>
-                  </div>
-                </div>
-              )}
-            </ScrollArea>
-          ) : (
-            <p className="text-xs text-muted-foreground">No data rows</p>
-          )}
-        </CardContent>
-      </Card>
-    )
-  }
-
-  // ─── Render: Schema Card ──────────────────────────────
-  const SchemaCard = ({ tableName, columns }: { tableName: string; columns: Record<string, string> }) => (
-    <Card>
-      <CardHeader className="pb-2">
-        <CardTitle className="text-sm font-semibold flex items-center gap-2">
-          <Table2 className="h-4 w-4 text-amber-700" />
-          {tableName}
-        </CardTitle>
-      </CardHeader>
-      <CardContent>
-        <ScrollArea className="max-h-48">
-          <div className="space-y-1">
-            {Object.entries(columns).map(([colName, colType]) => (
-              <div key={colName} className="flex items-center justify-between text-xs py-1.5 border-b last:border-0 hover:bg-muted/30 px-1 rounded">
-                <div className="flex items-center gap-2">
-                  {colName.toLowerCase() === 'id' && <Key className="h-3 w-3 text-amber-600" />}
-                  {colName.toLowerCase().endsWith('_id') && <Link2 className="h-3 w-3 text-sky-500" />}
-                  <span className="font-mono font-medium">{colName}</span>
-                </div>
-                <Badge variant="secondary" className="text-[10px] font-mono">{colType}</Badge>
-              </div>
-            ))}
-          </div>
-        </ScrollArea>
-      </CardContent>
-    </Card>
-  )
-
   // ─── Render: Entity-Relationship Diagram (text-based) ──
   const SchemaVisualization = () => {
-    const schema = getSchemaFromDb()
-    const tables = getTablesFromMessages()
+    const schema = getSchemaFromDb
+    const tables = getTablesFromMessages
     const allTableNames = new Set([...Object.keys(tables), ...Object.keys(schema)])
 
     if (allTableNames.size === 0) {
@@ -967,7 +1254,6 @@ export default function SynthForgeApp() {
       )
     }
 
-    // Build relationships
     const relationships: { from: string; to: string; via: string }[] = []
     for (const tableName of allTableNames) {
       const tableSchema = schema[tableName]
@@ -985,7 +1271,6 @@ export default function SynthForgeApp() {
 
     return (
       <div className="space-y-6">
-        {/* Relationship Overview */}
         {relationships.length > 0 && (
           <Card>
             <CardHeader className="pb-2">
@@ -1010,7 +1295,6 @@ export default function SynthForgeApp() {
           </Card>
         )}
 
-        {/* Entity Cards */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           {Array.from(allTableNames).map(tableName => {
             const tableSchema = schema[tableName]
@@ -1066,8 +1350,8 @@ export default function SynthForgeApp() {
 
   // ─── Render: Explorer Tree ────────────────────────────
   const ExplorerTree = () => {
-    const tables = getTablesFromMessages()
-    const schema = getSchemaFromDb()
+    const tables = getTablesFromMessages
+    const schema = getSchemaFromDb
     const allTableNames = new Set([...Object.keys(tables), ...Object.keys(schema)])
 
     return (
@@ -1092,6 +1376,7 @@ export default function SynthForgeApp() {
                   animate={{ opacity: 1, x: 0 }}
                   className="w-full text-left p-2 rounded-md hover:bg-muted/50 transition-colors group"
                   onClick={() => setRightTab('preview')}
+                  aria-label={`View ${tableName} table`}
                 >
                   <div className="flex items-center gap-2">
                     <ChevronRight className="h-3 w-3 text-muted-foreground group-hover:text-foreground" />
@@ -1128,8 +1413,24 @@ export default function SynthForgeApp() {
     if (isUser) {
       return (
         <motion.div {...messageSlideIn} className="flex justify-end">
-          <div className="max-w-[90%] bg-gradient-to-br from-amber-600 to-red-700 text-white rounded-xl rounded-br-sm px-3 py-2 shadow-sm">
+          <div className="max-w-[90%] bg-gradient-to-br from-amber-600 to-red-700 text-white rounded-xl rounded-br-sm px-3 py-2 shadow-sm relative">
             <p className="text-xs whitespace-pre-wrap">{msg.content}</p>
+            {/* Retry button for failed user messages */}
+            {msg.isError && (
+              <div className="mt-2 pt-1.5 border-t border-white/20 flex items-center gap-2">
+                <AlertCircle className="h-3 w-3 text-red-200" />
+                <span className="text-[10px] text-red-200">Failed to send</span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-5 text-[10px] px-2 text-white hover:bg-white/20"
+                  onClick={() => handleRetry(msg.id)}
+                  aria-label="Retry sending message"
+                >
+                  <RefreshCw className="h-2.5 w-2.5 mr-1" /> Retry
+                </Button>
+              </div>
+            )}
           </div>
         </motion.div>
       )
@@ -1141,7 +1442,6 @@ export default function SynthForgeApp() {
     try { parsedOptions = JSON.parse(msg.options || '[]') } catch { /* */ }
     try { parsedSteps = JSON.parse(msg.reasoningSteps || '[]') } catch { /* */ }
 
-    // Check if this message has generated tables
     let hasGeneratedTables = false
     try {
       const tables = JSON.parse(msg.tablesJson || '{}')
@@ -1151,11 +1451,15 @@ export default function SynthForgeApp() {
     return (
       <motion.div {...messageSlideIn} className="flex justify-start">
         <div className="max-w-[95%] bg-muted/50 rounded-xl rounded-bl-sm px-3 py-2.5 shadow-sm">
-          {/* Agent Badge & Indicators */}
           <div className="flex items-center gap-1.5 mb-1.5 flex-wrap">
             <AgentBadge name={msg.agentName} />
             {msg.qualityScore && <QualityBadge score={msg.qualityScore.overall} />}
             <PIIShieldBadge piiCheck={msg.piiCheck || null} />
+            {msg.isStreaming && (
+              <Badge className="text-[10px] bg-amber-100 text-amber-800 border-amber-200 gap-1">
+                <Loader2 className="h-2.5 w-2.5 animate-spin" /> Streaming
+              </Badge>
+            )}
             {msg.tokensIn > 0 && (
               <span className="text-[9px] text-muted-foreground">
                 {msg.tokensIn + msg.tokensOut} tok
@@ -1163,10 +1467,15 @@ export default function SynthForgeApp() {
             )}
           </div>
 
-          {/* Explanation */}
-          {renderAssistantContent(msg.content)}
+          {msg.isStreaming && !msg.content ? (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin text-amber-600" />
+              <span>Thinking<AnimatedDots /></span>
+            </div>
+          ) : (
+            renderAssistantContent(msg.content)
+          )}
 
-          {/* SQL Code Section */}
           {msg.sqlCode && (
             <Collapsible
               open={expandedSql[msg.id] ?? false}
@@ -1189,6 +1498,7 @@ export default function SynthForgeApp() {
                       size="sm"
                       className="h-5 w-5 p-0 bg-slate-800 text-slate-300 hover:text-white"
                       onClick={() => copyToClipboard(msg.sqlCode)}
+                      aria-label="Copy SQL code"
                     >
                       <Copy className="h-2.5 w-2.5" />
                     </Button>
@@ -1198,14 +1508,9 @@ export default function SynthForgeApp() {
             </Collapsible>
           )}
 
-          {/* Reasoning Steps */}
           <ReasoningTimeline steps={parsedSteps} msgId={msg.id} />
-
-          {/* Clarification Options */}
           <ClarificationOptions options={parsedOptions} />
-
-          {/* Quick Actions after generation */}
-          {hasGeneratedTables && <QuickActions msg={msg} />}
+          {hasGeneratedTables && !msg.isStreaming && <QuickActions msg={msg} />}
         </div>
       </motion.div>
     )
@@ -1214,7 +1519,7 @@ export default function SynthForgeApp() {
   // ─── Render: Chat Panel ────────────────────────────────
   const ChatPanel = () => (
     <div
-      className={`flex flex-col h-full border-r transition-colors ${isDragOver ? 'bg-amber-50/50 border-amber-300' : ''}`}
+      className={`flex flex-col h-full border-r transition-colors min-w-[280px] ${isDragOver ? 'bg-amber-50/50 border-amber-300' : ''}`}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
@@ -1230,8 +1535,16 @@ export default function SynthForgeApp() {
         </div>
       )}
 
+      {/* Offline Banner */}
+      {!isOnline && (
+        <div className="bg-red-50 border-b border-red-200 px-3 py-1.5 flex items-center gap-2 shrink-0" role="alert">
+          <WifiOff className="h-3.5 w-3.5 text-red-600 shrink-0" />
+          <span className="text-xs text-red-700">You are offline. Some features may not work.</span>
+        </div>
+      )}
+
       {/* Messages Area */}
-      <ScrollArea className="flex-1">
+      <div ref={chatScrollRef} className="flex-1 overflow-y-auto">
         <div className="p-3 space-y-3">
           {messages.length === 0 && !isLoading && (
             <motion.div
@@ -1252,22 +1565,6 @@ export default function SynthForgeApp() {
                 Describe the data you need. AI generates realistic synthetic data.
               </p>
 
-              {/* Row Count Control */}
-              <div className="w-full mb-4 p-2 bg-muted/30 rounded-lg">
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-[11px] text-muted-foreground">Rows per table:</span>
-                  <span className="text-xs font-semibold text-amber-700">{rowCount}</span>
-                </div>
-                <Slider
-                  value={[rowCount]}
-                  onValueChange={(v) => setRowCount(v[0])}
-                  min={5}
-                  max={100}
-                  step={5}
-                  className="w-full"
-                />
-              </div>
-
               <motion.div
                 variants={staggerContainer}
                 initial="initial"
@@ -1275,7 +1572,7 @@ export default function SynthForgeApp() {
                 className="grid grid-cols-1 gap-1.5 w-full"
               >
                 {[
-                  { icon: <Hash className="h-3 w-3" />, text: `Generate ${rowCount} users` },
+                  { icon: <Hash className="h-3 w-3" />, text: 'Generate users' },
                   { icon: <Table2 className="h-3 w-3" />, text: 'E-commerce orders' },
                   { icon: <Database className="h-3 w-3" />, text: 'Hospital DB schema' },
                   { icon: <Code2 className="h-3 w-3" />, text: 'Student enrollment' }
@@ -1300,8 +1597,8 @@ export default function SynthForgeApp() {
             <ChatMessage key={msg.id} msg={msg} />
           ))}
 
-          {/* Loading Indicator */}
-          {isLoading && (
+          {/* Loading Indicator (only when no streaming message is shown) */}
+          {isLoading && !messages.some(m => m.isStreaming) && (
             <motion.div
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
@@ -1316,7 +1613,7 @@ export default function SynthForgeApp() {
 
           <div ref={messagesEndRef} />
         </div>
-      </ScrollArea>
+      </div>
 
       {/* Input Area */}
       <div className="border-t bg-background p-2.5 shrink-0">
@@ -1327,7 +1624,7 @@ export default function SynthForgeApp() {
               <Badge key={i} variant="secondary" className="gap-1 text-[10px] py-0.5 px-1.5">
                 <Paperclip className="h-2.5 w-2.5" />
                 <span className="truncate max-w-[60px]">{file.name}</span>
-                <button onClick={() => removeFile(i)} className="hover:text-destructive transition-colors">
+                <button onClick={() => removeFile(i)} className="hover:text-destructive transition-colors" aria-label={`Remove ${file.name}`}>
                   <X className="h-2.5 w-2.5" />
                 </button>
               </Badge>
@@ -1335,22 +1632,27 @@ export default function SynthForgeApp() {
           </div>
         )}
 
-        {/* Row count quick setting */}
+        {/* Row count input */}
         <div className="flex items-center gap-2 mb-1.5">
           <span className="text-[10px] text-muted-foreground whitespace-nowrap">Rows:</span>
-          <div className="flex items-center gap-1 flex-1">
-            {[5, 10, 25, 50, 100].map(n => (
-              <Button
-                key={n}
-                variant={rowCount === n ? 'default' : 'outline'}
-                size="sm"
-                className={`h-5 text-[10px] px-1.5 py-0 ${rowCount === n ? 'bg-amber-600 text-white' : ''}`}
-                onClick={() => setRowCount(n)}
-              >
-                {n}
-              </Button>
-            ))}
-          </div>
+          <Input
+            type="number"
+            min={1}
+            max={10000}
+            value={rowCountInput}
+            onChange={(e) => handleRowCountChange(e.target.value)}
+            placeholder="Optional"
+            className={`h-5 text-[10px] px-1.5 py-0 w-20 ${rowCountError ? 'border-red-400 focus-visible:ring-red-400' : ''}`}
+            aria-label="Number of rows per table"
+          />
+          {rowCountError && (
+            <span className="text-[9px] text-red-500">{rowCountError}</span>
+          )}
+          {parsedRowCount && (
+            <Badge variant="outline" className="text-[9px] px-1 py-0">
+              {parsedRowCount} rows/table
+            </Badge>
+          )}
         </div>
 
         <div className="flex items-end gap-1.5">
@@ -1361,6 +1663,7 @@ export default function SynthForgeApp() {
             multiple
             accept=".sql,.csv,.json,.txt,.xml"
             onChange={handleFileUpload}
+            aria-hidden="true"
           />
           <TooltipProvider>
             <Tooltip>
@@ -1370,6 +1673,7 @@ export default function SynthForgeApp() {
                   size="sm"
                   className="h-7 w-7 shrink-0 p-0"
                   onClick={() => fileInputRef.current?.click()}
+                  aria-label="Attach files"
                 >
                   <Paperclip className="h-3.5 w-3.5" />
                 </Button>
@@ -1388,19 +1692,40 @@ export default function SynthForgeApp() {
               className="min-h-[34px] max-h-24 resize-none text-xs py-1.5 px-2.5"
               disabled={isLoading}
               rows={1}
+              aria-label="Chat message input"
             />
           </div>
 
-          <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
-            <Button
-              size="sm"
-              className="h-7 w-7 p-0 bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white shrink-0"
-              onClick={handleSubmit}
-              disabled={isLoading || (!input.trim() && attachedFiles.length === 0)}
-            >
-              <Send className="h-3.5 w-3.5" />
-            </Button>
-          </motion.div>
+          {/* Send / Stop button */}
+          {isLoading ? (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    className="h-7 w-7 p-0 bg-red-600 hover:bg-red-700 text-white shrink-0"
+                    onClick={handleAbort}
+                    aria-label="Stop generation"
+                  >
+                    <StopCircle className="h-3.5 w-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Stop generation</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          ) : (
+            <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
+              <Button
+                size="sm"
+                className="h-7 w-7 p-0 bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white shrink-0"
+                onClick={handleSubmit}
+                disabled={!input.trim() && attachedFiles.length === 0}
+                aria-label="Send message"
+              >
+                <Send className="h-3.5 w-3.5" />
+              </Button>
+            </motion.div>
+          )}
         </div>
       </div>
     </div>
@@ -1408,8 +1733,8 @@ export default function SynthForgeApp() {
 
   // ─── Render: Data Workspace Panel ─────────────────────
   const DataWorkspace = () => {
-    const allTables = getTablesFromMessages()
-    const schemaObj = getSchemaFromDb()
+    const allTables = getTablesFromMessages
+    const schemaObj = getSchemaFromDb
 
     return (
       <Tabs value={rightTab} onValueChange={setRightTab} className="flex flex-col h-full">
@@ -1479,7 +1804,7 @@ export default function SynthForgeApp() {
                     <div className="ml-auto flex items-center gap-1">
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
-                          <Button variant="outline" size="sm" className="gap-1 text-xs h-7">
+                          <Button variant="outline" size="sm" className="gap-1 text-xs h-7" aria-label="Export all data">
                             <Download className="h-3 w-3" /> Export
                           </Button>
                         </DropdownMenuTrigger>
@@ -1509,7 +1834,16 @@ export default function SynthForgeApp() {
                     </div>
                   </div>
                   {Object.entries(allTables).map(([tableName, rows]) => (
-                    <DataTable key={tableName} tableName={tableName} rows={rows} />
+                    <DataTable
+                      key={tableName}
+                      tableName={tableName}
+                      rows={rows}
+                      schemaObj={schemaObj}
+                      onRegenerate={regenerateTable}
+                      isLoading={isLoading}
+                      onExportTable={exportTable}
+                      onCopyTable={copyTable}
+                    />
                   ))}
                 </>
               )}
@@ -1520,7 +1854,6 @@ export default function SynthForgeApp() {
         <TabsContent value="schema" className="flex-1 overflow-auto mt-0">
           <ScrollArea className="h-full">
             <div className="p-4 space-y-4">
-              {/* Schema templates */}
               <div className="mb-4">
                 <Button
                   variant="outline"
@@ -1605,6 +1938,7 @@ export default function SynthForgeApp() {
               onChange={(e) => setSqlQuery(e.target.value)}
               placeholder="SELECT * FROM users LIMIT 10;"
               className="min-h-[100px] font-mono text-xs flex-1"
+              aria-label="SQL query input"
             />
             <Button
               size="sm"
@@ -1636,7 +1970,7 @@ export default function SynthForgeApp() {
   // ═══════════════════════════════════════════════════════════
   if (view === 'landing') {
     return (
-      <div className="min-h-screen flex flex-col bg-white">
+      <div className="min-h-screen flex flex-col bg-white overflow-x-hidden">
         <style>{gradientStyle}</style>
         {/* Nav */}
         <motion.nav
@@ -1672,7 +2006,6 @@ export default function SynthForgeApp() {
         {/* Hero */}
         <main className="flex-1">
           <section className="relative overflow-hidden">
-            {/* Animated gradient background */}
             <div
               className="absolute inset-0 opacity-30"
               style={{
@@ -1681,8 +2014,8 @@ export default function SynthForgeApp() {
                 animation: 'gradientShift 15s ease infinite'
               }}
             />
-            <div className="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-20 lg:py-32">
-              <div className="grid lg:grid-cols-2 gap-12 items-center">
+            <div className="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16 lg:py-32">
+              <div className="grid lg:grid-cols-2 gap-8 lg:gap-12 items-center">
                 <motion.div
                   initial={{ opacity: 0, x: -30 }}
                   animate={{ opacity: 1, x: 0 }}
@@ -1691,14 +2024,14 @@ export default function SynthForgeApp() {
                   <Badge className="mb-4 bg-amber-100 text-amber-800 border-amber-200">
                     <Sparkles className="h-3 w-3 mr-1" /> AI-Powered Synthetic Data
                   </Badge>
-                  <h1 className="text-4xl lg:text-6xl font-bold tracking-tight mb-6 leading-tight">
+                  <h1 className="text-3xl sm:text-4xl lg:text-6xl font-bold tracking-tight mb-6 leading-tight">
                     Generate <span className="text-transparent bg-clip-text bg-gradient-to-r from-amber-600 to-red-700">Realistic Data</span> in Seconds
                   </h1>
-                  <p className="text-lg text-muted-foreground mb-8 leading-relaxed max-w-xl">
+                  <p className="text-base sm:text-lg text-muted-foreground mb-8 leading-relaxed max-w-xl">
                     Create privacy-safe, relationally intact synthetic data from scratch.
                     Just describe what you need and our multi-agent AI generates statistically accurate datasets instantly.
                   </p>
-                  <div className="flex gap-3 mb-8">
+                  <div className="flex flex-wrap gap-3 mb-8">
                     <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
                       <Button size="lg" className="bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white text-base px-8" onClick={() => setView('dashboard')}>
                         Start Generating <ArrowRight className="ml-2 h-4 w-4" />
@@ -1708,8 +2041,7 @@ export default function SynthForgeApp() {
                       Try Demo
                     </Button>
                   </div>
-                  {/* Stats */}
-                  <div className="flex gap-8">
+                  <div className="flex gap-6 sm:gap-8">
                     {[
                       { value: '10M+', label: 'Rows Generated' },
                       { value: '99.2%', label: 'FK Integrity' },
@@ -1731,7 +2063,7 @@ export default function SynthForgeApp() {
                   initial={{ opacity: 0, x: 30, y: 20 }}
                   animate={{ opacity: 1, x: 0, y: 0 }}
                   transition={{ duration: 0.6, delay: 0.2 }}
-                  className="relative"
+                  className="relative hidden sm:block"
                 >
                   <Card className="shadow-2xl border-0 bg-white">
                     <CardHeader className="pb-3">
@@ -1744,14 +2076,14 @@ export default function SynthForgeApp() {
                     </CardHeader>
                     <CardContent className="space-y-3">
                       <div className="bg-muted rounded-lg p-3 text-sm">
-                        <span className="text-amber-700 font-medium">You:</span> Generate 50 rows of e-commerce data with users, orders, and products
+                        <span className="text-amber-700 font-medium">You:</span> Generate e-commerce data with users, orders, and products
                       </div>
                       <div className="bg-primary/5 rounded-lg p-3 text-sm space-y-2">
                         <div className="flex items-center gap-2">
                           <span className="text-primary font-medium">SynthForge:</span>
                           <Badge className="text-[10px] bg-amber-100 text-amber-800 border-amber-200"><Wand2 className="h-2.5 w-2.5 mr-0.5" /> auto-agent</Badge>
                         </div>
-                        <p className="text-muted-foreground">I&apos;ll create a realistic e-commerce dataset with 50 users, their orders, and a product catalog.</p>
+                        <p className="text-muted-foreground">I&apos;ll create a realistic e-commerce dataset with users, their orders, and a product catalog.</p>
                         <div className="bg-white rounded border p-2 font-mono text-xs overflow-hidden">
                           <p className="text-green-700">-- 3 tables generated</p>
                           <p className="text-muted-foreground">users (50 rows) | orders (127 rows) | products (30 rows)</p>
@@ -1776,7 +2108,7 @@ export default function SynthForgeApp() {
           </section>
 
           {/* Features */}
-          <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-20 bg-slate-50/50">
+          <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16 sm:py-20 bg-slate-50/50">
             <motion.div
               initial={{ opacity: 0, y: 20 }}
               whileInView={{ opacity: 1, y: 0 }}
@@ -1784,15 +2116,15 @@ export default function SynthForgeApp() {
               className="text-center mb-12"
             >
               <Badge variant="outline" className="mb-4">Core Features</Badge>
-              <h2 className="text-3xl font-bold mb-4">Everything You Need for Synthetic Data</h2>
-              <p className="text-muted-foreground text-lg max-w-2xl mx-auto">From schema definition to export, SynthForge AI handles the entire synthetic data lifecycle.</p>
+              <h2 className="text-2xl sm:text-3xl font-bold mb-4">Everything You Need for Synthetic Data</h2>
+              <p className="text-muted-foreground text-base sm:text-lg max-w-2xl mx-auto">From schema definition to export, SynthForge AI handles the entire synthetic data lifecycle.</p>
             </motion.div>
             <motion.div
               variants={staggerContainer}
               initial="initial"
               whileInView="animate"
               viewport={{ once: true }}
-              className="grid md:grid-cols-2 lg:grid-cols-4 gap-6"
+              className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-6"
             >
               {[
                 { icon: Sparkles, title: 'AI-Powered Generation', desc: 'Describe data in natural language. Multi-agent AI generates realistic, domain-specific synthetic data instantly.', color: 'from-amber-100 to-amber-50' },
@@ -1816,17 +2148,17 @@ export default function SynthForgeApp() {
           </section>
 
           {/* How it works */}
-          <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-20">
+          <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16 sm:py-20">
             <motion.div
               initial={{ opacity: 0, y: 20 }}
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true }}
               className="text-center mb-12"
             >
-              <h2 className="text-3xl font-bold mb-4">How It Works</h2>
-              <p className="text-muted-foreground text-lg">Three steps from idea to data</p>
+              <h2 className="text-2xl sm:text-3xl font-bold mb-4">How It Works</h2>
+              <p className="text-muted-foreground text-base sm:text-lg">Three steps from idea to data</p>
             </motion.div>
-            <div className="grid md:grid-cols-3 gap-8">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
               {[
                 { step: '1', title: 'Describe', desc: 'Tell the AI what data you need in natural language, or upload a schema file.', icon: MessageSquare },
                 { step: '2', title: 'Generate', desc: 'Our multi-agent AI plans the schema, generates realistic data, and validates integrity.', icon: Wand2 },
@@ -1854,10 +2186,10 @@ export default function SynthForgeApp() {
           </section>
 
           {/* Social Proof / CTA */}
-          <section className="bg-gradient-to-r from-amber-600 to-red-700 py-16">
+          <section className="bg-gradient-to-r from-amber-600 to-red-700 py-12 sm:py-16">
             <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
-              <h2 className="text-3xl font-bold text-white mb-4">Ready to Generate Synthetic Data?</h2>
-              <p className="text-white/80 text-lg mb-8 max-w-xl mx-auto">Start creating privacy-safe, realistic synthetic data in seconds. No credit card required.</p>
+              <h2 className="text-2xl sm:text-3xl font-bold text-white mb-4">Ready to Generate Synthetic Data?</h2>
+              <p className="text-white/80 text-base sm:text-lg mb-8 max-w-xl mx-auto">Start creating privacy-safe, realistic synthetic data in seconds. No credit card required.</p>
               <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
                 <Button
                   size="lg"
@@ -1889,7 +2221,6 @@ export default function SynthForgeApp() {
   // DASHBOARD VIEW
   // ═══════════════════════════════════════════════════════════
   if (view === 'dashboard') {
-    // Compute stats
     const totalTables = allDatabases.reduce((sum, db) => {
       try {
         const schema = JSON.parse(db.schemaJson || '{}')
@@ -1905,7 +2236,7 @@ export default function SynthForgeApp() {
     const totalConversations = allDatabases.reduce((sum, db) => sum + (db._count?.conversations || 0), 0)
 
     return (
-      <div className="min-h-screen flex bg-background">
+      <div className="min-h-screen flex bg-background overflow-x-hidden">
         {/* Sidebar */}
         <AnimatePresence>
           {(sidebarOpen || (typeof window !== 'undefined' && window.innerWidth >= 768)) && (
@@ -1916,18 +2247,16 @@ export default function SynthForgeApp() {
               transition={{ type: 'spring', stiffness: 300, damping: 30 }}
               className="fixed md:relative z-40 w-64 border-r bg-card h-screen flex flex-col md:translate-x-0"
             >
-              {/* Sidebar Header */}
               <div className="h-14 flex items-center gap-2 px-4 border-b shrink-0">
                 <div className="h-7 w-7 rounded-md bg-gradient-to-br from-amber-600 to-red-700 flex items-center justify-center">
                   <Zap className="h-4 w-4 text-white" />
                 </div>
                 <span className="font-bold text-sm">SynthForge AI</span>
-                <Button variant="ghost" size="sm" className="ml-auto md:hidden h-7 w-7 p-0" onClick={() => setSidebarOpen(false)}>
+                <Button variant="ghost" size="sm" className="ml-auto md:hidden h-7 w-7 p-0" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar">
                   <X className="h-4 w-4" />
                 </Button>
               </div>
 
-              {/* Sidebar Content */}
               <ScrollArea className="flex-1">
                 <div className="p-3 space-y-1">
                   <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2 px-2">Workspaces</p>
@@ -1958,6 +2287,7 @@ export default function SynthForgeApp() {
                           whileHover={{ x: 2 }}
                           className="w-full text-left p-2 rounded-md text-xs hover:bg-muted/50 transition-colors flex items-center gap-2"
                           onClick={() => openDatabase(db)}
+                          aria-label={`Open ${db.name}`}
                         >
                           <Database className="h-3.5 w-3.5 text-amber-700 shrink-0" />
                           <span className="truncate">{db.name}</span>
@@ -1971,7 +2301,6 @@ export default function SynthForgeApp() {
                 </div>
               </ScrollArea>
 
-              {/* Sidebar Footer */}
               <div className="p-3 border-t shrink-0">
                 <Button
                   variant="outline"
@@ -1986,16 +2315,13 @@ export default function SynthForgeApp() {
           )}
         </AnimatePresence>
 
-        {/* Sidebar overlay for mobile */}
         {sidebarOpen && typeof window !== 'undefined' && window.innerWidth < 768 && (
           <div className="fixed inset-0 bg-black/50 z-30" onClick={() => setSidebarOpen(false)} />
         )}
 
-        {/* Main Content */}
-        <main className="flex-1 min-h-screen">
-          {/* Dashboard Header */}
+        <main className="flex-1 min-h-screen min-w-0">
           <header className="h-14 border-b flex items-center px-4 gap-3 shrink-0 bg-card">
-            <Button variant="ghost" size="sm" className="md:hidden h-8 w-8 p-0" onClick={() => setSidebarOpen(true)}>
+            <Button variant="ghost" size="sm" className="md:hidden h-8 w-8 p-0" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar">
               <Menu className="h-4 w-4" />
             </Button>
             <h1 className="font-semibold text-lg">Dashboard</h1>
@@ -2015,8 +2341,9 @@ export default function SynthForgeApp() {
                   </DialogHeader>
                   <div className="space-y-4 py-4">
                     <div className="space-y-2">
-                      <label className="text-sm font-medium">Database Name</label>
+                      <label className="text-sm font-medium" htmlFor="new-db-name">Database Name</label>
                       <Input
+                        id="new-db-name"
                         value={newDbName}
                         onChange={(e) => setNewDbName(e.target.value)}
                         placeholder="e.g., E-Commerce Store"
@@ -2024,15 +2351,15 @@ export default function SynthForgeApp() {
                       />
                     </div>
                     <div className="space-y-2">
-                      <label className="text-sm font-medium">Schema (Optional JSON)</label>
+                      <label className="text-sm font-medium" htmlFor="new-db-schema">Schema (Optional JSON)</label>
                       <Textarea
+                        id="new-db-schema"
                         value={newDbSchema}
                         onChange={(e) => setNewDbSchema(e.target.value)}
                         placeholder='{"users": {"columns": {"id": "SERIAL", "name": "VARCHAR"}}}'
                         className="font-mono text-xs min-h-[80px]"
                       />
                     </div>
-                    {/* Schema Templates */}
                     <div className="space-y-2">
                       <label className="text-sm font-medium">Or choose a template:</label>
                       <div className="grid grid-cols-3 gap-2">
@@ -2061,15 +2388,14 @@ export default function SynthForgeApp() {
             </div>
           </header>
 
-          {/* Dashboard Content */}
           <ScrollArea className="h-[calc(100vh-56px)]">
-            <div className="p-6 max-w-6xl mx-auto">
+            <div className="p-4 sm:p-6 max-w-6xl mx-auto">
               {/* Workspace Stats */}
               <motion.div
                 variants={staggerContainer}
                 initial="initial"
                 animate="animate"
-                className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8"
+                className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 mb-8"
               >
                 {[
                   { icon: <Database className="h-4 w-4 text-amber-700" />, label: 'Databases', value: allDatabases.length, color: 'from-amber-100 to-amber-50' },
@@ -2083,7 +2409,7 @@ export default function SynthForgeApp() {
                         <div className={`h-8 w-8 rounded-lg bg-gradient-to-br ${stat.color} flex items-center justify-center mb-2`}>
                           {stat.icon}
                         </div>
-                        <p className="text-2xl font-bold">{stat.value}</p>
+                        <p className="text-xl sm:text-2xl font-bold">{stat.value}</p>
                         <p className="text-xs text-muted-foreground">{stat.label}</p>
                       </CardContent>
                     </Card>
@@ -2096,7 +2422,7 @@ export default function SynthForgeApp() {
                 variants={staggerContainer}
                 initial="initial"
                 animate="animate"
-                className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8"
+                className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 mb-8"
               >
                 {[
                   { icon: <MessageSquare className="h-5 w-5 text-amber-700" />, title: 'Chat to Generate', desc: 'Describe data in natural language', action: () => allDatabases[0] ? openDatabase(allDatabases[0]) : setShowNewDbDialog(true) },
@@ -2176,7 +2502,6 @@ export default function SynthForgeApp() {
                     className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"
                   >
                     {allDatabases.map(db => {
-                      // Parse schema and data for stats
                       let tableCount = 0
                       let rowCount = 0
                       try {
@@ -2197,7 +2522,7 @@ export default function SynthForgeApp() {
                                 </CardTitle>
                                 <DropdownMenu>
                                   <DropdownMenuTrigger asChild onClick={(e) => e.stopPropagation()}>
-                                    <Button variant="ghost" size="sm" className="h-7 w-7 p-0 opacity-0 group-hover:opacity-100 transition-opacity">
+                                    <Button variant="ghost" size="sm" className="h-7 w-7 p-0 opacity-0 group-hover:opacity-100 transition-opacity" aria-label="Database options">
                                       <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
                                     </Button>
                                   </DropdownMenuTrigger>
@@ -2265,13 +2590,13 @@ export default function SynthForgeApp() {
   // STUDIO VIEW
   // ═══════════════════════════════════════════════════════════
   if (view === 'studio' && activeDb) {
-    const allTables = getTablesFromMessages()
+    const allTables = getTablesFromMessages
 
     return (
-      <div className="h-screen flex flex-col bg-background">
+      <div className="h-screen flex flex-col bg-background overflow-hidden">
         {/* Studio Header */}
         <header className="border-b bg-card h-12 flex items-center px-3 gap-2 shrink-0">
-          <Button variant="ghost" size="sm" onClick={() => setView('dashboard')} className="gap-1 text-xs h-7">
+          <Button variant="ghost" size="sm" onClick={() => setView('dashboard')} className="gap-1 text-xs h-7" aria-label="Back to dashboard">
             <ChevronRight className="h-3 w-3 rotate-180" />
             <span className="hidden sm:inline">Back</span>
           </Button>
@@ -2292,14 +2617,13 @@ export default function SynthForgeApp() {
             </TooltipProvider>
           )}
 
-          {/* Agent Mode Selector - Prominent buttons */}
+          {/* Agent Mode Selector */}
           <Separator orientation="vertical" className="h-5 hidden md:block" />
           <div className="items-center gap-1 hidden md:flex">
             <span className="text-[10px] text-muted-foreground mr-1">Agent:</span>
             {(['plan', 'execute', 'auto'] as AgentMode[]).map((mode) => {
               const isPlan = mode === 'plan'
               const isExec = mode === 'execute'
-              const isAuto = mode === 'auto'
               const icon = isPlan ? <Brain className="h-3 w-3" /> : isExec ? <Play className="h-3 w-3" /> : <Wand2 className="h-3 w-3" />
               const label = isPlan ? 'Plan' : isExec ? 'Execute' : 'Auto'
               const activeColor = isPlan ? 'bg-sky-100 text-sky-800 border-sky-300' : isExec ? 'bg-emerald-100 text-emerald-800 border-emerald-300' : 'bg-amber-100 text-amber-800 border-amber-300'
@@ -2311,6 +2635,7 @@ export default function SynthForgeApp() {
                   size="sm"
                   className={`h-7 text-[11px] gap-1 px-2.5 ${agentMode === mode ? activeColor : 'text-muted-foreground'}`}
                   onClick={() => setAgentMode(mode)}
+                  aria-label={`${label} mode`}
                 >
                   {icon} {label}
                 </Button>
@@ -2319,7 +2644,6 @@ export default function SynthForgeApp() {
           </div>
 
           <div className="ml-auto flex items-center gap-1.5">
-            {/* Token usage indicator */}
             {totalTokens > 0 && (
               <TooltipProvider>
                 <Tooltip>
@@ -2340,6 +2664,7 @@ export default function SynthForgeApp() {
                 size="sm"
                 className="h-6 text-xs px-2"
                 onClick={() => setMobileStudioTab('chat')}
+                aria-label="Chat tab"
               >
                 <MessageSquare className="h-3 w-3" />
               </Button>
@@ -2348,6 +2673,7 @@ export default function SynthForgeApp() {
                 size="sm"
                 className="h-6 text-xs px-2"
                 onClick={() => setMobileStudioTab('data')}
+                aria-label="Data tab"
               >
                 <Table2 className="h-3 w-3" />
               </Button>
@@ -2356,7 +2682,7 @@ export default function SynthForgeApp() {
             {Object.keys(allTables).length > 0 && (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <Button variant="outline" size="sm" className="gap-1 text-xs h-7">
+                  <Button variant="outline" size="sm" className="gap-1 text-xs h-7" aria-label="Export data">
                     <Download className="h-3 w-3" /> <span className="hidden sm:inline">Export</span>
                   </Button>
                 </DropdownMenuTrigger>
@@ -2387,8 +2713,7 @@ export default function SynthForgeApp() {
           </div>
         </header>
 
-        {/* Main Studio Content */}
-        {/* Mobile: tab-based switching between chat and data */}
+        {/* Mobile: tab-based switching */}
         <div className="flex-1 overflow-hidden md:hidden">
           {mobileStudioTab === 'chat' ? <ChatPanel /> : <DataWorkspace />}
         </div>

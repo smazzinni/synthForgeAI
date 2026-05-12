@@ -20,10 +20,11 @@ export async function POST(request: NextRequest) {
       databaseId?: string
       agentMode?: string
       stream?: boolean
+      rowCount?: number
       files?: { name: string; content: string; type: string }[]
     }
 
-    const { conversationId, message, workspaceId, databaseId, agentMode = 'auto', stream = false, files = [] } = body
+    const { conversationId, message, workspaceId, databaseId, agentMode = 'auto', stream = false, rowCount, files = [] } = body
 
     if (!message || typeof message !== 'string') {
       return NextResponse.json({ error: 'Message required' }, { status: 400 })
@@ -91,9 +92,12 @@ export async function POST(request: NextRequest) {
     const currentAgentMode = agentMode || conversation.agentMode || 'auto'
     const systemPrompt = getSystemPrompt(currentAgentMode)
 
+    // Build row count context if specified
+    const rowContext = rowCount ? `\n\nUser wants to generate approximately ${rowCount} rows per table.` : ''
+
     const chatMessages = [
       ...previousMessages,
-      { role: 'user' as const, content: message + schemaContext + fileContext }
+      { role: 'user' as const, content: message + schemaContext + fileContext + rowContext }
     ]
 
     // ─── Streaming Path ─────────────────────────────────────────
