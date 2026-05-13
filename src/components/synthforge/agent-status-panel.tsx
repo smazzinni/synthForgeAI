@@ -279,9 +279,14 @@ export const AgentStatusPanel = React.memo(function AgentStatusPanel() {
   }, [])
 
   useEffect(() => {
-    fetchStatus()
+    let cancelled = false
+    const load = async () => {
+      await fetchStatus()
+      if (cancelled) return
+    }
+    load()
     const interval = setInterval(fetchStatus, 15000) // Refresh every 15s
-    return () => clearInterval(interval)
+    return () => { cancelled = true; clearInterval(interval) }
   }, [fetchStatus])
 
   if (isLoading) {

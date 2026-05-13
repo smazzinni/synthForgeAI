@@ -6,7 +6,6 @@ import {
   FolderTree, Table2, Network, GitBranch, ListOrdered,
   AlertTriangle, Link2, Search, Maximize2, ChevronRight
 } from 'lucide-react'
-import React from 'react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'

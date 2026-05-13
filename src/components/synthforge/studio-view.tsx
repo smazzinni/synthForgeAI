@@ -34,7 +34,7 @@ import { ChatPanel } from '@/components/synthforge/chat-panel'
 import { QualityReportPanel } from '@/components/synthforge/quality-report-panel'
 import { ERDiagram } from '@/components/synthforge/er-diagram'
 import { ExplorerPanel } from '@/components/explorer-panel'
-import { AgentStatusPanel } from '@/components/synthforge/agent-status-panel'
+// AgentStatusPanel removed - agents are only visible inside the chat during AI thinking
 
 // Shared types
 import type { Database_, Message, Conversation, AgentStepUI, QualityReportData, View, AgentMode } from '@/components/synthforge/types'
@@ -82,7 +82,7 @@ interface DataWorkspacePanelProps {
   validateSql: (sql: string) => void
   sendMessage: (messageText: string, files?: { name: string; content: string; type: string }[]) => void
   isLoadingChat: boolean
-  toast: (opts: { title: string; description: string; variant?: string }) => void
+  toast: (opts: { title: string; description: string; variant?: 'default' | 'destructive' | null }) => void
 }
 
 // ─── DataWorkspacePanel (proper component, not inline) ───
@@ -138,7 +138,7 @@ const DataWorkspacePanel = React.memo(function DataWorkspacePanel({
         <TabsTrigger value="relationships" className="text-xs data-[state=active]:bg-muted">ER Diagram</TabsTrigger>
         <TabsTrigger value="sql" className="text-xs data-[state=active]:bg-muted">SQL</TabsTrigger>
         <TabsTrigger value="explorer" className="text-xs data-[state=active]:bg-muted">Explorer</TabsTrigger>
-        <TabsTrigger value="agents" className="text-xs data-[state=active]:bg-muted">Agents</TabsTrigger>
+
       </TabsList>
 
       <TabsContent value="preview" className="flex-1 overflow-auto mt-0">
@@ -271,13 +271,7 @@ const DataWorkspacePanel = React.memo(function DataWorkspacePanel({
         />
       </TabsContent>
 
-      <TabsContent value="agents" className="flex-1 overflow-auto mt-0">
-        <ScrollArea className="h-full">
-          <div className="p-4">
-            <AgentStatusPanel />
-          </div>
-        </ScrollArea>
-      </TabsContent>
+
     </Tabs>
   )
 })
