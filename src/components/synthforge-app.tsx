@@ -11,7 +11,7 @@ import {
   Brain, Wand2, AlertCircle, Circle,
   Columns3, Key, Link2, RefreshCw, Menu, Eye, EyeOff,
   PanelLeftClose, PanelLeft, Shield, RotateCcw, Gauge, GitBranch,
-  Activity, Users, BarChart3, Clock, Layers, Settings,
+  Activity, Users, BarChart3, Clock, Settings,
   FileDown, ClipboardCheck, Rows3, Target, Network, StopCircle,
   WifiOff, ArrowDown, CheckCircle2, XCircle, Ban, HelpCircle,
   AlignLeft, Terminal, ZoomIn, ZoomOut, Maximize2, Move,
@@ -154,29 +154,86 @@ const gradientStyle = `
 }
 `
 
-// ─── React.memo DataTable ───────────────────────────────
+// ─── React.memo TableTreeView ───────────────────────────────
+const TableTreeView = React.memo(function TableTreeView({
+  tableNames,
+  tableRowCounts,
+  selectedTable,
+  onSelectTable
+}: {
+  tableNames: string[]
+  tableRowCounts: Record<string, number>
+  selectedTable: string | null
+  onSelectTable: (name: string) => void
+}) {
+  const [expanded, setExpanded] = useState(true)
+
+  return (
+    <div className="border rounded-lg bg-card">
+      <button
+        className="flex items-center gap-2 w-full p-2 hover:bg-muted/50 transition-colors text-left"
+        onClick={() => setExpanded(!expanded)}
+      >
+        {expanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+        <FolderTree className="h-3.5 w-3.5 text-amber-700" />
+        <span className="text-xs font-semibold">Tables</span>
+        <Badge variant="secondary" className="text-[10px] ml-auto">{tableNames.length}</Badge>
+      </button>
+      {expanded && (
+        <div className="border-t">
+          {tableNames.length === 0 ? (
+            <p className="text-[10px] text-muted-foreground p-2 text-center">No tables yet</p>
+          ) : (
+            tableNames.map(name => (
+              <button
+                key={name}
+                className={`flex items-center gap-2 w-full px-3 py-1.5 text-xs hover:bg-muted/50 transition-colors text-left ${
+                  selectedTable === name ? 'bg-amber-50 text-amber-900 border-l-2 border-amber-600' : ''
+                }`}
+                onClick={() => onSelectTable(name)}
+              >
+                <Table2 className="h-3 w-3 text-amber-700 shrink-0" />
+                <span className="truncate flex-1">{name}</span>
+                {tableRowCounts[name] !== undefined && (
+                  <Badge variant="secondary" className="text-[9px] px-1 py-0 h-3.5">{tableRowCounts[name]}</Badge>
+                )}
+              </button>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  )
+})
+
+// ─── React.memo DataTable (with lazy loading) ──────────────────
 const DataTable = React.memo(function DataTable({
   tableName,
-  rows,
+  allRows,
   schemaObj,
   onRegenerate,
   isLoading,
   onExportTable,
-  onCopyTable
+  onCopyTable,
+  initialPageSize
 }: {
   tableName: string
-  rows: Record<string, unknown>[]
+  allRows: Record<string, unknown>[]
   schemaObj: Record<string, { columns: Record<string, string>; relationships?: string[] }>
   onRegenerate: (name: string) => void
   isLoading: boolean
   onExportTable: (name: string, rows: Record<string, unknown>[], format: string) => void
   onCopyTable: (name: string, rows: Record<string, unknown>[]) => void
+  initialPageSize?: number
 }) {
   const [page, setPage] = useState(0)
+  const [visibleCount, setVisibleCount] = useState(initialPageSize ?? 50)
   const pageSize = 20
-  const totalPages = Math.ceil(rows.length / pageSize)
+  const visibleRows = allRows.slice(0, visibleCount)
+  const hasMore = visibleCount < allRows.length
+  const totalPages = Math.ceil(visibleRows.length / pageSize)
   const startIdx = page * pageSize
-  const pageRows = rows.slice(startIdx, startIdx + pageSize)
+  const pageRows = visibleRows.slice(startIdx, startIdx + pageSize)
   const tableSchema = schemaObj[tableName]
 
   const getColumnType = (colName: string): string => {
@@ -261,7 +318,7 @@ const DataTable = React.memo(function DataTable({
                 <TooltipContent>Regenerate {tableName}</TooltipContent>
               </Tooltip>
             </TooltipProvider>
-            <Badge variant="secondary" className="text-xs">{rows.length} rows</Badge>
+            <Badge variant="secondary" className="text-xs">{allRows.length} rows</Badge>
           </div>
         </div>
       </CardHeader>
@@ -322,6 +379,19 @@ const DataTable = React.memo(function DataTable({
         ) : (
           <p className="text-xs text-muted-foreground">No data rows</p>
         )}
+        {hasMore && (
+          <div className="flex justify-center pt-2">
+            <Button
+              variant="outline"
+              size="sm"
+              className="text-xs"
+              onClick={() => setVisibleCount(prev => prev + 50)}
+            >
+              <ArrowDown className="h-3 w-3 mr-1" />
+              Load More ({allRows.length - visibleCount} remaining)
+            </Button>
+          </div>
+        )}
       </CardContent>
     </Card>
   )
@@ -357,8 +427,139 @@ const SchemaCard = React.memo(function SchemaCard({ tableName, columns }: { tabl
   )
 })
 
+// ─── React.memo ChatInputBox ───────────────────────────────
+const ChatInputBox = React.memo(function ChatInputBox({
+  onSend,
+  isLoading,
+  onAbort,
+  attachedFiles,
+  onRemoveFile,
+  onFileUpload,
+  fileInputRef
+}: {
+  onSend: (message: string, files: { name: string; content: string; type: string }[]) => void
+  isLoading: boolean
+  onAbort: () => void
+  attachedFiles: { name: string; content: string; type: string }[]
+  onRemoveFile: (index: number) => void
+  onFileUpload: (e: React.ChangeEvent<HTMLInputElement>) => void
+  fileInputRef: React.RefObject<HTMLInputElement | null>
+}) {
+  const [inputValue, setInputValue] = useState('')
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+
+  const handleSend = useCallback(() => {
+    const msgText = inputValue.trim()
+    if (!msgText && attachedFiles.length === 0) return
+    onSend(msgText, attachedFiles)
+    setInputValue('')
+  }, [inputValue, attachedFiles, onSend])
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleSend()
+    }
+  }, [handleSend])
+
+  return (
+    <div className="border-t bg-background p-2.5 shrink-0">
+      {attachedFiles.length > 0 && (
+        <div className="flex flex-wrap gap-1 mb-1.5">
+          {attachedFiles.map((file, i) => (
+            <Badge key={i} variant="secondary" className="gap-1 text-[10px] py-0.5 px-1.5">
+              <Paperclip className="h-2.5 w-2.5" />
+              <span className="truncate max-w-[60px]">{file.name}</span>
+              <button onClick={() => onRemoveFile(i)} className="hover:text-destructive transition-colors" aria-label={`Remove ${file.name}`}>
+                <X className="h-2.5 w-2.5" />
+              </button>
+            </Badge>
+          ))}
+        </div>
+      )}
+
+      <div className="flex items-end gap-1.5">
+        <input
+          ref={fileInputRef}
+          type="file"
+          className="hidden"
+          multiple
+          accept=".sql,.csv,.json,.txt,.xml"
+          onChange={onFileUpload}
+          aria-hidden="true"
+        />
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 w-7 shrink-0 p-0"
+                onClick={() => fileInputRef.current?.click()}
+                aria-label="Attach files"
+              >
+                <Paperclip className="h-3.5 w-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Attach files (or drag & drop)</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+
+        <div className="flex-1 relative">
+          <Textarea
+            ref={textareaRef}
+            value={inputValue}
+            onChange={(e) => {
+              setInputValue(e.target.value)
+              e.stopPropagation()
+            }}
+            onKeyDown={handleKeyDown}
+            placeholder="Describe data..."
+            className="min-h-[34px] max-h-24 resize-none text-xs py-1.5 px-2.5"
+            disabled={isLoading}
+            rows={1}
+            aria-label="Chat message input"
+            onClick={(e) => e.stopPropagation()}
+            onFocus={(e) => e.stopPropagation()}
+          />
+        </div>
+
+        {isLoading ? (
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  size="sm"
+                  className="h-7 w-7 p-0 bg-red-600 hover:bg-red-700 text-white shrink-0"
+                  onClick={onAbort}
+                  aria-label="Stop generation"
+                >
+                  <StopCircle className="h-3.5 w-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Stop generation</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        ) : (
+          <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
+            <Button
+              size="sm"
+              className="h-7 w-7 p-0 bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white shrink-0"
+              onClick={handleSend}
+              disabled={!inputValue.trim() && attachedFiles.length === 0}
+              aria-label="Send message"
+            >
+              <Send className="h-3.5 w-3.5" />
+            </Button>
+          </motion.div>
+        )}
+      </div>
+    </div>
+  )
+})
+
 // ─── Main App ──────────────────────────────────────────
-export default function SynthForgeApp() {
+export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId?: string }) {
   const [view, setView] = useState<View>('landing')
   const [workspaces, setWorkspaces] = useState<Workspace[]>([])
   const [activeWorkspace, setActiveWorkspace] = useState<Workspace | null>(null)
@@ -366,7 +567,6 @@ export default function SynthForgeApp() {
   const [activeDb, setActiveDb] = useState<Database_ | null>(null)
   const [conversation, setConversation] = useState<Conversation | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
-  const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [showNewDbDialog, setShowNewDbDialog] = useState(false)
   const [newDbName, setNewDbName] = useState('')
@@ -383,7 +583,9 @@ export default function SynthForgeApp() {
   const [schemaVersionCount, setSchemaVersionCount] = useState(0)
   const [isDragOver, setIsDragOver] = useState(false)
   const [totalTokens, setTotalTokens] = useState(0)
-  const [showSchemaTemplates, setShowSchemaTemplates] = useState(false)
+  const [selectedTableName, setSelectedTableName] = useState<string | null>(null)
+  const [tableTreeExpanded, setTableTreeExpanded] = useState(true)
+
   const [isOnline, setIsOnline] = useState(true)
   const [isNearBottom, setIsNearBottom] = useState(true)
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
@@ -410,10 +612,8 @@ export default function SynthForgeApp() {
   const erDragRef = useRef<{ isDragging: boolean; startX: number; startY: number; startTransformX: number; startTransformY: number; target: string | null }>({ isDragging: false, startX: 0, startY: 0, startTransformX: 0, startTransformY: 0, target: null })
   const erTablePositionsRef = useRef<Record<string, { x: number; y: number }>>({})
   const chatScrollRef = useRef<HTMLDivElement>(null)
-  const chatInputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const abortControllerRef = useRef<AbortController | null>(null)
-  const inputValueRef = useRef<string>('')
   const streamingIdRef = useRef<string | null>(null)
   const { toast } = useToast()
 
@@ -432,8 +632,21 @@ export default function SynthForgeApp() {
 
   // Load workspaces on mount
   useEffect(() => {
-    loadWorkspaces()
-  }, [])
+    const init = async () => {
+      await loadWorkspaces()
+      if (initialDatabaseId) {
+        try {
+          const res = await fetch('/api/databases')
+          const data = await res.json()
+          const db = data.databases?.find((d: Database_) => d.id === initialDatabaseId)
+          if (db) {
+            openDatabase(db)
+          }
+        } catch { /* silent */ }
+      }
+    }
+    init()
+  }, [initialDatabaseId])
 
   // ─── Smart auto-scroll with requestAnimationFrame ──
   useEffect(() => {
@@ -552,11 +765,9 @@ export default function SynthForgeApp() {
 
   // ─── Core Send Message (with AbortController & SSE streaming) ──
   const sendMessage = useCallback(async (messageText: string, files: { name: string; content: string; type: string }[] = []) => {
-    if ((!messageText.trim() && files.length === 0) || isLoading || !activeDb) return
+    const msgText = messageText.trim()
+    if ((!msgText && files.length === 0) || isLoading || !activeDb) return
 
-    const msgText = messageText.trim() || 'Generate data from the attached file(s)'
-    setInput('')
-    inputValueRef.current = ''
     setIsLoading(true)
 
     // Optimistic user message with proper ID format
@@ -765,8 +976,6 @@ export default function SynthForgeApp() {
       setIsLoading(false)
       abortControllerRef.current = null
       streamingIdRef.current = null
-      // Return focus to chat input
-      chatInputRef.current?.focus()
     }
   }, [isLoading, activeDb, conversation, activeWorkspace, toast, agentMode])
 
@@ -809,14 +1018,12 @@ export default function SynthForgeApp() {
     sendMessage(originalText)
   }, [messages, sendMessage])
 
-  // ─── Chat Submit (from input) ────────────────────────────
-  const handleSubmit = useCallback(async () => {
-    const msgText = input.trim()
-    const files = [...attachedFiles]
-    if (!msgText && files.length === 0) return
+  // ─── Chat Send Message (from ChatInputBox) ────────────────
+  const handleSendMessage = useCallback(async (messageText: string, files: { name: string; content: string; type: string }[] = []) => {
+    const msgText = messageText.trim() || 'Generate data from the attached file(s)'
     setAttachedFiles([])
     await sendMessage(msgText, files)
-  }, [input, attachedFiles, sendMessage])
+  }, [sendMessage])
 
   // ─── Memoized computed values ──────────────────────────
   const getTablesFromMessages = useMemo((): Record<string, Record<string, unknown>[]> => {
@@ -856,12 +1063,6 @@ export default function SynthForgeApp() {
     toast({ title: 'Copied!', description: 'Content copied to clipboard' })
   }, [toast])
 
-  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      handleSubmit()
-    }
-  }, [handleSubmit])
 
   const handleFileUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files
@@ -878,33 +1079,6 @@ export default function SynthForgeApp() {
       reader.readAsText(file)
     })
     if (fileInputRef.current) fileInputRef.current.value = ''
-  }, [])
-
-  // ─── Drag & Drop handler ────────────────────────────
-  const handleDragOver = useCallback((e: React.DragEvent) => {
-    e.preventDefault()
-    setIsDragOver(true)
-  }, [])
-  const handleDragLeave = useCallback((e: React.DragEvent) => {
-    e.preventDefault()
-    setIsDragOver(false)
-  }, [])
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault()
-    setIsDragOver(false)
-    const files = e.dataTransfer.files
-    if (!files || files.length === 0) return
-
-    Array.from(files).forEach(file => {
-      const reader = new FileReader()
-      reader.onload = (ev) => {
-        const content = ev.target?.result as string
-        const ext = file.name.split('.').pop()?.toLowerCase() || ''
-        const type = ext === 'sql' ? 'sql' : ext === 'csv' ? 'csv' : ext === 'json' ? 'json' : ext === 'xml' ? 'xml' : 'text'
-        setAttachedFiles(prev => [...prev, { name: file.name, content, type }])
-      }
-      reader.readAsText(file)
-    })
   }, [])
 
   const removeFile = useCallback((index: number) => {
@@ -1131,14 +1305,7 @@ export default function SynthForgeApp() {
     setSqlValidationError('')
   }, [])
 
-  // ─── Schema templates ────────────────────────────────
-  const schemaTemplates: { name: string; desc: string; schema: Record<string, unknown> }[] = useMemo(() => [
-    { name: 'E-Commerce', desc: 'Users, Products, Orders', schema: { users: { columns: { id: 'SERIAL', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR', city: 'VARCHAR', state: 'VARCHAR', created_at: 'TIMESTAMP' } }, products: { columns: { id: 'SERIAL', name: 'VARCHAR', category: 'VARCHAR', price: 'DECIMAL', stock: 'INTEGER', description: 'VARCHAR' } }, orders: { columns: { id: 'SERIAL', user_id: 'INTEGER', product_id: 'INTEGER', quantity: 'INTEGER', total_amount: 'DECIMAL', status: 'VARCHAR', order_date: 'TIMESTAMP' } } } },
-    { name: 'Healthcare', desc: 'Patients, Doctors, Appointments', schema: { patients: { columns: { id: 'SERIAL', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', age: 'INTEGER', diagnosis: 'VARCHAR', admission_date: 'TIMESTAMP', status: 'VARCHAR' } }, doctors: { columns: { id: 'SERIAL', first_name: 'VARCHAR', last_name: 'VARCHAR', specialty: 'VARCHAR', email: 'VARCHAR' } }, appointments: { columns: { id: 'SERIAL', patient_id: 'INTEGER', doctor_id: 'INTEGER', date: 'TIMESTAMP', notes: 'VARCHAR', status: 'VARCHAR' } } } },
-    { name: 'Education', desc: 'Students, Courses, Enrollments', schema: { students: { columns: { id: 'SERIAL', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', age: 'INTEGER', enrollment_date: 'TIMESTAMP', status: 'VARCHAR' } }, courses: { columns: { id: 'SERIAL', name: 'VARCHAR', category: 'VARCHAR', credits: 'INTEGER', instructor: 'VARCHAR' } }, enrollments: { columns: { id: 'SERIAL', student_id: 'INTEGER', course_id: 'INTEGER', grade: 'VARCHAR', enrolled_at: 'TIMESTAMP' } } } },
-    { name: 'HR/Employee', desc: 'Employees, Departments, Salaries', schema: { employees: { columns: { id: 'SERIAL', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', department_id: 'INTEGER', hire_date: 'TIMESTAMP', status: 'VARCHAR' } }, departments: { columns: { id: 'SERIAL', name: 'VARCHAR', budget: 'DECIMAL', location: 'VARCHAR' } }, salaries: { columns: { id: 'SERIAL', employee_id: 'INTEGER', amount: 'DECIMAL', effective_date: 'TIMESTAMP' } } } },
-    { name: 'Fintech', desc: 'Accounts, Transactions, Cards', schema: { accounts: { columns: { id: 'SERIAL', holder_name: 'VARCHAR', email: 'VARCHAR', balance: 'DECIMAL', account_type: 'VARCHAR', created_at: 'TIMESTAMP' } }, transactions: { columns: { id: 'SERIAL', account_id: 'INTEGER', amount: 'DECIMAL', type: 'VARCHAR', description: 'VARCHAR', timestamp: 'TIMESTAMP' } }, cards: { columns: { id: 'SERIAL', account_id: 'INTEGER', card_type: 'VARCHAR', limit: 'DECIMAL', expiry: 'VARCHAR', status: 'VARCHAR' } } } },
-  ], [])
+
 
   // ─── Render Helper: Quality Score Badge ───────────────────
   const QualityBadge = ({ score }: { score: number }) => {
@@ -2786,102 +2953,15 @@ export default function SynthForgeApp() {
       </div>
 
       {/* Input Area */}
-      <div className="border-t bg-background p-2.5 shrink-0">
-        {/* Attached Files */}
-        {attachedFiles.length > 0 && (
-          <div className="flex flex-wrap gap-1 mb-1.5">
-            {attachedFiles.map((file, i) => (
-              <Badge key={i} variant="secondary" className="gap-1 text-[10px] py-0.5 px-1.5">
-                <Paperclip className="h-2.5 w-2.5" />
-                <span className="truncate max-w-[60px]">{file.name}</span>
-                <button onClick={() => removeFile(i)} className="hover:text-destructive transition-colors" aria-label={`Remove ${file.name}`}>
-                  <X className="h-2.5 w-2.5" />
-                </button>
-              </Badge>
-            ))}
-          </div>
-        )}
-
-        <div className="flex items-end gap-1.5">
-          <input
-            ref={fileInputRef}
-            type="file"
-            className="hidden"
-            multiple
-            accept=".sql,.csv,.json,.txt,.xml"
-            onChange={handleFileUpload}
-            aria-hidden="true"
-          />
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 w-7 shrink-0 p-0"
-                  onClick={() => fileInputRef.current?.click()}
-                  aria-label="Attach files"
-                >
-                  <Paperclip className="h-3.5 w-3.5" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Attach files (or drag & drop)</TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
-
-          <div className="flex-1 relative">
-            <Textarea
-              key={view === 'studio' ? 'studio-chat' : 'chat'}
-              ref={chatInputRef}
-              value={input}
-              onChange={(e) => {
-                setInput(e.target.value)
-                inputValueRef.current = e.target.value
-                e.stopPropagation()
-              }}
-              onKeyDown={handleKeyDown}
-              placeholder="Describe data..."
-              className="min-h-[34px] max-h-24 resize-none text-xs py-1.5 px-2.5"
-              disabled={isLoading}
-              rows={1}
-              aria-label="Chat message input"
-              onClick={(e) => e.stopPropagation()}
-              onFocus={(e) => e.stopPropagation()}
-            />
-          </div>
-
-          {/* Send / Stop button */}
-          {isLoading ? (
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    size="sm"
-                    className="h-7 w-7 p-0 bg-red-600 hover:bg-red-700 text-white shrink-0"
-                    onClick={handleAbort}
-                    aria-label="Stop generation"
-                  >
-                    <StopCircle className="h-3.5 w-3.5" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Stop generation</TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
-          ) : (
-            <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
-              <Button
-                size="sm"
-                className="h-7 w-7 p-0 bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white shrink-0"
-                onClick={handleSubmit}
-                disabled={!input.trim() && attachedFiles.length === 0}
-                aria-label="Send message"
-              >
-                <Send className="h-3.5 w-3.5" />
-              </Button>
-            </motion.div>
-          )}
-        </div>
-      </div>
+      <ChatInputBox
+        onSend={handleSendMessage}
+        isLoading={isLoading}
+        onAbort={handleAbort}
+        attachedFiles={attachedFiles}
+        onRemoveFile={removeFile}
+        onFileUpload={handleFileUpload}
+        fileInputRef={fileInputRef}
+      />
     </div>
   )
 
@@ -2901,166 +2981,226 @@ export default function SynthForgeApp() {
         </TabsList>
 
         <TabsContent value="preview" className="flex-1 overflow-auto mt-0">
-          <ScrollArea className="h-full">
-            <div className="p-4 space-y-4">
-              {isLoading && Object.keys(allTables).length === 0 ? (
-                <div className="space-y-4">
-                  {[1, 2].map(i => (
-                    <Card key={i}>
-                      <CardHeader className="pb-2">
-                        <div className="flex items-center justify-between">
-                          <Skeleton className="h-4 w-24" />
-                          <Skeleton className="h-5 w-14" />
-                        </div>
-                      </CardHeader>
-                      <CardContent>
-                        <div className="space-y-2">
-                          <div className="flex gap-4">
-                            {[1, 2, 3, 4].map(j => <Skeleton key={j} className="h-3 w-16" />)}
-                          </div>
-                          {[1, 2, 3, 4, 5].map(j => (
-                            <div key={j} className="flex gap-4">
-                              {[1, 2, 3, 4].map(k => <Skeleton key={k} className="h-3 w-20" />)}
-                            </div>
-                          ))}
-                        </div>
-                      </CardContent>
-                    </Card>
-                  ))}
-                </div>
-              ) : Object.keys(allTables).length === 0 ? (
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  className="text-center py-20"
-                >
-                  <div className="h-16 w-16 rounded-2xl bg-gradient-to-br from-amber-100 to-red-50 flex items-center justify-center mx-auto mb-4">
-                    <Table2 className="h-8 w-8 text-amber-700/50" />
-                  </div>
-                  <p className="text-sm font-medium text-muted-foreground mb-1">No data yet</p>
-                  <p className="text-xs text-muted-foreground mb-4">Chat with the AI to generate synthetic data</p>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="text-xs"
-                    onClick={() => setMobileStudioTab('chat')}
-                  >
-                    <MessageSquare className="h-3 w-3 mr-1" /> Start Chat
-                  </Button>
-                </motion.div>
-              ) : (
-                <>
-                  {/* Export bar */}
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className="text-xs text-muted-foreground">
-                      {Object.keys(allTables).length} table{Object.keys(allTables).length !== 1 ? 's' : ''} · {Object.values(allTables).reduce((s, r) => s + r.length, 0)} total rows
-                    </span>
-                    <div className="ml-auto flex items-center gap-1">
-                      {/* Quality Check Button */}
-                      <TooltipProvider>
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              className="gap-1 text-xs h-7 hover:bg-amber-50 hover:border-amber-300"
-                              onClick={() => runQualityCheck(false)}
-                              disabled={isQualityCheckRunning}
-                              aria-label="Run quality check"
-                            >
-                              {isQualityCheckRunning ? <Loader2 className="h-3 w-3 animate-spin" /> : <Bug className="h-3 w-3" />}
-                              Quality
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent>Run data quality check</TooltipContent>
-                        </Tooltip>
-                      </TooltipProvider>
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button variant="outline" size="sm" className="gap-1 text-xs h-7" aria-label="Export all data">
-                            <Download className="h-3 w-3" /> Export
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent>
-                          <DropdownMenuItem onClick={() => exportData(allTables, 'json')}>
-                            <FileJson className="h-3.5 w-3.5 mr-2" /> Export as JSON
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => exportData(allTables, 'csv')}>
-                            <FileText className="h-3.5 w-3.5 mr-2" /> Export as CSV
-                          </DropdownMenuItem>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem onClick={() => exportData(allTables, 'sql-insert')}>
-                            <Code2 className="h-3.5 w-3.5 mr-2" /> SQL INSERT statements
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => exportData(allTables, 'sql-full')}>
-                            <Database className="h-3.5 w-3.5 mr-2" /> Full SQL dump (CREATE + INSERT)
-                          </DropdownMenuItem>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem onClick={() => copyAllData(allTables, 'json')}>
-                            <Copy className="h-3.5 w-3.5 mr-2" /> Copy JSON to clipboard
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => copyAllData(allTables, 'sql')}>
-                            <ClipboardCheck className="h-3.5 w-3.5 mr-2" /> Copy SQL to clipboard
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </div>
-                  </div>
-                  {Object.entries(allTables).map(([tableName, rows]) => (
-                    <DataTable
-                      key={tableName}
-                      tableName={tableName}
-                      rows={rows}
-                      schemaObj={schemaObj}
-                      onRegenerate={regenerateTable}
-                      isLoading={isLoading}
-                      onExportTable={exportTable}
-                      onCopyTable={copyTable}
-                    />
-                  ))}
-                </>
-              )}
+          <div className="flex h-full">
+            {/* Table Tree Sidebar */}
+            <div className="w-48 shrink-0 border-r bg-muted/20 overflow-y-auto">
+              <div className="p-2">
+                <TableTreeView
+                  tableNames={Object.keys(allTables)}
+                  tableRowCounts={Object.fromEntries(Object.entries(allTables).map(([k, v]) => [k, v.length]))}
+                  selectedTable={selectedTableName}
+                  onSelectTable={setSelectedTableName}
+                />
+              </div>
             </div>
-          </ScrollArea>
+
+            {/* Selected Table Content */}
+            <div className="flex-1 overflow-auto">
+              <ScrollArea className="h-full">
+                <div className="p-4 space-y-4">
+                  {isLoading && Object.keys(allTables).length === 0 ? (
+                    <div className="space-y-4">
+                      {[1, 2].map(i => (
+                        <Card key={i}>
+                          <CardHeader className="pb-2">
+                            <div className="flex items-center justify-between">
+                              <Skeleton className="h-4 w-24" />
+                              <Skeleton className="h-5 w-14" />
+                            </div>
+                          </CardHeader>
+                          <CardContent>
+                            <div className="space-y-2">
+                              <div className="flex gap-4">
+                                {[1, 2, 3, 4].map(j => <Skeleton key={j} className="h-3 w-16" />)}
+                              </div>
+                              {[1, 2, 3, 4, 5].map(j => (
+                                <div key={j} className="flex gap-4">
+                                  {[1, 2, 3, 4].map(k => <Skeleton key={k} className="h-3 w-20" />)}
+                                </div>
+                              ))}
+                            </div>
+                          </CardContent>
+                        </Card>
+                      ))}
+                    </div>
+                  ) : selectedTableName && allTables[selectedTableName] ? (
+                    <>
+                      {/* Show selected table only */}
+                      {/* Export bar */}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="text-xs h-7"
+                          onClick={() => setSelectedTableName(null)}
+                        >
+                          <ChevronRight className="h-3 w-3 mr-1" />
+                          All Tables
+                        </Button>
+                        <span className="text-xs text-muted-foreground">
+                          {selectedTableName} · {allTables[selectedTableName].length} rows
+                        </span>
+                        <div className="ml-auto flex items-center gap-1">
+                          <TooltipProvider>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="gap-1 text-xs h-7 hover:bg-amber-50 hover:border-amber-300"
+                                  onClick={() => runQualityCheck(false)}
+                                  disabled={isQualityCheckRunning}
+                                  aria-label="Run quality check"
+                                >
+                                  {isQualityCheckRunning ? <Loader2 className="h-3 w-3 animate-spin" /> : <Bug className="h-3 w-3" />}
+                                  Quality
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>Run data quality check</TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button variant="outline" size="sm" className="gap-1 text-xs h-7" aria-label="Export all data">
+                                <Download className="h-3 w-3" /> Export
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent>
+                              <DropdownMenuItem onClick={() => exportData(allTables, 'json')}>
+                                <FileJson className="h-3.5 w-3.5 mr-2" /> Export as JSON
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => exportData(allTables, 'csv')}>
+                                <FileText className="h-3.5 w-3.5 mr-2" /> Export as CSV
+                              </DropdownMenuItem>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem onClick={() => exportData(allTables, 'sql-insert')}>
+                                <Code2 className="h-3.5 w-3.5 mr-2" /> SQL INSERT statements
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => exportData(allTables, 'sql-full')}>
+                                <Database className="h-3.5 w-3.5 mr-2" /> Full SQL dump (CREATE + INSERT)
+                              </DropdownMenuItem>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem onClick={() => copyAllData(allTables, 'json')}>
+                                <Copy className="h-3.5 w-3.5 mr-2" /> Copy JSON to clipboard
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => copyAllData(allTables, 'sql')}>
+                                <ClipboardCheck className="h-3.5 w-3.5 mr-2" /> Copy SQL to clipboard
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </div>
+                      </div>
+                      <DataTable
+                        key={selectedTableName}
+                        tableName={selectedTableName}
+                        allRows={allTables[selectedTableName]}
+                        schemaObj={schemaObj}
+                        onRegenerate={regenerateTable}
+                        isLoading={isLoading}
+                        onExportTable={exportTable}
+                        onCopyTable={copyTable}
+                      />
+                    </>
+                  ) : !selectedTableName && Object.keys(allTables).length > 0 ? (
+                    <>
+                      {/* Show all tables when nothing selected */}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-xs text-muted-foreground">
+                          {Object.keys(allTables).length} table{Object.keys(allTables).length !== 1 ? 's' : ''} · {Object.values(allTables).reduce((s, r) => s + r.length, 0)} total rows
+                        </span>
+                        <div className="ml-auto flex items-center gap-1">
+                          <TooltipProvider>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="gap-1 text-xs h-7 hover:bg-amber-50 hover:border-amber-300"
+                                  onClick={() => runQualityCheck(false)}
+                                  disabled={isQualityCheckRunning}
+                                  aria-label="Run quality check"
+                                >
+                                  {isQualityCheckRunning ? <Loader2 className="h-3 w-3 animate-spin" /> : <Bug className="h-3 w-3" />}
+                                  Quality
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>Run data quality check</TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button variant="outline" size="sm" className="gap-1 text-xs h-7" aria-label="Export all data">
+                                <Download className="h-3 w-3" /> Export
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent>
+                              <DropdownMenuItem onClick={() => exportData(allTables, 'json')}>
+                                <FileJson className="h-3.5 w-3.5 mr-2" /> Export as JSON
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => exportData(allTables, 'csv')}>
+                                <FileText className="h-3.5 w-3.5 mr-2" /> Export as CSV
+                              </DropdownMenuItem>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem onClick={() => exportData(allTables, 'sql-insert')}>
+                                <Code2 className="h-3.5 w-3.5 mr-2" /> SQL INSERT statements
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => exportData(allTables, 'sql-full')}>
+                                <Database className="h-3.5 w-3.5 mr-2" /> Full SQL dump (CREATE + INSERT)
+                              </DropdownMenuItem>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem onClick={() => copyAllData(allTables, 'json')}>
+                                <Copy className="h-3.5 w-3.5 mr-2" /> Copy JSON to clipboard
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => copyAllData(allTables, 'sql')}>
+                                <ClipboardCheck className="h-3.5 w-3.5 mr-2" /> Copy SQL to clipboard
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </div>
+                      </div>
+                      {Object.entries(allTables).map(([tableName, rows]) => (
+                        <DataTable
+                          key={tableName}
+                          tableName={tableName}
+                          allRows={rows}
+                          schemaObj={schemaObj}
+                          onRegenerate={regenerateTable}
+                          isLoading={isLoading}
+                          onExportTable={exportTable}
+                          onCopyTable={copyTable}
+                        />
+                      ))}
+                    </>
+                  ) : (
+                    <motion.div
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      className="text-center py-20"
+                    >
+                      <div className="h-16 w-16 rounded-2xl bg-gradient-to-br from-amber-100 to-red-50 flex items-center justify-center mx-auto mb-4">
+                        <Table2 className="h-8 w-8 text-amber-700/50" />
+                      </div>
+                      <p className="text-sm font-medium text-muted-foreground mb-1">No data yet</p>
+                      <p className="text-xs text-muted-foreground mb-4">Chat with the AI to generate synthetic data</p>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="text-xs"
+                        onClick={() => setMobileStudioTab('chat')}
+                      >
+                        <MessageSquare className="h-3 w-3 mr-1" /> Start Chat
+                      </Button>
+                    </motion.div>
+                  )}
+                </div>
+              </ScrollArea>
+            </div>
+          </div>
         </TabsContent>
 
         <TabsContent value="schema" className="flex-1 overflow-auto mt-0">
           <ScrollArea className="h-full">
             <div className="p-4 space-y-4">
-              <div className="mb-4">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="text-xs gap-1"
-                  onClick={() => setShowSchemaTemplates(!showSchemaTemplates)}
-                >
-                  <Layers className="h-3 w-3" /> Schema Templates
-                  <ChevronDown className={`h-3 w-3 transition-transform ${showSchemaTemplates ? 'rotate-180' : ''}`} />
-                </Button>
-                {showSchemaTemplates && (
-                  <motion.div
-                    initial={{ opacity: 0, height: 0 }}
-                    animate={{ opacity: 1, height: 'auto' }}
-                    className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-3"
-                  >
-                    {schemaTemplates.map((tmpl) => (
-                      <Card
-                        key={tmpl.name}
-                        className="cursor-pointer hover:shadow-md hover:border-amber-300 transition-all"
-                        onClick={() => {
-                          setNewDbSchema(JSON.stringify(tmpl.schema))
-                          sendMessage(`Generate data for a ${tmpl.name.toLowerCase()} system with these tables: ${Object.keys(tmpl.schema).join(', ')}`)
-                        }}
-                      >
-                        <CardContent className="p-3">
-                          <h4 className="text-xs font-semibold">{tmpl.name}</h4>
-                          <p className="text-[10px] text-muted-foreground">{tmpl.desc}</p>
-                        </CardContent>
-                      </Card>
-                    ))}
-                  </motion.div>
-                )}
-              </div>
 
               {Object.keys(schemaObj).length === 0 ? (
                 <motion.div
@@ -3640,25 +3780,7 @@ export default function SynthForgeApp() {
                         className="font-mono text-xs min-h-[80px]"
                       />
                     </div>
-                    <div className="space-y-2">
-                      <label className="text-sm font-medium">Or choose a template:</label>
-                      <div className="grid grid-cols-3 gap-2">
-                        {schemaTemplates.map(tmpl => (
-                          <Button
-                            key={tmpl.name}
-                            variant="outline"
-                            size="sm"
-                            className="h-auto py-2 text-[11px]"
-                            onClick={() => {
-                              setNewDbSchema(JSON.stringify(tmpl.schema))
-                              setNewDbName(tmpl.name + ' DB')
-                            }}
-                          >
-                            {tmpl.name}
-                          </Button>
-                        ))}
-                      </div>
-                    </div>
+
                     <Button onClick={createDatabase} className="w-full bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white">
                       Create Database
                     </Button>
@@ -3708,7 +3830,7 @@ export default function SynthForgeApp() {
                   { icon: <MessageSquare className="h-5 w-5 text-amber-700" />, title: 'Chat to Generate', desc: 'Describe data in natural language', action: () => allDatabases[0] ? openDatabase(allDatabases[0]) : setShowNewDbDialog(true) },
                   { icon: <Upload className="h-5 w-5 text-amber-700" />, title: 'Upload Schema', desc: 'Import SQL, CSV, or JSON', action: () => setShowNewDbDialog(true) },
                   { icon: <Wand2 className="h-5 w-5 text-amber-700" />, title: 'Auto Mode', desc: 'Plan & generate in one step', action: () => { setAgentMode('auto'); if (allDatabases[0]) openDatabase(allDatabases[0]) } },
-                  { icon: <Layers className="h-5 w-5 text-amber-700" />, title: 'Use Template', desc: 'Start from a domain template', action: () => setShowNewDbDialog(true) }
+                  { icon: <FolderTree className="h-5 w-5 text-amber-700" />, title: 'Use Template', desc: 'Start from a domain template', action: () => setShowNewDbDialog(true) }
                 ].map((action, i) => (
                   <motion.div key={i} variants={staggerItem} whileHover={{ y: -2, transition: { duration: 0.15 } }}>
                     <Card className="cursor-pointer hover:shadow-md transition-all group" onClick={action.action}>

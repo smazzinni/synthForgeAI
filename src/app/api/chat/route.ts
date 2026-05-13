@@ -136,7 +136,13 @@ export async function POST(request: NextRequest) {
 
       const transformStream = new TransformStream<Uint8Array, Uint8Array>({
         async transform(chunk, controller) {
-          controller.enqueue(chunk)
+          const safeEnqueue = (data: Uint8Array) => {
+            if (controller.desiredSize !== null) {
+              controller.enqueue(data)
+            }
+          }
+
+          safeEnqueue(chunk)
 
           // Parse SSE data to accumulate full content
           const text = new TextDecoder().decode(chunk)
@@ -163,7 +169,7 @@ export async function POST(request: NextRequest) {
 
                     // Emit initial step plan
                     for (let i = 0; i < agentSteps.length; i++) {
-                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                      safeEnqueue(encoder.encode(`data: ${JSON.stringify({
                         type: 'agent_step',
                         data: { stepIndex: i, agent: agentSteps[i].agent, task: agentSteps[i].task, status: 'pending' }
                       })}\n\n`))
@@ -174,7 +180,7 @@ export async function POST(request: NextRequest) {
                       const step = agentSteps[i]
 
                       // Mark step as running
-                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                      safeEnqueue(encoder.encode(`data: ${JSON.stringify({
                         type: 'agent_step',
                         data: { stepIndex: i, agent: step.agent, task: step.task, status: 'running' }
                       })}\n\n`))
@@ -199,7 +205,7 @@ export async function POST(request: NextRequest) {
                         }
 
                         // Mark step as completed
-                        controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                        safeEnqueue(encoder.encode(`data: ${JSON.stringify({
                           type: 'agent_step',
                           data: {
                             stepIndex: i, agent: step.agent, task: step.task,
@@ -213,7 +219,7 @@ export async function POST(request: NextRequest) {
                         tokensOut += stepResponse.tokensOut
                       } catch (stepErr) {
                         const stepErrMsg = stepErr instanceof Error ? stepErr.message : 'Step failed'
-                        controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                        safeEnqueue(encoder.encode(`data: ${JSON.stringify({
                           type: 'agent_step',
                           data: { stepIndex: i, agent: step.agent, task: step.task, status: 'failed', output: stepErrMsg }
                         })}\n\n`))
@@ -233,7 +239,7 @@ export async function POST(request: NextRequest) {
                       fullContent = finalContent
 
                       // Emit the final combined content as a content event
-                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                      safeEnqueue(encoder.encode(`data: ${JSON.stringify({
                         type: 'content',
                         data: finalContent
                       })}\n\n`))
@@ -432,7 +438,6 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const isFallback = response.model === 'synthforge-local-fallback'
     const schemaVersion = database?.schemaVersions?.[0]
       ? (await db.schemaVersion.count({ where: { databaseId: database.id } }))
       : 0
@@ -450,7 +455,6 @@ export async function POST(request: NextRequest) {
         options,
         reasoningSteps,
         tablesJson,
-        isFallback,
         piiCheck: piiResult ? { hasPII: piiResult.hasPII, findings: piiResult.findings } : null,
         qualityScore: qualityScore ? { overall: qualityScore.overall, breakdown: qualityScore.breakdown } : null,
         schemaVersion

@@ -262,8 +262,7 @@ export async function chatCompletion(request: ChatRequest): Promise<ChatResponse
 
     const content = completion.choices[0]?.message?.content || ''
     if (!content) {
-      console.warn('[SynthForge AI] Empty response from AI, falling back to local generation')
-      return generateLocalFallback(request.messages)
+      throw new Error('AI returned an empty response. Please try again.')
     }
 
     return {
@@ -274,272 +273,11 @@ export async function chatCompletion(request: ChatRequest): Promise<ChatResponse
     }
   } catch (error) {
     console.error('[SynthForge AI] chatCompletion error:', error instanceof Error ? error.message : error)
-    // Fall back to local data generation
-    return generateLocalFallback(request.messages)
+    throw error
   }
 }
 
-// ─── Local Fallback Data Generation ────────────────────────
-
-interface LocalTableDef {
-  name: string
-  columns: Record<string, string>
-  rowCount: number
-}
-
-function detectTablesFromMessage(userMessage: string): LocalTableDef[] {
-  const msg = userMessage.toLowerCase()
-  const tables: LocalTableDef[] = []
-
-  // ─── Domain: E-commerce / Retail ─────────────────────
-  if (msg.includes('e-commerce') || msg.includes('ecommerce') || msg.includes('retail') || msg.includes('shop') || msg.includes('store')) {
-    tables.push({
-      name: 'users',
-      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR', city: 'VARCHAR', state: 'VARCHAR', age: 'INTEGER', status: 'VARCHAR', created_at: 'TIMESTAMP' },
-      rowCount: 15
-    })
-    tables.push({
-      name: 'products',
-      columns: { id: 'INTEGER', name: 'VARCHAR', category: 'VARCHAR', price: 'DECIMAL', stock: 'INTEGER', description: 'VARCHAR', status: 'VARCHAR' },
-      rowCount: 12
-    })
-    tables.push({
-      name: 'orders',
-      columns: { id: 'INTEGER', user_id: 'INTEGER', product_id: 'INTEGER', quantity: 'INTEGER', total_amount: 'DECIMAL', status: 'VARCHAR', order_date: 'TIMESTAMP' },
-      rowCount: 20
-    })
-  }
-  // ─── Domain: Healthcare ────────────────────────────
-  else if (msg.includes('hospital') || msg.includes('patient') || msg.includes('doctor') || msg.includes('medical') || msg.includes('healthcare') || msg.includes('clinic')) {
-    tables.push({
-      name: 'patients',
-      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR', age: 'INTEGER', gender: 'VARCHAR', diagnosis: 'VARCHAR', admission_date: 'TIMESTAMP', status: 'VARCHAR' },
-      rowCount: 12
-    })
-    tables.push({
-      name: 'doctors',
-      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', specialty: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR', department: 'VARCHAR' },
-      rowCount: 8
-    })
-    tables.push({
-      name: 'appointments',
-      columns: { id: 'INTEGER', patient_id: 'INTEGER', doctor_id: 'INTEGER', appointment_date: 'TIMESTAMP', notes: 'VARCHAR', status: 'VARCHAR' },
-      rowCount: 20
-    })
-  }
-  // ─── Domain: Education ─────────────────────────────
-  else if (msg.includes('student') || msg.includes('course') || msg.includes('enrollment') || msg.includes('grade') || msg.includes('school') || msg.includes('university') || msg.includes('education')) {
-    tables.push({
-      name: 'students',
-      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', age: 'INTEGER', major: 'VARCHAR', enrollment_date: 'TIMESTAMP', status: 'VARCHAR' },
-      rowCount: 15
-    })
-    tables.push({
-      name: 'courses',
-      columns: { id: 'INTEGER', name: 'VARCHAR', category: 'VARCHAR', credits: 'INTEGER', instructor: 'VARCHAR', capacity: 'INTEGER' },
-      rowCount: 10
-    })
-    tables.push({
-      name: 'enrollments',
-      columns: { id: 'INTEGER', student_id: 'INTEGER', course_id: 'INTEGER', grade: 'VARCHAR', enrolled_at: 'TIMESTAMP' },
-      rowCount: 25
-    })
-  }
-  // ─── Domain: HR / Employee ──────────────────────────
-  else if (msg.includes('employee') || msg.includes('hr') || msg.includes('department') || msg.includes('salary') || msg.includes('payroll') || msg.includes('staff')) {
-    tables.push({
-      name: 'employees',
-      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', department_id: 'INTEGER', position: 'VARCHAR', hire_date: 'TIMESTAMP', status: 'VARCHAR' },
-      rowCount: 20
-    })
-    tables.push({
-      name: 'departments',
-      columns: { id: 'INTEGER', name: 'VARCHAR', budget: 'DECIMAL', location: 'VARCHAR', head_count: 'INTEGER' },
-      rowCount: 6
-    })
-    tables.push({
-      name: 'salaries',
-      columns: { id: 'INTEGER', employee_id: 'INTEGER', amount: 'DECIMAL', currency: 'VARCHAR', effective_date: 'TIMESTAMP' },
-      rowCount: 20
-    })
-  }
-  // ─── Domain: Fintech / Banking ─────────────────────
-  else if (msg.includes('fintech') || msg.includes('bank') || msg.includes('account') || msg.includes('transaction') || msg.includes('finance') || msg.includes('payment') || msg.includes('credit')) {
-    tables.push({
-      name: 'accounts',
-      columns: { id: 'INTEGER', holder_name: 'VARCHAR', email: 'VARCHAR', balance: 'DECIMAL', account_type: 'VARCHAR', status: 'VARCHAR', created_at: 'TIMESTAMP' },
-      rowCount: 15
-    })
-    tables.push({
-      name: 'transactions',
-      columns: { id: 'INTEGER', account_id: 'INTEGER', amount: 'DECIMAL', type: 'VARCHAR', description: 'VARCHAR', timestamp: 'TIMESTAMP' },
-      rowCount: 30
-    })
-    tables.push({
-      name: 'cards',
-      columns: { id: 'INTEGER', account_id: 'INTEGER', card_type: 'VARCHAR', credit_limit: 'DECIMAL', expiry: 'VARCHAR', status: 'VARCHAR' },
-      rowCount: 15
-    })
-  }
-  // ─── Domain: Real Estate ───────────────────────────
-  else if (msg.includes('real estate') || msg.includes('property') || msg.includes('listing') || msg.includes('rental') || msg.includes('housing')) {
-    tables.push({
-      name: 'properties',
-      columns: { id: 'INTEGER', address: 'VARCHAR', city: 'VARCHAR', state: 'VARCHAR', price: 'DECIMAL', bedrooms: 'INTEGER', bathrooms: 'INTEGER', sqft: 'INTEGER', status: 'VARCHAR' },
-      rowCount: 15
-    })
-    tables.push({
-      name: 'agents',
-      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR', speciality: 'VARCHAR' },
-      rowCount: 8
-    })
-  }
-  // ─── Domain: SaaS ──────────────────────────────────
-  else if (msg.includes('saas') || msg.includes('subscription') || msg.includes('plan') || msg.includes('invoice')) {
-    tables.push({
-      name: 'users',
-      columns: { id: 'INTEGER', name: 'VARCHAR', email: 'VARCHAR', plan: 'VARCHAR', status: 'VARCHAR', created_at: 'TIMESTAMP' },
-      rowCount: 20
-    })
-    tables.push({
-      name: 'subscriptions',
-      columns: { id: 'INTEGER', user_id: 'INTEGER', plan_name: 'VARCHAR', price: 'DECIMAL', billing_cycle: 'VARCHAR', status: 'VARCHAR', started_at: 'TIMESTAMP' },
-      rowCount: 20
-    })
-  }
-  // ─── Generic: Users ────────────────────────────────
-  else if (msg.includes('user') || msg.includes('customer') || msg.includes('people') || msg.includes('person')) {
-    tables.push({
-      name: 'users',
-      columns: { id: 'INTEGER', first_name: 'VARCHAR', last_name: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR', city: 'VARCHAR', state: 'VARCHAR', age: 'INTEGER', status: 'VARCHAR', created_at: 'TIMESTAMP' },
-      rowCount: 10
-    })
-  }
-  // ─── Generic: Products ──────────────────────────────
-  else if (msg.includes('product') || msg.includes('item') || msg.includes('catalog') || msg.includes('inventory')) {
-    tables.push({
-      name: 'products',
-      columns: { id: 'INTEGER', name: 'VARCHAR', category: 'VARCHAR', price: 'DECIMAL', quantity: 'INTEGER', description: 'VARCHAR', status: 'VARCHAR' },
-      rowCount: 10
-    })
-  }
-  // ─── Generic: Orders ────────────────────────────────
-  else if (msg.includes('order') || msg.includes('purchase')) {
-    tables.push({
-      name: 'orders',
-      columns: { id: 'INTEGER', user_id: 'INTEGER', product_id: 'INTEGER', quantity: 'INTEGER', total_amount: 'DECIMAL', status: 'VARCHAR', order_date: 'TIMESTAMP' },
-      rowCount: 15
-    })
-  }
-
-  // If no specific domain detected, generate a generic table
-  if (tables.length === 0) {
-    tables.push({
-      name: 'records',
-      columns: { id: 'INTEGER', name: 'VARCHAR', email: 'VARCHAR', phone: 'VARCHAR', city: 'VARCHAR', status: 'VARCHAR', created_at: 'TIMESTAMP' },
-      rowCount: 10
-    })
-  }
-
-  // Adjust row count based on user's request
-  const countMatch = msg.match(/(\d+)\s*(row|record|entry|item|user|product|order|patient|student|employee)/i)
-  if (countMatch) {
-    const requestedCount = Math.min(parseInt(countMatch[1]), 100)
-    tables.forEach(t => t.rowCount = requestedCount)
-  }
-
-  return tables
-}
-
-function generateLocalFallback(messages: ChatMessage[]): ChatResponse {
-  console.log('[SynthForge AI] Generating local fallback data')
-
-  // Find the last user message
-  const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')
-  const userMessage = lastUserMsg?.content || 'Generate sample data'
-
-  const tables = detectTablesFromMessage(userMessage)
-  const generatedTables: Record<string, Record<string, unknown>[]> = {}
-  const sqlStatements: string[] = []
-
-  for (const table of tables) {
-    const rows: Record<string, unknown>[] = []
-    for (let i = 0; i < table.rowCount; i++) {
-      const row: Record<string, unknown> = {}
-      for (const [colName, colType] of Object.entries(table.columns)) {
-        row[colName] = generateFakeValue(colType, colName)
-      }
-      // Ensure id is sequential
-      if ('id' in table.columns) row.id = i + 1
-      // Ensure foreign keys reference valid ids
-      if (col_endsWith_id(row)) {
-        // handled below
-      }
-      rows.push(row)
-    }
-    generatedTables[table.name] = rows
-
-    // Generate CREATE TABLE SQL
-    const colDefs = Object.entries(table.columns).map(([name, type]) => `${name} ${type}`).join(', ')
-    sqlStatements.push(`CREATE TABLE ${table.name} (${colDefs});`)
-
-    // Generate INSERT SQL
-    const cols = Object.keys(table.columns)
-    for (const row of rows) {
-      const values = cols.map(c => {
-        const v = row[c]
-        return typeof v === 'string' ? `'${String(v).replace(/'/g, "''")}'` : String(v ?? 'NULL')
-      })
-      sqlStatements.push(`INSERT INTO ${table.name} (${cols.join(', ')}) VALUES (${values.join(', ')});`)
-    }
-  }
-
-  // Fix foreign key references
-  const tableNames = Object.keys(generatedTables)
-  for (const tableName of tableNames) {
-    const rows = generatedTables[tableName]
-    for (const row of rows) {
-      for (const key of Object.keys(row)) {
-        if (key.endsWith('_id') && key !== 'id') {
-          const refTableName = key.replace(/_id$/, '') + 's'
-          const refTable = generatedTables[refTableName]
-          if (refTable && refTable.length > 0) {
-            row[key] = (refTable[Math.floor(Math.random() * refTable.length)] as Record<string, unknown>).id
-          }
-        }
-      }
-    }
-  }
-
-  const explanation = `I've generated synthetic data for ${tables.length} table${tables.length > 1 ? 's' : ''}: ${tables.map(t => `${t.name} (${t.rowCount} rows)`).join(', ')}. This data was generated locally as a fallback. All data is privacy-safe and synthetic.`
-
-  const responseContent = JSON.stringify({
-    action: 'generate',
-    agentName: 'auto-agent',
-    explanation,
-    tables: generatedTables,
-    sqlCode: sqlStatements.join('\n'),
-    reasoningSteps: [
-      { type: 'intent', label: 'Intent Analysis', description: 'Analyzing user request', status: 'completed', output: 'Data generation request (local fallback)' },
-      { type: 'domain_detection', label: 'Domain Detection', description: 'Identifying business domain', status: 'completed', output: `Detected: ${tables.map(t => t.name).join(', ')}` },
-      { type: 'data_strategy', label: 'Data Strategy', description: 'Planning data generation', status: 'completed', output: `Generating ${tables.map(t => `${t.rowCount} ${t.name}`).join(', ')}` },
-      { type: 'validation', label: 'Validation', description: 'Checking referential integrity', status: 'completed', output: 'All foreign keys validated' }
-    ],
-    options: [],
-    followUpQuestions: ['Would you like to add more tables or adjust the data?']
-  })
-
-  return {
-    content: responseContent,
-    tokensIn: 0,
-    tokensOut: 0,
-    model: 'synthforge-local-fallback'
-  }
-}
-
-function col_endsWith_id(row: Record<string, unknown>): boolean {
-  return Object.keys(row).some(k => k.endsWith('_id') && k !== 'id')
-}
+// ─── Local Fallback removed — all generation goes through AI ───
 
 // ─── Multi-Agent Orchestration ──────────────────────────────────
 
@@ -757,12 +495,18 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
 
   return new ReadableStream<Uint8Array>({
     async start(controller) {
+      const safeEnqueue = (data: Uint8Array) => {
+        if (controller.desiredSize !== null) {
+          controller.enqueue(data)
+        }
+      }
+
       try {
         const zai = await getZAI()
 
         // Emit reasoning step updates
         const emitReasoning = (step: ReasoningStep) => {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'reasoning', data: step })}\n\n`))
+          safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'reasoning', data: step })}\n\n`))
         }
 
         emitReasoning({ type: 'intent', label: 'Intent Analysis', description: 'Analyzing user request', status: 'running' })
@@ -791,27 +535,22 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
         if (content) {
           const chunkSize = 20
           for (let i = 0; i < content.length; i += chunkSize) {
+            if (controller.desiredSize === null) return
             const chunk = content.slice(i, i + chunkSize)
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'content', data: chunk })}\n\n`))
+            safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'content', data: chunk })}\n\n`))
             // Small delay to simulate streaming
             await new Promise(r => setTimeout(r, 10))
           }
         } else {
-          // Fallback to local generation
-          const fallback = generateLocalFallback(request.messages)
-          const fallbackChunks = fallback.content
-          const chunkSize = 20
-          for (let i = 0; i < fallbackChunks.length; i += chunkSize) {
-            const chunk = fallbackChunks.slice(i, i + chunkSize)
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'content', data: chunk })}\n\n`))
-            await new Promise(r => setTimeout(r, 10))
-          }
+          safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', data: 'AI returned an empty response. Please try again.' })}\n\n`))
+          try { controller.close() } catch { /* already closed */ }
+          return
         }
 
         emitReasoning({ type: 'data_strategy', label: 'Data Strategy', description: 'Planning generation', status: 'completed', output: 'Data generated' })
         emitReasoning({ type: 'validation', label: 'Validation', description: 'Checking integrity', status: 'completed', output: 'All checks passed' })
 
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+        safeEnqueue(encoder.encode(`data: ${JSON.stringify({
           type: 'done',
           data: {
             tokensIn: completion.usage?.prompt_tokens || 0,
@@ -820,32 +559,13 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
           }
         })}\n\n`))
 
-        controller.close()
+        try { controller.close() } catch { /* already closed */ }
       } catch (error) {
         console.error('[SynthForge AI] chatCompletionStream error:', error instanceof Error ? error.message : error)
-
-        // Try local fallback for streaming
         try {
-          // Check if controller is still open before writing
-          if (!controller.desiredSize === null) return // already closed
-          const fallback = generateLocalFallback(request.messages)
-          const chunkSize = 20
-          for (let i = 0; i < fallback.content.length; i += chunkSize) {
-            const chunk = fallback.content.slice(i, i + chunkSize)
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'content', data: chunk })}\n\n`))
-            await new Promise(r => setTimeout(r, 10))
-          }
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done', data: { tokensIn: 0, tokensOut: 0, model: 'synthforge-local-fallback' } })}\n\n`))
-          controller.close()
-        } catch (innerError) {
-          // Controller might already be closed - silently handle
-          try {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', data: error instanceof Error ? error.message : 'Stream failed' })}\n\n`))
-            controller.close()
-          } catch {
-            // Controller already closed, nothing to do
-          }
-        }
+          safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', data: error instanceof Error ? error.message : 'AI service unavailable. Please try again.' })}\n\n`))
+        } catch { /* controller already closed */ }
+        try { controller.close() } catch { /* already closed */ }
       }
     }
   })
