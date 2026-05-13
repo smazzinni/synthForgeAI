@@ -218,7 +218,7 @@ const DataWorkspacePanel = React.memo(function DataWorkspacePanel({
                 <p className="text-xs text-muted-foreground mb-4">Ask the AI to design a database schema</p>
                 <Button variant="outline" size="sm" className="text-xs" onClick={() => setMobileStudioTab('chat')}><MessageSquare className="h-3 w-3 mr-1" /> Start Chat</Button>
               </motion.div>
-            ) : Object.entries(schemaObj).map(([tableName, def]) => <SchemaCard key={tableName} tableName={tableName} columns={(def as { columns: Record<string, string> }).columns} />)}
+            ) : Object.entries(schemaObj).map(([tableName, def]) => <SchemaCard key={tableName} tableName={tableName} columns={(def as { columns: Record<string, string> }).columns} relationships={(def as any).relationships} rowCount={allTables[tableName]?.length} indexes={(def as any).indexes} constraints={(def as any).constraints} />)}
           </div>
         </ScrollArea>
       </TabsContent>

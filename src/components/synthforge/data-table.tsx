@@ -127,6 +127,7 @@ export const DataTable = React.memo(function DataTable({
       <CardContent>
         {pageRows.length > 0 ? (
           <ScrollArea className="max-h-80">
+            <div className="overflow-x-auto">
             <table className="w-full text-xs" role="table">
               <thead>
                 <tr className="border-b bg-muted/30 sticky top-0">
@@ -164,6 +165,7 @@ export const DataTable = React.memo(function DataTable({
                 ))}
               </tbody>
             </table>
+            </div>
             {totalPages > 1 && (
               <div className="flex items-center justify-between mt-3 pt-2 border-t">
                 <p className="text-xs text-muted-foreground">Page {page + 1} of {totalPages}</p>

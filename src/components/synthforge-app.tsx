@@ -208,7 +208,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
 
   // ─── Core Send Message (with SSE streaming for real-time agent reasoning) ───
   const sendMessage = useCallback(async (messageText: string, files: { name: string; content: string; type: string }[] = []) => {
-    const msgText = messageText.trim()
+    const msgText = String(messageText ?? '').trim()
     if ((!msgText && files.length === 0) || isLoading || !activeDb) return
 
     setIsLoading(true)

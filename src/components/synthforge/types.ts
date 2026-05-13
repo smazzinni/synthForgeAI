@@ -82,6 +82,16 @@ interface ClarificationOption {
   label: string
   value: string
   description?: string
+  multiSelect?: boolean  // whether this group allows multiple selections
+  questionId?: string    // groups options by question
+}
+
+interface ClarificationQuestion {
+  id: string
+  question: string
+  options: ClarificationOption[]
+  multiSelect: boolean
+  required: boolean
 }
 
 interface AgentStepUI {
@@ -176,6 +186,7 @@ export type {
   Conversation,
   ReasoningStep,
   ClarificationOption,
+  ClarificationQuestion,
   AgentStepUI,
   QualityReportData,
   View,
