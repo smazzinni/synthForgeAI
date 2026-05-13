@@ -270,7 +270,7 @@ const DataTable = React.memo(function DataTable({
                     variant="ghost"
                     size="sm"
                     className="h-6 w-6 p-0 hover:bg-amber-50"
-                    onClick={() => onCopyTable(tableName, rows)}
+                    onClick={() => onCopyTable(tableName, allRows)}
                     aria-label={`Copy ${tableName} data`}
                   >
                     <Copy className="h-3 w-3 text-muted-foreground" />
@@ -286,17 +286,17 @@ const DataTable = React.memo(function DataTable({
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent>
-                <DropdownMenuItem onClick={() => onExportTable(tableName, rows, 'json')}>
+                <DropdownMenuItem onClick={() => onExportTable(tableName, allRows, 'json')}>
                   <FileJson className="h-3.5 w-3.5 mr-2" /> Export as JSON
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => onExportTable(tableName, rows, 'csv')}>
+                <DropdownMenuItem onClick={() => onExportTable(tableName, allRows, 'csv')}>
                   <FileText className="h-3.5 w-3.5 mr-2" /> Export as CSV
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={() => onExportTable(tableName, rows, 'sql-insert')}>
+                <DropdownMenuItem onClick={() => onExportTable(tableName, allRows, 'sql-insert')}>
                   <Code2 className="h-3.5 w-3.5 mr-2" /> SQL INSERT
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => onExportTable(tableName, rows, 'sql-full')}>
+                <DropdownMenuItem onClick={() => onExportTable(tableName, allRows, 'sql-full')}>
                   <Database className="h-3.5 w-3.5 mr-2" /> Full SQL dump
                 </DropdownMenuItem>
               </DropdownMenuContent>
@@ -558,6 +558,58 @@ const ChatInputBox = React.memo(function ChatInputBox({
   )
 })
 
+// ─── React.memo QualityBadge ────────────────────────────
+const QualityBadge = React.memo(function QualityBadge({ score }: { score: number }) {
+  const color = score >= 80 ? 'bg-green-100 text-green-800 border-green-200' : score >= 60 ? 'bg-yellow-100 text-yellow-800 border-yellow-200' : 'bg-red-100 text-red-800 border-red-200'
+  const icon = score >= 80 ? <Gauge className="h-3 w-3" /> : score >= 60 ? <Gauge className="h-3 w-3" /> : <AlertCircle className="h-3 w-3" />
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Badge className={`text-[10px] ${color} gap-1 cursor-help`}>
+            {icon} {score}/100
+          </Badge>
+        </TooltipTrigger>
+        <TooltipContent>Data Quality Score</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  )
+})
+
+// ─── React.memo PIIShieldBadge ──────────────────────────
+const PIIShieldBadge = React.memo(function PIIShieldBadge({ piiCheck }: { piiCheck: PIICheck | null }) {
+  if (!piiCheck) return null
+  const hasNoPII = !piiCheck.hasPII
+  const color = hasNoPII ? 'bg-emerald-100 text-emerald-800 border-emerald-200' : 'bg-red-100 text-red-800 border-red-200'
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Badge className={`text-[10px] ${color} gap-1 cursor-help`}>
+            <Shield className="h-3 w-3" /> {hasNoPII ? 'PII Safe' : 'PII Found'}
+          </Badge>
+        </TooltipTrigger>
+        <TooltipContent>
+          {hasNoPII ? 'No personally identifiable information detected' : `${piiCheck.findings.length} PII finding(s) detected`}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  )
+})
+
+// ─── React.memo AgentBadge ──────────────────────────────
+const AgentBadge = React.memo(function AgentBadge({ name }: { name: string }) {
+  const isPlan = name.includes('plan')
+  const isExec = name.includes('exec')
+  const color = isPlan ? 'bg-sky-100 text-sky-800 border-sky-200' : isExec ? 'bg-emerald-100 text-emerald-800 border-emerald-200' : 'bg-amber-100 text-amber-800 border-amber-200'
+  const icon = isPlan ? <Brain className="h-3 w-3" /> : isExec ? <Play className="h-3 w-3" /> : <Wand2 className="h-3 w-3" />
+  return (
+    <Badge className={`text-xs ${color} gap-1`}>
+      {icon} {name}
+    </Badge>
+  )
+})
+
 // ─── Main App ──────────────────────────────────────────
 export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId?: string }) {
   const [view, setView] = useState<View>('landing')
@@ -814,6 +866,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
     setMessages(prev => [...prev, streamMsg])
 
     try {
+      // Use non-streaming mode for reliability (streaming can cause server crashes)
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -822,7 +875,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
           databaseId: activeDb.id,
           workspaceId: activeWorkspace?.id,
           message: msgText,
-          stream: true,
+          stream: false,
           agentMode,
           files: files.map(f => ({ name: f.name, content: f.content, type: f.type }))
         }),
@@ -830,122 +883,47 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
       })
 
       if (!res.ok) {
-        const errData = await res.json().catch(() => ({ error: 'Request failed' }))
-        throw new Error(errData.error || 'Chat request failed')
-      }
-
-      if (!conversation) {
-        const convId = res.headers.get('X-Conversation-Id')
-        if (convId) {
-          setConversation({ id: convId, title: msgText.slice(0, 60), messages: [] })
+        let errMsg = 'Chat request failed'
+        try {
+          const errData = await res.json()
+          errMsg = errData.error || errData.hint || errMsg
+        } catch {
+          errMsg = `Request failed (${res.status})`
         }
+        throw new Error(errMsg)
       }
 
-      // ─── SSE Streaming ─────────────────────────────
-      const reader = res.body?.getReader()
-      if (!reader) throw new Error('No response stream')
+      const data = await res.json()
 
-      const decoder = new TextDecoder()
-      let fullContent = ''
-      let buffer = ''
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || ''
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const event = JSON.parse(line.slice(6))
-              if (event.type === 'content') {
-                fullContent += event.data
-                setMessages(prev => prev.map(m =>
-                  m.id === streamId
-                    ? { ...m, content: fullContent, generationStatus: 'generating' as const }
-                    : m
-                ))
-              } else if (event.type === 'done') {
-                const tokensIn = event.data?.tokensIn || 0
-                const tokensOut = event.data?.tokensOut || 0
-
-                // Parse the full content for tables, sql, etc.
-                let parsedTables = '{}'
-                let sqlCode = ''
-                let agentName = agentMode + '-agent'
-                let reasoningSteps = '[]'
-                let options = '[]'
-                let qualityScore: QualityScore | null = null
-                let piiCheck: PIICheck | null = null
-
-                try {
-                  const jsonMatch = fullContent.match(/\{[\s\S]*\}/)
-                  if (jsonMatch) {
-                    const parsed = JSON.parse(jsonMatch[0])
-                    if (parsed.tables) parsedTables = JSON.stringify(parsed.tables)
-                    if (parsed.sqlCode) sqlCode = parsed.sqlCode
-                    if (parsed.agentName) agentName = parsed.agentName
-                    if (parsed.reasoningSteps) reasoningSteps = JSON.stringify(parsed.reasoningSteps)
-                    if (parsed.options) options = JSON.stringify(parsed.options)
-                  }
-                } catch { /* use defaults */ }
-
-                setMessages(prev => prev.map(m =>
-                  m.id === streamId
-                    ? {
-                        ...m,
-                        isStreaming: false,
-                        generationStatus: 'completed' as const,
-                        tokensIn,
-                        tokensOut,
-                        cost: (tokensIn / 1_000_000) * 0.27 + (tokensOut / 1_000_000) * 1.10,
-                        tablesJson: parsedTables,
-                        sqlCode,
-                        agentName,
-                        reasoningSteps,
-                        options,
-                        qualityScore,
-                        piiCheck
-                      }
-                    : m
-                ))
-              } else if (event.type === 'error') {
-                throw new Error(event.data || 'Stream error')
-              } else if (event.type === 'agent_step') {
-                // Handle multi-agent pipeline step updates
-                const stepData = event.data as { stepIndex: number; agent: string; task: string; status: string; output?: string; tables?: string[] }
-                setAgentSteps(prev => {
-                  const updated = [...prev]
-                  while (updated.length <= stepData.stepIndex) {
-                    updated.push({ agent: '', task: '', status: 'pending' })
-                  }
-                  updated[stepData.stepIndex] = {
-                    agent: stepData.agent,
-                    task: stepData.task,
-                    status: stepData.status as AgentStepUI['status'],
-                    output: stepData.output,
-                    tables: stepData.tables
-                  }
-                  return updated
-                })
-              }
-            } catch (parseErr) {
-              // Non-JSON line, skip
-              if (parseErr instanceof Error && parseErr.message !== 'Stream error' && !parseErr.message.includes('JSON')) {
-                // Only re-throw actual stream errors
-              }
-            }
-          }
-        }
+      // Update conversation ID if new
+      if (!conversation && data.conversationId) {
+        setConversation({ id: data.conversationId, title: msgText.slice(0, 60), messages: [] })
       }
 
-      // If streaming ended without a 'done' event, mark as complete
-      setMessages(prev => prev.map(m =>
-        m.id === streamId ? { ...m, isStreaming: false, generationStatus: 'completed' as const } : m
-      ))
+      // Parse the response
+      const msg = data.message
+      if (msg) {
+        setMessages(prev => prev.map(m =>
+          m.id === streamId
+            ? {
+                ...m,
+                isStreaming: false,
+                generationStatus: 'completed' as const,
+                content: msg.content,
+                tokensIn: msg.tokensIn || 0,
+                tokensOut: msg.tokensOut || 0,
+                cost: msg.cost || 0,
+                tablesJson: msg.tablesJson || '{}',
+                sqlCode: msg.sqlCode || '',
+                agentName: msg.agentName || agentMode + '-agent',
+                reasoningSteps: typeof msg.reasoningSteps === 'string' ? msg.reasoningSteps : JSON.stringify(msg.reasoningSteps || []),
+                options: typeof msg.options === 'string' ? msg.options : JSON.stringify(msg.options || []),
+                qualityScore: msg.qualityScore || null,
+                piiCheck: msg.piiCheck || null
+              }
+            : m
+        ))
+      }
 
       await refreshDatabase(activeDb.id)
     } catch (error) {
@@ -1307,63 +1285,11 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
 
 
 
-  // ─── Render Helper: Quality Score Badge ───────────────────
-  const QualityBadge = ({ score }: { score: number }) => {
-    const color = score >= 80 ? 'bg-green-100 text-green-800 border-green-200' : score >= 60 ? 'bg-yellow-100 text-yellow-800 border-yellow-200' : 'bg-red-100 text-red-800 border-red-200'
-    const icon = score >= 80 ? <Gauge className="h-3 w-3" /> : score >= 60 ? <Gauge className="h-3 w-3" /> : <AlertCircle className="h-3 w-3" />
-    return (
-      <TooltipProvider>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Badge className={`text-[10px] ${color} gap-1 cursor-help`}>
-              {icon} {score}/100
-            </Badge>
-          </TooltipTrigger>
-          <TooltipContent>Data Quality Score</TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
-    )
-  }
-
-  // ─── Render Helper: PII Shield Badge ────────────────────
-  const PIIShieldBadge = ({ piiCheck }: { piiCheck: PIICheck | null }) => {
-    if (!piiCheck) return null
-    const hasNoPII = !piiCheck.hasPII
-    const color = hasNoPII ? 'bg-emerald-100 text-emerald-800 border-emerald-200' : 'bg-red-100 text-red-800 border-red-200'
-    return (
-      <TooltipProvider>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Badge className={`text-[10px] ${color} gap-1 cursor-help`}>
-              <Shield className="h-3 w-3" /> {hasNoPII ? 'PII Safe' : 'PII Found'}
-            </Badge>
-          </TooltipTrigger>
-          <TooltipContent>
-            {hasNoPII ? 'No personally identifiable information detected' : `${piiCheck.findings.length} PII finding(s) detected`}
-          </TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
-    )
-  }
-
   // ─── Regenerate table data ────────────────────────────────
   const regenerateTable = useCallback(async (tableName: string) => {
     if (!activeDb || !conversation) return
     await sendMessage(`Regenerate data for the ${tableName} table with different values`)
   }, [activeDb, conversation, sendMessage])
-
-  // ─── Render Helper: Agent Badge ────────────────────────
-  const AgentBadge = ({ name }: { name: string }) => {
-    const isPlan = name.includes('plan')
-    const isExec = name.includes('exec')
-    const color = isPlan ? 'bg-sky-100 text-sky-800 border-sky-200' : isExec ? 'bg-emerald-100 text-emerald-800 border-emerald-200' : 'bg-amber-100 text-amber-800 border-amber-200'
-    const icon = isPlan ? <Brain className="h-3 w-3" /> : isExec ? <Play className="h-3 w-3" /> : <Wand2 className="h-3 w-3" />
-    return (
-      <Badge className={`text-xs ${color} gap-1`}>
-        {icon} {name}
-      </Badge>
-    )
-  }
 
   // ─── Render Helper: Reasoning Steps ───────────────────
   const ReasoningTimeline = ({ steps, msgId }: { steps: ReasoningStep[]; msgId: string }) => {
@@ -2878,10 +2804,10 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
                 className="grid grid-cols-1 gap-1.5 w-full"
               >
                 {[
-                  { icon: <Hash className="h-3 w-3" />, text: 'Generate users' },
-                  { icon: <Table2 className="h-3 w-3" />, text: 'E-commerce orders' },
-                  { icon: <Database className="h-3 w-3" />, text: 'Hospital DB schema' },
-                  { icon: <Code2 className="h-3 w-3" />, text: 'Student enrollment' }
+                  { icon: <Hash className="h-3 w-3" />, text: 'Generate sample data' },
+                  { icon: <Table2 className="h-3 w-3" />, text: 'Create a data schema' },
+                  { icon: <Database className="h-3 w-3" />, text: 'Build relational tables' },
+                  { icon: <Code2 className="h-3 w-3" />, text: 'Design a database' }
                 ].map((suggestion, i) => (
                   <motion.button
                     key={i}
@@ -3496,14 +3422,14 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
                     </CardHeader>
                     <CardContent className="space-y-3">
                       <div className="bg-muted rounded-lg p-3 text-sm">
-                        <span className="text-amber-700 font-medium">You:</span> Generate e-commerce data with users, orders, and products
+                        <span className="text-amber-700 font-medium">You:</span> Generate realistic sample data for my project
                       </div>
                       <div className="bg-primary/5 rounded-lg p-3 text-sm space-y-2">
                         <div className="flex items-center gap-2">
                           <span className="text-primary font-medium">SynthForge:</span>
                           <Badge className="text-[10px] bg-amber-100 text-amber-800 border-amber-200"><Wand2 className="h-2.5 w-2.5 mr-0.5" /> auto-agent</Badge>
                         </div>
-                        <p className="text-muted-foreground">I&apos;ll create a realistic e-commerce dataset with users, their orders, and a product catalog.</p>
+                        <p className="text-muted-foreground">I&apos;ll design a schema and generate realistic synthetic data based on your requirements.</p>
                         <div className="bg-white rounded border p-2 font-mono text-xs overflow-hidden">
                           <p className="text-green-700">-- 3 tables generated</p>
                           <p className="text-muted-foreground">users (50 rows) | orders (127 rows) | products (30 rows)</p>
@@ -3766,7 +3692,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
                         id="new-db-name"
                         value={newDbName}
                         onChange={(e) => setNewDbName(e.target.value)}
-                        placeholder="e.g., E-Commerce Store"
+                        placeholder="e.g., My Database"
                         onKeyDown={(e) => e.key === 'Enter' && createDatabase()}
                       />
                     </div>
@@ -3824,13 +3750,12 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
                 variants={staggerContainer}
                 initial="initial"
                 animate="animate"
-                className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 mb-8"
+                className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4 mb-8"
               >
                 {[
                   { icon: <MessageSquare className="h-5 w-5 text-amber-700" />, title: 'Chat to Generate', desc: 'Describe data in natural language', action: () => allDatabases[0] ? openDatabase(allDatabases[0]) : setShowNewDbDialog(true) },
                   { icon: <Upload className="h-5 w-5 text-amber-700" />, title: 'Upload Schema', desc: 'Import SQL, CSV, or JSON', action: () => setShowNewDbDialog(true) },
-                  { icon: <Wand2 className="h-5 w-5 text-amber-700" />, title: 'Auto Mode', desc: 'Plan & generate in one step', action: () => { setAgentMode('auto'); if (allDatabases[0]) openDatabase(allDatabases[0]) } },
-                  { icon: <FolderTree className="h-5 w-5 text-amber-700" />, title: 'Use Template', desc: 'Start from a domain template', action: () => setShowNewDbDialog(true) }
+                  { icon: <Wand2 className="h-5 w-5 text-amber-700" />, title: 'Auto Mode', desc: 'Plan & generate in one step', action: () => { setAgentMode('auto'); if (allDatabases[0]) openDatabase(allDatabases[0]) } }
                 ].map((action, i) => (
                   <motion.div key={i} variants={staggerItem} whileHover={{ y: -2, transition: { duration: 0.15 } }}>
                     <Card className="cursor-pointer hover:shadow-md transition-all group" onClick={action.action}>

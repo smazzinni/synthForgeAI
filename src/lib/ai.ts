@@ -248,15 +248,15 @@ export async function chatCompletion(request: ChatRequest): Promise<ChatResponse
   try {
     const zai = await getZAI()
 
-    // Add timeout wrapper (120s max)
+    // Add timeout wrapper (90s max for non-streaming to avoid server hangs)
     const completion = await Promise.race([
       zai.chat.completions.create({
         messages: request.messages,
         temperature: request.temperature ?? 0.7,
-        max_tokens: request.maxTokens ?? 8192
+        max_tokens: request.maxTokens ?? 4096
       }),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('AI request timed out after 120s')), 120_000)
+        setTimeout(() => reject(new Error('AI request timed out. Please try again.')), 90_000)
       )
     ])
 
@@ -272,7 +272,8 @@ export async function chatCompletion(request: ChatRequest): Promise<ChatResponse
       model: 'synthforge-v1'
     }
   } catch (error) {
-    console.error('[SynthForge AI] chatCompletion error:', error instanceof Error ? error.message : error)
+    const msg = error instanceof Error ? error.message : 'AI service unavailable'
+    console.error('[SynthForge AI] chatCompletion error:', msg)
     throw error
   }
 }
@@ -492,24 +493,41 @@ export interface StreamEvent {
 
 export async function chatCompletionStream(request: ChatRequest): Promise<ReadableStream<Uint8Array>> {
   const encoder = new TextEncoder()
+  let controllerClosed = false
 
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       const safeEnqueue = (data: Uint8Array) => {
-        if (controller.desiredSize !== null) {
-          controller.enqueue(data)
+        if (controllerClosed) return false
+        try {
+          if (controller.desiredSize !== null) {
+            controller.enqueue(data)
+            return true
+          }
+        } catch {
+          controllerClosed = true
         }
+        return false
+      }
+
+      const safeClose = () => {
+        if (controllerClosed) return
+        controllerClosed = true
+        try { controller.close() } catch { /* already closed */ }
       }
 
       try {
         const zai = await getZAI()
 
         // Emit reasoning step updates
-        const emitReasoning = (step: ReasoningStep) => {
-          safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'reasoning', data: step })}\n\n`))
+        const emitReasoning = (step: ReasoningStep): boolean => {
+          return safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'reasoning', data: step })}\n\n`))
         }
 
-        emitReasoning({ type: 'intent', label: 'Intent Analysis', description: 'Analyzing user request', status: 'running' })
+        if (!emitReasoning({ type: 'intent', label: 'Intent Analysis', description: 'Analyzing user request', status: 'running' })) {
+          safeClose()
+          return
+        }
 
         // Use the regular completion with a simulated stream
         // The z-ai-web-dev-sdk doesn't natively support streaming, so we simulate it
@@ -517,38 +535,44 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
           zai.chat.completions.create({
             messages: request.messages,
             temperature: request.temperature ?? 0.7,
-            max_tokens: request.maxTokens ?? 8192
+            max_tokens: request.maxTokens ?? 4096
           }),
           new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('AI stream request timed out after 120s')), 120_000)
+            setTimeout(() => reject(new Error('AI request timed out. Please try again.')), 90_000)
           )
         ])
 
         const content = completion.choices[0]?.message?.content || ''
 
-        emitReasoning({ type: 'intent', label: 'Intent Analysis', description: 'Analyzing user request', status: 'completed', output: 'Request understood' })
-        emitReasoning({ type: 'domain_detection', label: 'Domain Detection', description: 'Identifying business domain', status: 'running' })
-        emitReasoning({ type: 'domain_detection', label: 'Domain Detection', description: 'Identifying business domain', status: 'completed', output: 'Processing data request' })
-        emitReasoning({ type: 'data_strategy', label: 'Data Strategy', description: 'Planning generation', status: 'running' })
+        if (!emitReasoning({ type: 'intent', label: 'Intent Analysis', description: 'Analyzing user request', status: 'completed', output: 'Request understood' })) { safeClose(); return }
+        if (!emitReasoning({ type: 'domain_detection', label: 'Domain Detection', description: 'Identifying business domain', status: 'running' })) { safeClose(); return }
+        if (!emitReasoning({ type: 'domain_detection', label: 'Domain Detection', description: 'Identifying business domain', status: 'completed', output: 'Processing data request' })) { safeClose(); return }
+        if (!emitReasoning({ type: 'data_strategy', label: 'Data Strategy', description: 'Planning generation', status: 'running' })) { safeClose(); return }
 
         // Simulate streaming by chunking the response
         if (content) {
-          const chunkSize = 20
+          const chunkSize = 40
           for (let i = 0; i < content.length; i += chunkSize) {
-            if (controller.desiredSize === null) return
+            if (controllerClosed || controller.desiredSize === null) {
+              safeClose()
+              return
+            }
             const chunk = content.slice(i, i + chunkSize)
-            safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'content', data: chunk })}\n\n`))
-            // Small delay to simulate streaming
-            await new Promise(r => setTimeout(r, 10))
+            if (!safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'content', data: chunk })}\n\n`))) {
+              safeClose()
+              return
+            }
+            // Small delay to simulate streaming (reduced for performance)
+            await new Promise(r => setTimeout(r, 5))
           }
         } else {
           safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', data: 'AI returned an empty response. Please try again.' })}\n\n`))
-          try { controller.close() } catch { /* already closed */ }
+          safeClose()
           return
         }
 
-        emitReasoning({ type: 'data_strategy', label: 'Data Strategy', description: 'Planning generation', status: 'completed', output: 'Data generated' })
-        emitReasoning({ type: 'validation', label: 'Validation', description: 'Checking integrity', status: 'completed', output: 'All checks passed' })
+        if (!emitReasoning({ type: 'data_strategy', label: 'Data Strategy', description: 'Planning generation', status: 'completed', output: 'Data generated' })) { safeClose(); return }
+        if (!emitReasoning({ type: 'validation', label: 'Validation', description: 'Checking integrity', status: 'completed', output: 'All checks passed' })) { safeClose(); return }
 
         safeEnqueue(encoder.encode(`data: ${JSON.stringify({
           type: 'done',
@@ -559,13 +583,15 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
           }
         })}\n\n`))
 
-        try { controller.close() } catch { /* already closed */ }
+        safeClose()
       } catch (error) {
         console.error('[SynthForge AI] chatCompletionStream error:', error instanceof Error ? error.message : error)
-        try {
-          safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', data: error instanceof Error ? error.message : 'AI service unavailable. Please try again.' })}\n\n`))
-        } catch { /* controller already closed */ }
-        try { controller.close() } catch { /* already closed */ }
+        if (!controllerClosed) {
+          try {
+            safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', data: error instanceof Error ? error.message : 'AI service unavailable. Please try again.' })}\n\n`))
+          } catch { /* controller already closed */ }
+        }
+        safeClose()
       }
     }
   })

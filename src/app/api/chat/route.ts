@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { chatCompletion, chatCompletionStream, estimateCost, parseAgentResponse, getSystemPrompt, detectPII, scoreDataQuality, inferSchemaFromData, type AgentStep } from '@/lib/ai'
 
-export const maxDuration = 120
+export const maxDuration = 90
 
 // ─── Specialized subagent system prompts ────────────────────────
 const SCHEMA_AGENT_PROMPT = `You are the SynthForge AI Schema Agent. Design a database schema based on the user's request. Return a JSON object with the schema plan including tables, columns, types, and relationships. Use the standard SynthForge AI response format with action "generate".`
@@ -134,11 +134,17 @@ export async function POST(request: NextRequest) {
       let tokensOut = 0
       let multiStepHandled = false
 
+      let streamClosed = false
       const transformStream = new TransformStream<Uint8Array, Uint8Array>({
         async transform(chunk, controller) {
           const safeEnqueue = (data: Uint8Array) => {
-            if (controller.desiredSize !== null) {
-              controller.enqueue(data)
+            if (streamClosed) return
+            try {
+              if (controller.desiredSize !== null) {
+                controller.enqueue(data)
+              }
+            } catch {
+              streamClosed = true
             }
           }
 
@@ -158,91 +164,95 @@ export async function POST(request: NextRequest) {
                   tokensOut = event.data?.tokensOut || 0
 
                   // Check for multi_step action
-                  const parsed = parseAgentResponse(fullContent)
+                  if (!streamClosed) {
+                    const parsed = parseAgentResponse(fullContent)
 
-                  if (parsed?.action === 'multi_step' && parsed.steps && parsed.steps.length > 0) {
-                    // ─── Multi-Step Agent Execution ──────────────────
-                    multiStepHandled = true
-                    const agentSteps: AgentStep[] = parsed.steps
-                    let accumulatedContext = fullContent
-                    let allTables: Record<string, Record<string, unknown>[]> = {}
+                    if (parsed?.action === 'multi_step' && parsed.steps && parsed.steps.length > 0) {
+                      // ─── Multi-Step Agent Execution ──────────────────
+                      multiStepHandled = true
+                      const agentSteps: AgentStep[] = parsed.steps
+                      let accumulatedContext = fullContent
+                      let allTables: Record<string, Record<string, unknown>[]> = {}
 
-                    // Emit initial step plan
-                    for (let i = 0; i < agentSteps.length; i++) {
-                      safeEnqueue(encoder.encode(`data: ${JSON.stringify({
-                        type: 'agent_step',
-                        data: { stepIndex: i, agent: agentSteps[i].agent, task: agentSteps[i].task, status: 'pending' }
-                      })}\n\n`))
-                    }
-
-                    // Execute each step sequentially
-                    for (let i = 0; i < agentSteps.length; i++) {
-                      const step = agentSteps[i]
-
-                      // Mark step as running
-                      safeEnqueue(encoder.encode(`data: ${JSON.stringify({
-                        type: 'agent_step',
-                        data: { stepIndex: i, agent: step.agent, task: step.task, status: 'running' }
-                      })}\n\n`))
-
-                      try {
-                        const subagentPrompt = getSubagentPrompt(step.agent)
-                        const stepResponse = await chatCompletion({
-                          messages: [
-                            { role: 'system', content: subagentPrompt },
-                            { role: 'user', content: `Task: ${step.task}\n\nPrevious context:\n${accumulatedContext.slice(-3000)}` }
-                          ],
-                          temperature: 0.7,
-                          maxTokens: 8192
-                        })
-
-                        const stepParsed = parseAgentResponse(stepResponse.content)
-                        const stepOutput = stepParsed?.explanation || stepResponse.content.slice(0, 200)
-
-                        // Accumulate tables from this step
-                        if (stepParsed?.tables) {
-                          allTables = { ...allTables, ...stepParsed.tables }
-                        }
-
-                        // Mark step as completed
+                      // Emit initial step plan
+                      for (let i = 0; i < agentSteps.length; i++) {
+                        if (streamClosed) break
                         safeEnqueue(encoder.encode(`data: ${JSON.stringify({
                           type: 'agent_step',
-                          data: {
-                            stepIndex: i, agent: step.agent, task: step.task,
-                            status: 'completed', output: stepOutput,
-                            tables: stepParsed?.tables ? Object.keys(stepParsed.tables) : []
-                          }
-                        })}\n\n`))
-
-                        accumulatedContext += `\n\nStep ${i + 1} (${step.agent}) output: ${stepOutput}`
-                        tokensIn += stepResponse.tokensIn
-                        tokensOut += stepResponse.tokensOut
-                      } catch (stepErr) {
-                        const stepErrMsg = stepErr instanceof Error ? stepErr.message : 'Step failed'
-                        safeEnqueue(encoder.encode(`data: ${JSON.stringify({
-                          type: 'agent_step',
-                          data: { stepIndex: i, agent: step.agent, task: step.task, status: 'failed', output: stepErrMsg }
+                          data: { stepIndex: i, agent: agentSteps[i].agent, task: agentSteps[i].task, status: 'pending' }
                         })}\n\n`))
                       }
-                    }
 
-                    // If any tables were generated across all steps, emit them as content
-                    if (Object.keys(allTables).length > 0) {
-                      const finalContent = JSON.stringify({
-                        action: 'generate',
-                        agentName: 'orchestrator',
-                        explanation: parsed.explanation + '\n\nAll pipeline steps completed successfully.',
-                        tables: allTables,
-                        steps: agentSteps.map((s, idx) => ({ ...s, status: 'completed' })),
-                        reasoningSteps: parsed.reasoningSteps || []
-                      })
-                      fullContent = finalContent
+                      // Execute each step sequentially
+                      for (let i = 0; i < agentSteps.length; i++) {
+                        if (streamClosed) break
+                        const step = agentSteps[i]
 
-                      // Emit the final combined content as a content event
-                      safeEnqueue(encoder.encode(`data: ${JSON.stringify({
-                        type: 'content',
-                        data: finalContent
-                      })}\n\n`))
+                        // Mark step as running
+                        safeEnqueue(encoder.encode(`data: ${JSON.stringify({
+                          type: 'agent_step',
+                          data: { stepIndex: i, agent: step.agent, task: step.task, status: 'running' }
+                        })}\n\n`))
+
+                        try {
+                          const subagentPrompt = getSubagentPrompt(step.agent)
+                          const stepResponse = await chatCompletion({
+                            messages: [
+                              { role: 'system', content: subagentPrompt },
+                              { role: 'user', content: `Task: ${step.task}\n\nPrevious context:\n${accumulatedContext.slice(-3000)}` }
+                            ],
+                            temperature: 0.7,
+                            maxTokens: 4096
+                          })
+
+                          const stepParsed = parseAgentResponse(stepResponse.content)
+                          const stepOutput = stepParsed?.explanation || stepResponse.content.slice(0, 200)
+
+                          // Accumulate tables from this step
+                          if (stepParsed?.tables) {
+                            allTables = { ...allTables, ...stepParsed.tables }
+                          }
+
+                          // Mark step as completed
+                          safeEnqueue(encoder.encode(`data: ${JSON.stringify({
+                            type: 'agent_step',
+                            data: {
+                              stepIndex: i, agent: step.agent, task: step.task,
+                              status: 'completed', output: stepOutput,
+                              tables: stepParsed?.tables ? Object.keys(stepParsed.tables) : []
+                            }
+                          })}\n\n`))
+
+                          accumulatedContext += `\n\nStep ${i + 1} (${step.agent}) output: ${stepOutput}`
+                          tokensIn += stepResponse.tokensIn
+                          tokensOut += stepResponse.tokensOut
+                        } catch (stepErr) {
+                          const stepErrMsg = stepErr instanceof Error ? stepErr.message : 'Step failed'
+                          safeEnqueue(encoder.encode(`data: ${JSON.stringify({
+                            type: 'agent_step',
+                            data: { stepIndex: i, agent: step.agent, task: step.task, status: 'failed', output: stepErrMsg }
+                          })}\n\n`))
+                        }
+                      }
+
+                      // If any tables were generated across all steps, emit them as content
+                      if (Object.keys(allTables).length > 0 && !streamClosed) {
+                        const finalContent = JSON.stringify({
+                          action: 'generate',
+                          agentName: 'orchestrator',
+                          explanation: parsed.explanation + '\n\nAll pipeline steps completed successfully.',
+                          tables: allTables,
+                          steps: agentSteps.map((s, idx) => ({ ...s, status: 'completed' })),
+                          reasoningSteps: parsed.reasoningSteps || []
+                        })
+                        fullContent = finalContent
+
+                        // Emit the final combined content as a content event
+                        safeEnqueue(encoder.encode(`data: ${JSON.stringify({
+                          type: 'content',
+                          data: finalContent
+                        })}\n\n`))
+                      }
                     }
                   }
 
@@ -266,8 +276,9 @@ export async function POST(request: NextRequest) {
                     } catch { /* non-fatal */ }
                   }
 
-                  // Save assistant message (fire and forget, don't block stream)
-                  ;(async () => {
+                  // Save assistant message and update database in background (non-blocking)
+                  // Use fire-and-forget with proper .catch() to prevent unhandled rejections
+                  const savePromise = (async () => {
                     try {
                       await db.message.create({
                         data: {
@@ -332,6 +343,8 @@ export async function POST(request: NextRequest) {
                       console.error('[Chat API Stream] Error saving message:', err)
                     }
                   })()
+                  // Prevent unhandled rejection
+                  savePromise.catch(() => {})
                 }
               } catch { /* not valid JSON, skip */ }
             }
@@ -355,7 +368,7 @@ export async function POST(request: NextRequest) {
     const response = await chatCompletion({
       messages: [{ role: 'system', content: systemPrompt }, ...chatMessages],
       temperature: 0.7,
-      maxTokens: 8192
+      maxTokens: 4096
     })
 
     const cost = estimateCost(response.tokensIn, response.tokensOut)
