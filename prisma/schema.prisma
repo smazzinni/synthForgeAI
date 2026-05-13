@@ -136,3 +136,20 @@ model ApiKey {
   createdAt   DateTime @default(now())
   workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
 }
+
+model AgentRegistryEntry {
+  id              String   @id @default(cuid())
+  agentId         String   @unique // discovery-agent | schema-agent | data-agent | etc.
+  name            String
+  role            String
+  phase           Int      @default(1) // 1=Discovery, 2=Schema, 3=Generation
+  status          String   @default("available") // available | busy | offline | error
+  skills          String   @default("[]") // JSON array of skill IDs
+  maxConcurrency  Int      @default(2)
+  tasksCompleted  Int      @default(0)
+  tasksFailed     Int      @default(0)
+  avgExecTimeMs   Int      @default(0)
+  lastHeartbeat   DateTime @default(now())
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}

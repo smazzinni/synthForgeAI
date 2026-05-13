@@ -148,3 +148,30 @@ Stage Summary:
 - SQL playground state isolated in StudioView component
 - Build passes cleanly with no errors
 - Application ready for end-to-end testing
+
+---
+Task ID: 8
+Agent: Main
+Task: Implement Autonomous Agent Communication, Skills Registry, Message Bus, and Heartbeat Monitoring
+
+Work Log:
+- Created /src/lib/agent-registry.ts: Skills Registry with 18 predefined skills across 7 categories (discovery, schema, generation, validation, quality, pii, orchestration), AgentDescriptor interface with health/status tracking, AgentRegistry singleton with task assignment/routing/query methods
+- Created /src/lib/agent-bus.ts: Inter-Agent Message Bus with publish/subscribe pattern, direct messaging, shared state store with compare-and-swap, pipeline state helpers, message history with filtering
+- Created /src/lib/agent-heartbeat.ts: Heartbeat Monitor inspired by Kubernetes liveness probes and Erlang supervisors, configurable timeouts, stale agent detection, background auto-checking, status change events
+- Created /src/lib/agent-orchestrator.ts: Central coordinator that ties Registry + Bus + Heartbeat together, pipeline planning based on agent mode, sequential step execution with retry logic, agent availability checks before routing, shared state coordination via bus
+- Created /src/app/api/agents/route.ts: REST API for agent status (GET), skills registry (GET ?view=skills), heartbeat (GET ?view=heartbeat), message bus (GET ?view=bus), system diagnostics (GET ?view=system), and actions (POST: heartbeat, route, reset, ping)
+- Updated prisma/schema.prisma: Added AgentRegistryEntry model for persistent agent state
+- Created /src/components/synthforge/agent-status-panel.tsx: Frontend component with 3 tabs (Agents, Skills, System), real-time status polling every 15s, agent cards with expandable details (workload, stats, skills, heartbeat), skills grid by category with tooltips, system health overview with performance charts
+- Added "Agents" tab to StudioView's DataWorkspacePanel tabs
+- All code compiles cleanly with `npx next build`
+- HeartbeatMonitor auto-starts with 15s interval, 60s offline timeout
+
+Stage Summary:
+- Full Autonomous Agent Communication system implemented
+- Skills Registry: 6 agents (discovery, schema, data, validation, quality, orchestrator) with 18 skills
+- Message Bus: Pub/Sub + direct messaging + shared state + pipeline coordination
+- Heartbeat Monitor: Auto-starts, detects stale agents, emits status change events
+- Orchestrator: Plans pipelines, routes tasks to best agent, handles failures with retry
+- API: /api/agents endpoint with GET (status/skills/heartbeat/bus/system) and POST (actions)
+- Frontend: Agent Status Panel in Studio View "Agents" tab showing real-time agent network
+- Prisma: AgentRegistryEntry model added for persistent agent tracking
