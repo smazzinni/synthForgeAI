@@ -60,3 +60,91 @@ Stage Summary:
 - AgentPipeline shows schema-agent (purple), data-agent (blue), quality-agent (green) with color coding
 - ReasoningTimeline shows intent analysis, domain detection, entity extraction, etc. with icons
 - All components properly display during both streaming and completed states
+
+---
+Task ID: 3
+Agent: full-stack-developer
+Task: Rewrite AI agent system prompts and orchestration for TDM Agent Architecture
+
+Work Log:
+- Rewrote PLAN_AGENT_SYSTEM prompt to implement Phase 1: Intelligent Discovery with interactive interview protocol (Volume, Modules, Constraints) and multi-choice options
+- Rewrote EXEC_AGENT_SYSTEM prompt to implement Phase 2+3: Technical Schema Mapping + Output Generation with preview-first approach and Few-Shot Good vs Bad schema examples
+- Rewrote AUTO_MODE_SYSTEM prompt with comprehensive 3-phase TDM architecture: Phase 1 Discovery → Phase 2 Schema Mapping → Phase 3 Preview-First Generation
+- Added DISCOVERY_AGENT_PROMPT for multi-step pipeline - specializes in Phase 1 discovery interviews with strict protocol
+- Added VALIDATION_AGENT_PROMPT for multi-step pipeline - validates Phase 2 constraints (referential integrity, business logic, constraint compliance, data realism, schema completeness)
+- Updated getSubagentPrompt function to route discovery-agent and validation-agent to their new prompts
+- Added 'preview' and 'discovery' action types to AgentResponse interface
+- Added previewTables field to AgentResponse for preview data (3-5 sample rows per table)
+- Updated parseAgentResponse to extract previewTables from AI responses
+- Kept domain detection hints (Healthcare, E-commerce, ITSM/ServiceNow, CRM/Salesforce, etc.) as module suggestions only - NO hardcoded schema templates
+- Added ITSM/ServiceNow and CRM/Salesforce domain hints for enterprise platform coverage
+- Added Few-Shot examples in AUTO_MODE_SYSTEM and EXEC_AGENT_SYSTEM showing Good vs Bad schema design
+- Enforced "NEVER generate mock data if the AI API is unavailable" rule across all prompts
+- Multi-step pipeline now includes 5 agents: discovery-agent → schema-agent → data-agent → validation-agent → quality-agent
+- Build passes successfully with `npx next build`
+- Lint passes cleanly with `bun run lint`
+
+Stage Summary:
+- AI system completely restructured as a Test Data Management (TDM) Agent with strict 3-phase pipeline
+- Phase 1 (Discovery): Interactive interview with multi-choice options for Volume, Modules, Constraints
+- Phase 2 (Schema Mapping): Relational integrity, business logic validation, data realism planning
+- Phase 3 (Preview-First Generation): 3-5 row preview → user approval → full dataset generation
+- Two new subagent prompts added: DISCOVERY_AGENT_PROMPT and VALIDATION_AGENT_PROMPT
+- New action types: 'discovery' (Phase 1 gathering) and 'preview' (Phase 3 preview)
+- previewTables field enables showing sample rows before full generation
+- Few-Shot examples demonstrate Good vs Bad schema patterns inline
+- Domain hints kept as suggestions only, no hardcoded CREATE TABLE templates
+- All prompts enforce: Never mention LLM provider, never generate mock data if API unavailable
+
+---
+Task ID: 6
+Agent: full-stack-developer
+Task: Extract Studio View from synthforge-app.tsx into separate component file
+
+Work Log:
+- Created /src/components/synthforge/studio-view.tsx (586 lines) containing the full Studio View
+- Extracted DataWorkspacePanel as a proper React.memo component (not inline) to satisfy react-hooks/static-components lint rule
+- Moved SQL playground state (sqlQuery, sqlResult, sqlSuggestion, showSqlSuggestion, sqlValidationError) into StudioView since it's only used there
+- Moved runSqlPlayground and validateSql functions into StudioView
+- Defined StudioViewProps interface with all required props (50+ props)
+- Wrapped StudioView with React.memo for performance
+- Added key={activeDb.id} on StudioView usage in parent to reset SQL state when switching databases
+- Removed SQL playground state declarations from synthforge-app.tsx
+- Removed runSqlPlayground and validateSql functions from synthforge-app.tsx
+- Removed setSqlQuery('') and setSqlResult('') from openDatabase (now handled by key prop remounting)
+- Replaced the entire Studio View block (lines 1047-1263) with a single <StudioView> component call
+- Main file reduced from ~1291 to 1116 lines
+- Build passes successfully with `npx next build`
+- Lint passes cleanly with `bun run lint`
+
+Stage Summary:
+- Studio View fully extracted into /src/components/synthforge/studio-view.tsx
+- DataWorkspacePanel extracted as proper React.memo component (fixes react-hooks/static-components lint error)
+- SQL playground state now internal to StudioView (no longer pollutes parent component)
+- Main file: ~1291 → 1116 lines (~14% reduction from this extraction)
+- All functionality preserved - Studio View works exactly as before
+- Build and lint both pass cleanly
+
+---
+Task ID: 7
+Agent: Main
+Task: Add React.memo to remaining components and finalize all fixes
+
+Work Log:
+- Added React.memo to ChatPanel component (most important - renders messages list)
+- Added React.memo to QuickActions component
+- Added React.memo to QualityReportPanel component
+- Added React.memo to ReasoningTimeline component
+- Added React.memo to AgentPipeline component
+- Added React.memo to ERDiagram component
+- Added React.memo to ClarificationOptions component
+- Verified all components that were already memoized: AgentBadge, TableTreeView, ChatInputBox, DataTable, SchemaCard, ChatMessageBubble, PIIShieldBadge, QualityBadge, StudioView, DataWorkspacePanel
+- Build passes successfully with `npx next build`
+- All API routes verified: /api/chat, /api/databases, /api/projects, /api/workspaces, /api/generate, /api/datasets, /api/quality
+
+Stage Summary:
+- All SynthForge UI components now wrapped with React.memo for performance
+- Chat input state isolated in ChatInputBox component (prevents parent re-renders)
+- SQL playground state isolated in StudioView component
+- Build passes cleanly with no errors
+- Application ready for end-to-end testing

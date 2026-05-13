@@ -10,7 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import type { QualityReportData } from './types'
 
-export function QualityReportPanel({
+export const QualityReportPanel = React.memo(function QualityReportPanel({
   qualityReport,
   showQualityReport,
   setShowQualityReport,
@@ -134,4 +134,4 @@ export function QualityReportPanel({
       </DialogContent>
     </Dialog>
   )
-}
+})

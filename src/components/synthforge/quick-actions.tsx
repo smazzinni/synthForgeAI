@@ -5,7 +5,7 @@ import { FileJson, FileText, Copy, Plus } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import type { Message } from './types'
 
-export function QuickActions({ msg, allTables, onExportData, onCopyAllData, onSendMessage, isLoading }: {
+export const QuickActions = React.memo(function QuickActions({ msg, allTables, onExportData, onCopyAllData, onSendMessage, isLoading }: {
   msg: Message
   allTables: Record<string, Record<string, unknown>[]>
   onExportData: (tables: Record<string, Record<string, unknown>[]>, format: string) => void
@@ -56,4 +56,4 @@ export function QuickActions({ msg, allTables, onExportData, onCopyAllData, onSe
       </Button>
     </div>
   )
-}
+})

@@ -14,7 +14,7 @@ import { AnimatedDots } from './animated-dots'
 import { staggerContainer, staggerItem } from './types'
 import type { Message, AgentStepUI } from './types'
 
-export function ChatPanel({
+export const ChatPanel = React.memo(function ChatPanel({
   messages,
   isLoading,
   isDragOver,
@@ -247,4 +247,4 @@ export function ChatPanel({
       />
     </div>
   )
-}
+})

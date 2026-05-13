@@ -10,7 +10,7 @@ import { Badge } from '@/components/ui/badge'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import type { ReasoningStep } from './types'
 
-export function ReasoningTimeline({ steps, msgId }: { steps: ReasoningStep[]; msgId: string }) {
+export const ReasoningTimeline = React.memo(function ReasoningTimeline({ steps, msgId }: { steps: ReasoningStep[]; msgId: string }) {
   const [isOpen, setIsOpen] = useState(false)
   if (!steps || steps.length === 0) return null
 
@@ -119,4 +119,4 @@ export function ReasoningTimeline({ steps, msgId }: { steps: ReasoningStep[]; ms
       </CollapsibleContent>
     </Collapsible>
   )
-}
+})

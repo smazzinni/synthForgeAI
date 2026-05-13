@@ -11,7 +11,7 @@ interface ERDiagramProps {
   erSvgRef: React.RefObject<SVGSVGElement | null>
 }
 
-export function ERDiagram({ schema, tables, erSvgRef }: ERDiagramProps) {
+export const ERDiagram = React.memo(function ERDiagram({ schema, tables, erSvgRef }: ERDiagramProps) {
   const allTableNames = Array.from(new Set([...Object.keys(tables), ...Object.keys(schema)]))
 
   const [erDragState, setErDragState] = useState<{ isDragging: boolean; target: string | null; startX: number; startY: number; offsetX: number; offsetY: number }>({ isDragging: false, target: null, startX: 0, startY: 0, offsetX: 0, offsetY: 0 })
@@ -336,4 +336,4 @@ export function ERDiagram({ schema, tables, erSvgRef }: ERDiagramProps) {
       </div>
     </div>
   )
-}
+})

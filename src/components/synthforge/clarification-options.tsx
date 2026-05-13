@@ -5,7 +5,7 @@ import { motion } from 'framer-motion'
 import { Button } from '@/components/ui/button'
 import type { ClarificationOption } from './types'
 
-export function ClarificationOptions({ options, onSelectOption, isLoading }: {
+export const ClarificationOptions = React.memo(function ClarificationOptions({ options, onSelectOption, isLoading }: {
   options: ClarificationOption[]
   onSelectOption: (value: string) => void
   isLoading: boolean
@@ -31,4 +31,4 @@ export function ClarificationOptions({ options, onSelectOption, isLoading }: {
       </div>
     </div>
   )
-}
+})

@@ -47,6 +47,7 @@ import { ChatPanel } from '@/components/synthforge/chat-panel'
 import { QualityReportPanel } from '@/components/synthforge/quality-report-panel'
 import { ERDiagram } from '@/components/synthforge/er-diagram'
 import { ExplorerPanel } from '@/components/explorer-panel'
+import { StudioView } from '@/components/synthforge/studio-view'
 
 // Shared types and animation variants
 import type { Workspace, Project, Database_, Message, Conversation, AgentStepUI, QualityReportData, View, AgentMode, ReasoningStep } from '@/components/synthforge/types'
@@ -68,8 +69,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
   const [agentMode, setAgentMode] = useState<AgentMode>('auto')
   const [attachedFiles, setAttachedFiles] = useState<{ name: string; content: string; type: string }[]>([])
   const [rightTab, setRightTab] = useState('preview')
-  const [sqlQuery, setSqlQuery] = useState('')
-  const [sqlResult, setSqlResult] = useState<string>('')
+
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [mobileStudioTab, setMobileStudioTab] = useState<'chat' | 'data'>('chat')
   const [schemaVersionCount, setSchemaVersionCount] = useState(0)
@@ -77,9 +77,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
   const [totalTokens, setTotalTokens] = useState(0)
   const [selectedTableName, setSelectedTableName] = useState<string | null>(null)
   const [isOnline, setIsOnline] = useState(true)
-  const [sqlSuggestion, setSqlSuggestion] = useState<string>('')
-  const [showSqlSuggestion, setShowSqlSuggestion] = useState(false)
-  const [sqlValidationError, setSqlValidationError] = useState<string>('')
+
   const [explorerView, setExplorerView] = useState<'tree' | 'graph'>('tree')
   const [topologicalSortResult, setTopologicalSortResult] = useState<string[] | null>(null)
   const [cutpoints, setCutpoints] = useState<string[] | null>(null)
@@ -181,8 +179,6 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
     setActiveDb(db)
     setRightTab('preview')
     setAgentMode('auto')
-    setSqlQuery('')
-    setSqlResult('')
     setAttachedFiles([])
     setMobileStudioTab('chat')
     setView('studio')
@@ -640,27 +636,6 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
     toast({ title: 'Copied!', description: 'Data copied to clipboard' })
   }, [toast])
 
-  const runSqlPlayground = () => {
-    if (!sqlQuery.trim()) return
-    const tables = getTablesFromMessages
-    const tableName = sqlQuery.match(/FROM\s+(\w+)/i)?.[1] || sqlQuery.match(/from\s+(\w+)/i)?.[1]
-    if (tableName && tables[tableName]) {
-      setSqlResult(`Found ${tables[tableName].length} rows in "${tableName}"\n\n${JSON.stringify(tables[tableName].slice(0, 5), null, 2)}${tables[tableName].length > 5 ? '\n\n... and more' : ''}`)
-    } else {
-      setSqlResult(`Query executed (simulated)\n\nAvailable tables: ${Object.keys(tables).join(', ') || 'None'}\n\nNote: SQL Playground runs in preview mode. Generated data is available for inspection.`)
-    }
-  }
-
-  const validateSql = useCallback((sql: string) => {
-    if (!sql.trim()) { setSqlValidationError(''); return }
-    let parenCount = 0
-    for (const char of sql) { if (char === '(') parenCount++; if (char === ')') parenCount--; if (parenCount < 0) { setSqlValidationError('Unbalanced parentheses: extra closing ")"'); return } }
-    if (parenCount > 0) { setSqlValidationError(`Unbalanced parentheses: missing ${parenCount} closing ")"`); return }
-    const upperSql = sql.toUpperCase().trim()
-    if (upperSql.endsWith('FROM') || upperSql.endsWith('SELECT') || upperSql.endsWith('WHERE') || upperSql.endsWith('JOIN') || upperSql.endsWith('ON')) { setSqlValidationError('Query appears incomplete (ends with a keyword)'); return }
-    setSqlValidationError('')
-  }, [])
-
   const regenerateTable = useCallback(async (tableName: string) => {
     if (!activeDb || !conversation) return
     await sendMessage(`Regenerate data for the ${tableName} table with different values`)
@@ -1068,220 +1043,70 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
   }
 
   // ═══════════════════════════════════════════════════════════
-  // STUDIO VIEW
+  // STUDIO VIEW (delegated to StudioView component)
   // ═══════════════════════════════════════════════════════════
   if (view === 'studio' && activeDb) {
-    const allTables = getTablesFromMessages
-    const schemaObj = getSchemaFromDb
-
-    // Data Workspace Panel (rendered inline since it's deeply integrated with state)
-    const DataWorkspacePanel = () => (
-      <Tabs value={rightTab} onValueChange={setRightTab} className="flex flex-col h-full">
-        <TabsList className="w-full justify-start rounded-none border-b bg-transparent h-10 px-3 shrink-0">
-          <TabsTrigger value="preview" className="text-xs data-[state=active]:bg-muted">Data</TabsTrigger>
-          <TabsTrigger value="schema" className="text-xs data-[state=active]:bg-muted">Schema</TabsTrigger>
-          <TabsTrigger value="relationships" className="text-xs data-[state=active]:bg-muted">ER Diagram</TabsTrigger>
-          <TabsTrigger value="sql" className="text-xs data-[state=active]:bg-muted">SQL</TabsTrigger>
-          <TabsTrigger value="explorer" className="text-xs data-[state=active]:bg-muted">Explorer</TabsTrigger>
-        </TabsList>
-
-        <TabsContent value="preview" className="flex-1 overflow-auto mt-0">
-          <div className="flex h-full">
-            <div className="w-48 shrink-0 border-r bg-muted/20 overflow-y-auto">
-              <div className="p-2">
-                <TableTreeView tableNames={Object.keys(allTables)} tableRowCounts={Object.fromEntries(Object.entries(allTables).map(([k, v]) => [k, v.length]))} selectedTable={selectedTableName} onSelectTable={setSelectedTableName} />
-              </div>
-            </div>
-            <div className="flex-1 overflow-auto">
-              <ScrollArea className="h-full">
-                <div className="p-4 space-y-4">
-                  {isLoading && Object.keys(allTables).length === 0 ? (
-                    <div className="space-y-4">{[1, 2].map(i => <Card key={i}><CardHeader className="pb-2"><div className="flex items-center justify-between"><Skeleton className="h-4 w-24" /><Skeleton className="h-5 w-14" /></div></CardHeader><CardContent><div className="space-y-2"><div className="flex gap-4">{[1, 2, 3, 4].map(j => <Skeleton key={j} className="h-3 w-16" />)}</div>{[1, 2, 3, 4, 5].map(j => <div key={j} className="flex gap-4">{[1, 2, 3, 4].map(k => <Skeleton key={k} className="h-3 w-20" />)}</div>)}</div></CardContent></Card>)}</div>
-                  ) : selectedTableName && allTables[selectedTableName] ? (
-                    <>
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <Button variant="ghost" size="sm" className="text-xs h-7" onClick={() => setSelectedTableName(null)}><ChevronRight className="h-3 w-3 mr-1" />All Tables</Button>
-                        <span className="text-xs text-muted-foreground">{selectedTableName} · {allTables[selectedTableName].length} rows</span>
-                        <div className="ml-auto flex items-center gap-1">
-                          <Button variant="outline" size="sm" className="gap-1 text-xs h-7 hover:bg-amber-50 hover:border-amber-300" onClick={() => runQualityCheck(false)} disabled={isQualityCheckRunning}>{isQualityCheckRunning ? <Loader2 className="h-3 w-3 animate-spin" /> : <Bug className="h-3 w-3" />}Quality</Button>
-                          <DropdownMenu><DropdownMenuTrigger asChild><Button variant="outline" size="sm" className="gap-1 text-xs h-7"><Download className="h-3 w-3" /> Export</Button></DropdownMenuTrigger><DropdownMenuContent>
-                            <DropdownMenuItem onClick={() => exportData(allTables, 'json')}><FileJson className="h-3.5 w-3.5 mr-2" /> Export as JSON</DropdownMenuItem>
-                            <DropdownMenuItem onClick={() => exportData(allTables, 'csv')}><FileText className="h-3.5 w-3.5 mr-2" /> Export as CSV</DropdownMenuItem>
-                            <DropdownMenuSeparator />
-                            <DropdownMenuItem onClick={() => exportData(allTables, 'sql-insert')}><Code2 className="h-3.5 w-3.5 mr-2" /> SQL INSERT statements</DropdownMenuItem>
-                            <DropdownMenuItem onClick={() => exportData(allTables, 'sql-full')}><Database className="h-3.5 w-3.5 mr-2" /> Full SQL dump (CREATE + INSERT)</DropdownMenuItem>
-                            <DropdownMenuSeparator />
-                            <DropdownMenuItem onClick={() => copyAllData(allTables, 'json')}><Copy className="h-3.5 w-3.5 mr-2" /> Copy JSON to clipboard</DropdownMenuItem>
-                            <DropdownMenuItem onClick={() => copyAllData(allTables, 'sql')}><ClipboardCheck className="h-3.5 w-3.5 mr-2" /> Copy SQL to clipboard</DropdownMenuItem>
-                          </DropdownMenuContent></DropdownMenu>
-                        </div>
-                      </div>
-                      <DataTable key={selectedTableName} tableName={selectedTableName} allRows={allTables[selectedTableName]} schemaObj={schemaObj} onRegenerate={regenerateTable} isLoading={isLoading} onExportTable={exportTable} onCopyTable={copyTable} />
-                    </>
-                  ) : !selectedTableName && Object.keys(allTables).length > 0 ? (
-                    <>
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className="text-xs text-muted-foreground">{Object.keys(allTables).length} table{Object.keys(allTables).length !== 1 ? 's' : ''} · {Object.values(allTables).reduce((s, r) => s + r.length, 0)} total rows</span>
-                        <div className="ml-auto flex items-center gap-1">
-                          <Button variant="outline" size="sm" className="gap-1 text-xs h-7 hover:bg-amber-50 hover:border-amber-300" onClick={() => runQualityCheck(false)} disabled={isQualityCheckRunning}>{isQualityCheckRunning ? <Loader2 className="h-3 w-3 animate-spin" /> : <Bug className="h-3 w-3" />}Quality</Button>
-                          <DropdownMenu><DropdownMenuTrigger asChild><Button variant="outline" size="sm" className="gap-1 text-xs h-7"><Download className="h-3 w-3" /> Export</Button></DropdownMenuTrigger><DropdownMenuContent>
-                            <DropdownMenuItem onClick={() => exportData(allTables, 'json')}><FileJson className="h-3.5 w-3.5 mr-2" /> Export as JSON</DropdownMenuItem>
-                            <DropdownMenuItem onClick={() => exportData(allTables, 'csv')}><FileText className="h-3.5 w-3.5 mr-2" /> Export as CSV</DropdownMenuItem>
-                            <DropdownMenuSeparator />
-                            <DropdownMenuItem onClick={() => exportData(allTables, 'sql-insert')}><Code2 className="h-3.5 w-3.5 mr-2" /> SQL INSERT statements</DropdownMenuItem>
-                            <DropdownMenuItem onClick={() => exportData(allTables, 'sql-full')}><Database className="h-3.5 w-3.5 mr-2" /> Full SQL dump (CREATE + INSERT)</DropdownMenuItem>
-                            <DropdownMenuSeparator />
-                            <DropdownMenuItem onClick={() => copyAllData(allTables, 'json')}><Copy className="h-3.5 w-3.5 mr-2" /> Copy JSON to clipboard</DropdownMenuItem>
-                            <DropdownMenuItem onClick={() => copyAllData(allTables, 'sql')}><ClipboardCheck className="h-3.5 w-3.5 mr-2" /> Copy SQL to clipboard</DropdownMenuItem>
-                          </DropdownMenuContent></DropdownMenu>
-                        </div>
-                      </div>
-                      {Object.entries(allTables).map(([tableName, rows]) => <DataTable key={tableName} tableName={tableName} allRows={rows} schemaObj={schemaObj} onRegenerate={regenerateTable} isLoading={isLoading} onExportTable={exportTable} onCopyTable={copyTable} />)}
-                    </>
-                  ) : (
-                    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-center py-20">
-                      <div className="h-16 w-16 rounded-2xl bg-gradient-to-br from-amber-100 to-red-50 flex items-center justify-center mx-auto mb-4"><Table2 className="h-8 w-8 text-amber-700/50" /></div>
-                      <p className="text-sm font-medium text-muted-foreground mb-1">No data yet</p>
-                      <p className="text-xs text-muted-foreground mb-4">Chat with the AI to generate synthetic data</p>
-                      <Button variant="outline" size="sm" className="text-xs" onClick={() => setMobileStudioTab('chat')}><MessageSquare className="h-3 w-3 mr-1" /> Start Chat</Button>
-                    </motion.div>
-                  )}
-                </div>
-              </ScrollArea>
-            </div>
-          </div>
-        </TabsContent>
-
-        <TabsContent value="schema" className="flex-1 overflow-auto mt-0">
-          <ScrollArea className="h-full">
-            <div className="p-4 space-y-4">
-              {Object.keys(schemaObj).length === 0 ? (
-                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-center py-20">
-                  <div className="h-16 w-16 rounded-2xl bg-gradient-to-br from-amber-100 to-red-50 flex items-center justify-center mx-auto mb-4"><Columns3 className="h-8 w-8 text-amber-700/50" /></div>
-                  <p className="text-sm font-medium text-muted-foreground mb-1">No schema defined</p>
-                  <p className="text-xs text-muted-foreground mb-4">Ask the AI to design a database schema</p>
-                  <Button variant="outline" size="sm" className="text-xs" onClick={() => setMobileStudioTab('chat')}><MessageSquare className="h-3 w-3 mr-1" /> Start Chat</Button>
-                </motion.div>
-              ) : Object.entries(schemaObj).map(([tableName, def]) => <SchemaCard key={tableName} tableName={tableName} columns={(def as { columns: Record<string, string> }).columns} />)}
-            </div>
-          </ScrollArea>
-        </TabsContent>
-
-        <TabsContent value="relationships" className="flex-1 mt-0 overflow-hidden">
-          <ERDiagram schema={schemaObj} tables={allTables} erSvgRef={erSvgRef} />
-        </TabsContent>
-
-        <TabsContent value="sql" className="flex-1 flex flex-col mt-0">
-          <div className="p-4 space-y-3 flex-1 flex flex-col">
-            <div className="flex items-center gap-2"><Code2 className="h-4 w-4 text-amber-700" /><span className="text-sm font-semibold">SQL Playground</span><Badge variant="secondary" className="text-[10px] ml-auto">Preview Mode</Badge></div>
-
-            {showSqlSuggestion && sqlSuggestion && (
-              <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} className="border border-amber-200 bg-amber-50/50 rounded-lg p-3 space-y-2">
-                <div className="flex items-center gap-2"><Sparkles className="h-3.5 w-3.5 text-amber-700" /><span className="text-xs font-semibold text-amber-800">AI Suggestion</span></div>
-                <ScrollArea className="max-h-32"><pre className="text-[11px] font-mono whitespace-pre-wrap text-amber-900">{sqlSuggestion}</pre></ScrollArea>
-                <div className="flex items-center gap-2">
-                  <Button variant="outline" size="sm" className="h-6 text-[10px] gap-1 border-green-300 text-green-700 hover:bg-green-50" onClick={() => { setSqlQuery(sqlSuggestion); setShowSqlSuggestion(false); setSqlSuggestion(''); toast({ title: 'SQL Accepted', description: 'AI suggestion applied to editor' }) }}><Check className="h-2.5 w-2.5" /> Accept</Button>
-                  <Button variant="outline" size="sm" className="h-6 text-[10px] gap-1 border-red-300 text-red-700 hover:bg-red-50" onClick={() => { setShowSqlSuggestion(false); setSqlSuggestion('') }}><X className="h-2.5 w-2.5" /> Reject</Button>
-                </div>
-              </motion.div>
-            )}
-
-            <div className="flex-1 relative">
-              <Textarea value={sqlQuery} onChange={(e) => { setSqlQuery(e.target.value); validateSql(e.target.value); setShowSqlSuggestion(false) }} placeholder={"-- Write a comment like: Get all users older than 30\n-- Or type SQL directly:\nSELECT * FROM users LIMIT 10;"} className="min-h-[120px] font-mono text-xs flex-1" aria-label="SQL query input" />
-              {sqlValidationError && <div className="absolute bottom-1 left-1 right-1 flex items-center gap-1 text-[10px] text-red-600 bg-red-50 px-2 py-1 rounded"><AlertCircle className="h-3 w-3 shrink-0" />{sqlValidationError}</div>}
-            </div>
-
-            <div className="flex items-center gap-1.5 flex-wrap">
-              <Button size="sm" className="bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white h-7 text-xs" onClick={runSqlPlayground} disabled={!sqlQuery.trim()}><Play className="h-3 w-3 mr-1" /> Run</Button>
-              <Button variant="outline" size="sm" className="h-7 text-xs gap-1" onClick={() => { const commentMatch = sqlQuery.match(/^--\s*(.+)$/m); if (commentMatch) sendMessage(`Generate SQL for: ${commentMatch[1]}`); else if (sqlQuery.trim()) sendMessage(`Generate an improved or alternative SQL query for: ${sqlQuery.trim()}`); else toast({ title: 'No query', description: 'Write a comment (-- text) or SQL query first', variant: 'destructive' }) }} disabled={isLoading || !sqlQuery.trim()}><Wand2 className="h-3 w-3" /> Ask AI</Button>
-              <Button variant="outline" size="sm" className="h-7 text-xs gap-1" onClick={() => { if (!sqlQuery.trim()) { toast({ title: 'No query', description: 'Write a SQL query first', variant: 'destructive' }); return } sendMessage(`Explain this SQL query in plain English: ${sqlQuery.trim()}`) }} disabled={isLoading || !sqlQuery.trim()}><HelpCircle className="h-3 w-3" /> Explain</Button>
-              <Button variant="outline" size="sm" className="h-7 text-xs gap-1" onClick={() => { if (!sqlQuery.trim()) return; let formatted = sqlQuery.replace(/\b(SELECT|FROM|WHERE|JOIN|LEFT JOIN|RIGHT JOIN|INNER JOIN|OUTER JOIN|ON|AND|OR|ORDER BY|GROUP BY|HAVING|INSERT INTO|VALUES|UPDATE|SET|DELETE FROM|CREATE TABLE|ALTER TABLE|DROP TABLE|AS|IN|NOT|IS|NULL|LIKE|BETWEEN|EXISTS|DISTINCT|LIMIT|OFFSET|UNION|CASE|WHEN|THEN|ELSE|END)\b/gi, '\n$1').replace(/^\n/, '').replace(/\n\n+/g, '\n'); setSqlQuery(formatted) }}><AlignLeft className="h-3 w-3" /> Format</Button>
-            </div>
-
-            {sqlResult && <ScrollArea className="max-h-64"><pre className="bg-slate-900 text-green-400 p-3 rounded-lg text-xs font-mono whitespace-pre-wrap">{sqlResult}</pre></ScrollArea>}
-          </div>
-        </TabsContent>
-
-        <TabsContent value="explorer" className="flex-1 mt-0 overflow-hidden">
-          <ExplorerPanel
-            tables={allTables} schema={schemaObj} explorerView={explorerView} setExplorerView={setExplorerView}
-            cutpoints={cutpoints} reachableTables={reachableTables} selectedGraphNode={selectedGraphNode}
-            constraintClosureResult={constraintClosureResult} topologicalSortResult={topologicalSortResult}
-            buildDependencyGraph={buildDependencyGraph} topologicalSort={topologicalSort}
-            findCutpoints={findCutpoints} bfsReachable={bfsReachable}
-            computeConstraintClosure={computeConstraintClosure}
-            onNavigateToData={() => setRightTab('preview')}
-            graphSvgRef={graphSvgRef}
-          />
-        </TabsContent>
-      </Tabs>
-    )
-
     return (
-      <div className="h-screen flex flex-col bg-background overflow-hidden">
-        {/* Studio Header */}
-        <header className="border-b bg-card h-12 flex items-center px-3 gap-2 shrink-0">
-          <Button variant="ghost" size="sm" onClick={() => setView('dashboard')} className="gap-1 text-xs h-7" aria-label="Back to dashboard"><ChevronRight className="h-3 w-3 rotate-180" /><span className="hidden sm:inline">Back</span></Button>
-          <Separator orientation="vertical" className="h-5" />
-          <Database className="h-4 w-4 text-amber-700 shrink-0" />
-          <span className="font-semibold text-sm truncate max-w-[150px]">{activeDb.name}</span>
-          <Badge variant="secondary" className="text-xs hidden sm:inline-flex">{activeDb.dbType}</Badge>
-          {(schemaVersionCount > 0 || messages.some(m => m.schemaVersion && m.schemaVersion > 0)) && (
-            <Badge variant="outline" className="text-[10px] gap-1 font-mono hidden sm:inline-flex"><GitBranch className="h-2.5 w-2.5" /> v{schemaVersionCount || messages.reduce((max, m) => Math.max(max, m.schemaVersion || 0), 0) || 1}</Badge>
-          )}
-
-          <Separator orientation="vertical" className="h-5 hidden md:block" />
-          <div className="items-center gap-1 hidden md:flex">
-            <span className="text-[10px] text-muted-foreground mr-1">Agent:</span>
-            {(['plan', 'execute', 'auto'] as AgentMode[]).map((mode) => {
-              const isPlan = mode === 'plan'; const isExec = mode === 'execute'
-              const icon = isPlan ? <Brain className="h-3 w-3" /> : isExec ? <Play className="h-3 w-3" /> : <Wand2 className="h-3 w-3" />
-              const label = isPlan ? 'Plan' : isExec ? 'Execute' : 'Auto'
-              const activeColor = isPlan ? 'bg-sky-100 text-sky-800 border-sky-300' : isExec ? 'bg-emerald-100 text-emerald-800 border-emerald-300' : 'bg-amber-100 text-amber-800 border-amber-300'
-              return <Button key={mode} variant="outline" size="sm" className={`h-7 text-[11px] gap-1 px-2.5 ${agentMode === mode ? activeColor : 'text-muted-foreground'}`} onClick={() => setAgentMode(mode)} aria-label={`${label} mode`}>{icon} {label}</Button>
-            })}
-          </div>
-
-          <div className="ml-auto flex items-center gap-1.5">
-            {totalTokens > 0 && <Badge variant="outline" className="text-[10px] gap-1 font-mono hidden sm:inline-flex"><Zap className="h-2.5 w-2.5 text-amber-600" /> {totalTokens > 1000 ? `${(totalTokens / 1000).toFixed(1)}k` : totalTokens} tok</Badge>}
-
-            <div className="flex md:hidden items-center gap-0.5 bg-muted rounded-md p-0.5">
-              <Button variant={mobileStudioTab === 'chat' ? 'secondary' : 'ghost'} size="sm" className="h-6 text-xs px-2" onClick={() => setMobileStudioTab('chat')} aria-label="Chat tab"><MessageSquare className="h-3 w-3" /></Button>
-              <Button variant={mobileStudioTab === 'data' ? 'secondary' : 'ghost'} size="sm" className="h-6 text-xs px-2" onClick={() => setMobileStudioTab('data')} aria-label="Data tab"><Table2 className="h-3 w-3" /></Button>
-            </div>
-
-            {Object.keys(allTables).length > 0 && (
-              <DropdownMenu><DropdownMenuTrigger asChild><Button variant="outline" size="sm" className="gap-1 text-xs h-7"><Download className="h-3 w-3" /> <span className="hidden sm:inline">Export</span></Button></DropdownMenuTrigger><DropdownMenuContent>
-                <DropdownMenuItem onClick={() => exportData(allTables, 'json')}><FileJson className="h-3.5 w-3.5 mr-2" /> Export as JSON</DropdownMenuItem>
-                <DropdownMenuItem onClick={() => exportData(allTables, 'csv')}><FileText className="h-3.5 w-3.5 mr-2" /> Export as CSV</DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={() => exportData(allTables, 'sql-insert')}><Code2 className="h-3.5 w-3.5 mr-2" /> SQL INSERT statements</DropdownMenuItem>
-                <DropdownMenuItem onClick={() => exportData(allTables, 'sql-full')}><Database className="h-3.5 w-3.5 mr-2" /> Full SQL dump</DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={() => copyAllData(allTables, 'json')}><Copy className="h-3.5 w-3.5 mr-2" /> Copy JSON</DropdownMenuItem>
-                <DropdownMenuItem onClick={() => copyAllData(allTables, 'sql')}><ClipboardCheck className="h-3.5 w-3.5 mr-2" /> Copy SQL</DropdownMenuItem>
-              </DropdownMenuContent></DropdownMenu>
-            )}
-          </div>
-        </header>
-
-        <div className="flex-1 overflow-hidden md:hidden">
-          {mobileStudioTab === 'chat' ? <ChatPanel messages={messages} isLoading={isLoading} isDragOver={isDragOver} isOnline={isOnline} onSendMessage={sendMessage} onAbort={handleAbort} onHandleSendMessage={handleSendMessage} attachedFiles={attachedFiles} onFileUpload={handleFileUpload} onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop} onRemoveFile={removeFile} fileInputRef={fileInputRef} onRetry={handleRetry} onRegenerate={handleRegenerate} onCopyToClipboard={copyToClipboard} onExportData={exportData} onCopyAllData={copyAllData} agentSteps={agentSteps} allTables={allTables} /> : <DataWorkspacePanel />}
-        </div>
-        <div className="flex-1 overflow-hidden hidden md:block">
-          <ResizablePanelGroup direction="horizontal">
-            <ResizablePanel defaultSize={25} minSize={15} maxSize={50}>
-              <ChatPanel messages={messages} isLoading={isLoading} isDragOver={isDragOver} isOnline={isOnline} onSendMessage={sendMessage} onAbort={handleAbort} onHandleSendMessage={handleSendMessage} attachedFiles={attachedFiles} onFileUpload={handleFileUpload} onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop} onRemoveFile={removeFile} fileInputRef={fileInputRef} onRetry={handleRetry} onRegenerate={handleRegenerate} onCopyToClipboard={copyToClipboard} onExportData={exportData} onCopyAllData={copyAllData} agentSteps={agentSteps} allTables={allTables} />
-            </ResizablePanel>
-            <ResizableHandle withHandle />
-            <ResizablePanel defaultSize={75} minSize={40}>
-              <DataWorkspacePanel />
-            </ResizablePanel>
-          </ResizablePanelGroup>
-        </div>
-
-        <QualityReportPanel qualityReport={qualityReport} showQualityReport={showQualityReport} setShowQualityReport={setShowQualityReport} onRunQualityCheck={runQualityCheck} isQualityCheckRunning={isQualityCheckRunning} />
-      </div>
+      <StudioView
+        key={activeDb.id}
+        activeDb={activeDb}
+        messages={messages}
+        isLoading={isLoading}
+        isDragOver={isDragOver}
+        isOnline={isOnline}
+        conversation={conversation}
+        agentMode={agentMode}
+        setAgentMode={setAgentMode}
+        attachedFiles={attachedFiles}
+        allTables={getTablesFromMessages}
+        schemaObj={getSchemaFromDb}
+        selectedTableName={selectedTableName}
+        setSelectedTableName={setSelectedTableName}
+        mobileStudioTab={mobileStudioTab}
+        setMobileStudioTab={setMobileStudioTab}
+        totalTokens={totalTokens}
+        schemaVersionCount={schemaVersionCount}
+        agentSteps={agentSteps}
+        sendMessage={sendMessage}
+        handleAbort={handleAbort}
+        handleSendMessage={handleSendMessage}
+        handleFileUpload={handleFileUpload}
+        handleDragOver={handleDragOver}
+        handleDragLeave={handleDragLeave}
+        handleDrop={handleDrop}
+        removeFile={removeFile}
+        fileInputRef={fileInputRef}
+        handleRetry={handleRetry}
+        handleRegenerate={handleRegenerate}
+        copyToClipboard={copyToClipboard}
+        exportData={exportData}
+        exportTable={exportTable}
+        copyTable={copyTable}
+        copyAllData={copyAllData}
+        regenerateTable={regenerateTable}
+        runQualityCheck={runQualityCheck}
+        isQualityCheckRunning={isQualityCheckRunning}
+        qualityReport={qualityReport}
+        showQualityReport={showQualityReport}
+        setShowQualityReport={setShowQualityReport}
+        explorerView={explorerView}
+        setExplorerView={setExplorerView}
+        cutpoints={cutpoints}
+        reachableTables={reachableTables}
+        selectedGraphNode={selectedGraphNode}
+        constraintClosureResult={constraintClosureResult}
+        topologicalSortResult={topologicalSortResult}
+        buildDependencyGraph={buildDependencyGraph}
+        topologicalSort={topologicalSort}
+        findCutpoints={findCutpoints}
+        bfsReachable={bfsReachable}
+        computeConstraintClosure={computeConstraintClosure}
+        graphSvgRef={graphSvgRef}
+        erSvgRef={erSvgRef}
+        setView={setView}
+        setRightTab={setRightTab}
+        rightTab={rightTab}
+      />
     )
   }
 

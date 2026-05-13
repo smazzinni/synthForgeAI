@@ -10,7 +10,7 @@ import { Badge } from '@/components/ui/badge'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import type { AgentStepUI } from './types'
 
-export function AgentPipeline({ steps }: { steps: AgentStepUI[] }) {
+export const AgentPipeline = React.memo(function AgentPipeline({ steps }: { steps: AgentStepUI[] }) {
   const [isExpanded, setIsExpanded] = useState(true)
   if (!steps || steps.length === 0) return null
 
@@ -140,4 +140,4 @@ export function AgentPipeline({ steps }: { steps: AgentStepUI[] }) {
       </Collapsible>
     </div>
   )
-}
+})
