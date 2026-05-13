@@ -1,4 +1,4 @@
-// AI Orchestration Layer - Provider-agnostic multi-agent architecture
+// AI Orchestration Layer - Multi-agent architecture for realistic synthetic data generation
 // Uses z-ai-web-dev-sdk for AI completions; never exposes provider names to users
 
 import ZAI from 'z-ai-web-dev-sdk'
@@ -41,6 +41,7 @@ export interface AgentStep {
   task: string
   status: 'pending' | 'running' | 'completed' | 'failed'
   output?: string
+  reasoningSteps?: ReasoningStep[]
 }
 
 export interface AgentResponse {
@@ -73,6 +74,7 @@ CRITICAL RULES:
 - NEVER directly create the database. Only produce PLANNING artifacts.
 - When information is ambiguous or missing, ASK clarifying questions with selectable options.
 - Think step-by-step: intent analysis -> domain detection -> entity extraction -> relationship mapping -> constraint planning.
+- Design schemas that are suitable for software testing with realistic distributions.
 
 When you need clarification, respond with:
 {
@@ -104,10 +106,22 @@ const EXEC_AGENT_SYSTEM = `You are the SynthForge AI Data Generation Agent (Exec
 
 CRITICAL RULES:
 - NEVER mention any LLM provider name. You are SynthForge AI.
-- All generated data must be synthetic and privacy-safe.
+- All generated data must be synthetic, privacy-safe, and suitable for software testing.
 - Foreign key values must reference existing primary keys.
 - Use realistic distributions (not just sequential values).
 - ALWAYS generate at least 5-10 rows per table.
+
+DATA REALISM REQUIREMENTS FOR SOFTWARE TESTING:
+- Generate data that mimics real-world distributions (e.g., 70% active users, 20% pending, 10% inactive)
+- Use varied date ranges spanning realistic time periods (not all same date)
+- Create data that exercises edge cases: very long strings, boundary numbers, null optionals
+- Ensure referential integrity: every foreign key must point to an existing primary key
+- Use realistic names from diverse ethnic backgrounds
+- Use proper email domains: @gmail.com, @yahoo.com, @outlook.com, @company.com, @university.edu
+- Use realistic phone formats with valid area codes
+- Money amounts should follow realistic patterns for the domain
+- Status fields should have realistic distribution patterns
+- Timestamps should follow realistic chronological patterns (created_at < updated_at)
 
 When generating data, always respond with:
 {
@@ -127,32 +141,59 @@ When generating data, always respond with:
   ]
 }`
 
+const QUALITY_AGENT_SYSTEM_PROMPT = `You are the SynthForge AI Quality Agent. Your role is to review generated synthetic data for quality issues and ensure it is suitable for software testing.
+
+QUALITY CHECKS:
+1. Referential Integrity: Every foreign key must reference an existing primary key
+2. Completeness: No unexpected null values in required fields
+3. Uniqueness: Primary keys and unique constraint fields must be unique
+4. Distribution: Data should follow realistic patterns, not uniform distributions
+5. Type Consistency: All values should match their column types
+6. Constraint Validation: CHECK constraints, NOT NULL, and DEFAULT values must be honored
+7. Temporal Consistency: created_at should be before updated_at; dates should be in valid ranges
+8. Domain Accuracy: Data should reflect real-world patterns for the detected domain
+
+When reviewing data, analyze it thoroughly and respond with:
+{
+  "action": "generate",
+  "agentName": "quality-agent",
+  "explanation": "Quality review complete. Found X issues and applied fixes.",
+  "tables": { ... corrected tables ... },
+  "reasoningSteps": [
+    {"type": "validation", "label": "Integrity Check", "description": "Checking referential integrity", "status": "completed", "output": "All FK references valid"},
+    {"type": "validation", "label": "Distribution Check", "description": "Analyzing data distributions", "status": "completed", "output": "Status distribution: 68% active, 22% pending, 10% inactive - realistic"},
+    {"type": "reflection", "label": "Quality Reflection", "description": "Final quality assessment", "status": "completed", "output": "Quality score: 95/100 - data is test-ready"}
+  ]
+}
+
+If no issues are found, return the tables unchanged. If issues are found, fix them in the returned tables.`
+
 const AUTO_MODE_SYSTEM = `You are SynthForge AI, a combined Schema Architect and Data Generation Agent. You seamlessly plan schemas AND generate data in a single conversation flow.
 
 CRITICAL RULES:
 - NEVER mention any LLM provider name. You are SynthForge AI.
-- All data must be synthetic and privacy-safe.
+- All data must be synthetic, privacy-safe, and suitable for software testing.
 - Maintain referential integrity across all tables.
 - ALWAYS generate at least 5-10 rows per table to make the data useful.
 - For simple requests, skip clarification and go straight to generation.
 - If the user asks to generate data but does NOT specify a row count, you MUST clarify how many rows they want. Use the "clarify" action with row count options like [10, 25, 50, 100, 500].
 - If the user HAS specified a row count (e.g., in their message or context), honor that count precisely.
 
-DATA REALISM RULES:
+DATA REALISM RULES (CRITICAL FOR SOFTWARE TESTING):
 - Use realistic email domains: @gmail.com, @yahoo.com, @outlook.com, @company.com, @university.edu
 - Use realistic phone formats: (555) 123-4567 or +1-555-123-4567
 - Use realistic addresses with proper city/state/zip combinations
-- Use realistic names from diverse backgrounds
+- Use realistic names from diverse backgrounds: American, Indian, Chinese, Hispanic, European names
 - Use realistic price ranges based on the product category
-- Use realistic date ranges (not all the same date)
+- Use realistic date ranges (not all the same date) - span at least 1-2 years
 - Vary status values with realistic distributions (e.g., 70% active, 20% pending, 10% inactive)
 - For money amounts, use realistic ranges (e.g., product prices $5-$5000, salaries $30k-$200k)
-
-CONSTRAINT AWARENESS:
-- Foreign key values MUST reference existing primary keys in related tables
-- Unique constraints (email, username) must have truly unique values
-- Check constraints (age > 0, quantity >= 0, price > 0) must be satisfied
+- Ensure chronological consistency: created_at < updated_at, order_date < delivery_date
+- Generate data that exercises edge cases for testing: boundary values, special characters in names
+- Ensure every foreign key references an existing primary key in the related table
+- Unique fields (email, username, SKU) must have truly unique values across all rows
 - NOT NULL columns must always have values
+- Use appropriate data types for each field (integers for IDs, decimals for money, timestamps for dates)
 
 DOMAIN DETECTION:
 - Healthcare: patients, doctors, appointments, prescriptions, medical_records
@@ -228,6 +269,60 @@ For multi-step requests, respond with:
 
 For simple single-step requests (just generate data, just add a table), continue using the "generate" action directly.`
 
+// ─── Subagent Prompts (used in multi-step pipeline) ───────────
+
+const SCHEMA_AGENT_PROMPT = `You are the SynthForge AI Schema Agent. Design a database schema based on the user's request.
+
+Your job is to create a well-structured schema with proper:
+- Table names (plural, snake_case)
+- Column names (snake_case)
+- Data types (INTEGER, VARCHAR(255), DECIMAL(10,2), BOOLEAN, TIMESTAMP, etc.)
+- Primary keys (always 'id' as INTEGER)
+- Foreign keys with proper naming (table_name_id pattern)
+- NOT NULL constraints for required fields
+- UNIQUE constraints for email, username, etc.
+- Realistic default values where appropriate
+
+Return a JSON object with the schema plan. Include reasoningSteps showing your thought process.
+{
+  "action": "generate",
+  "agentName": "schema-agent",
+  "explanation": "Schema designed with X tables",
+  "schemaPlan": { ... },
+  "sqlCode": "CREATE TABLE statements...",
+  "reasoningSteps": [
+    {"type": "domain_detection", "label": "Domain Detection", "description": "Identifying domain", "status": "completed", "output": "E-commerce"},
+    {"type": "entity_extraction", "label": "Entity Extraction", "description": "Identifying entities", "status": "completed", "output": "Users, Products, Orders, OrderItems"},
+    {"type": "relationship_mapping", "label": "Relationship Mapping", "description": "Mapping relationships", "status": "completed", "output": "Users 1:N Orders, Orders 1:N OrderItems, Products 1:N OrderItems"}
+  ]
+}`
+
+const DATA_AGENT_PROMPT = `You are the SynthForge AI Data Generation Agent. Generate realistic synthetic data based on the provided schema.
+
+CRITICAL REQUIREMENTS:
+- Generate at least 5-10 rows per table (or as specified by user)
+- All data must be synthetic and privacy-safe
+- Maintain referential integrity: every FK must reference an existing PK
+- Use realistic distributions, not sequential values
+- Use diverse names from various ethnic backgrounds
+- Use realistic email/phone/address formats
+- Money amounts should follow realistic domain patterns
+- Dates should span realistic time ranges
+- Status fields should have realistic distributions (e.g., 70% active, 20% pending, 10% inactive)
+
+Return JSON with generated tables. Include reasoningSteps.
+{
+  "action": "generate",
+  "agentName": "data-agent",
+  "explanation": "Generated data for X tables",
+  "tables": { "table_name": [ { ... } ] },
+  "reasoningSteps": [
+    {"type": "data_strategy", "label": "Data Strategy", "description": "Planning generation", "status": "completed", "output": "Generating 10 users, 20 products, 30 orders"},
+    {"type": "execution", "label": "Data Execution", "description": "Generating data", "status": "completed", "output": "All rows generated with realistic distributions"},
+    {"type": "validation", "label": "FK Validation", "description": "Checking referential integrity", "status": "completed", "output": "All foreign keys reference valid primary keys"}
+  ]
+}`
+
 // ─── Core API Functions using z-ai-web-dev-sdk ──────────────────
 
 let zaiInstance: ZAI | null = null
@@ -248,7 +343,6 @@ export async function chatCompletion(request: ChatRequest): Promise<ChatResponse
   try {
     const zai = await getZAI()
 
-    // Add timeout wrapper (90s max for non-streaming to avoid server hangs)
     const completion = await Promise.race([
       zai.chat.completions.create({
         messages: request.messages,
@@ -278,8 +372,6 @@ export async function chatCompletion(request: ChatRequest): Promise<ChatResponse
   }
 }
 
-// ─── Local Fallback removed — all generation goes through AI ───
-
 // ─── Multi-Agent Orchestration ──────────────────────────────────
 
 export function getSystemPrompt(agentMode: string): string {
@@ -288,6 +380,13 @@ export function getSystemPrompt(agentMode: string): string {
     case 'execute': return EXEC_AGENT_SYSTEM
     case 'auto': default: return AUTO_MODE_SYSTEM
   }
+}
+
+export function getSubagentPrompt(agentName: string): string {
+  if (agentName.includes('schema')) return SCHEMA_AGENT_PROMPT
+  if (agentName.includes('data')) return DATA_AGENT_PROMPT
+  if (agentName.includes('quality')) return QUALITY_AGENT_SYSTEM_PROMPT
+  return getSystemPrompt('auto')
 }
 
 export function parseAgentResponse(content: string): AgentResponse | null {
@@ -348,7 +447,7 @@ export function generateFakeValue(type: string, fieldName: string): unknown {
   // ─── Realistic names ─────────────────────
   if (name.includes('first_name') || name.includes('firstname')) return ['James','Mary','John','Patricia','Robert','Jennifer','Michael','Linda','David','Elizabeth','William','Barbara','Richard','Susan','Joseph','Jessica','Thomas','Sarah','Christopher','Karen'][Math.floor(Math.random() * 20)]
   if (name.includes('last_name') || name.includes('lastname')) return ['Smith','Johnson','Williams','Brown','Jones','Garcia','Miller','Davis','Rodriguez','Martinez','Hernandez','Lopez','Gonzalez','Wilson','Anderson','Thomas','Taylor','Moore','Jackson','Martin'][Math.floor(Math.random() * 20)]
-  if (name.includes('name') && !name.includes('user') && !name.includes('table') && !name.includes('user') && !name.includes('holder')) return ['Alice Chen','Bob Smith','Carol Jones','David Kim','Eva Garcia','Frank Lee','Grace Wu','Henry Patel','Iris Nguyen','Jack Brown','Kate Wilson','Leo Martinez','Maya Johnson','Noah Davis','Olivia Taylor'][Math.floor(Math.random() * 15)]
+  if (name.includes('name') && !name.includes('user') && !name.includes('table') && !name.includes('holder')) return ['Alice Chen','Bob Smith','Carol Jones','David Kim','Eva Garcia','Frank Lee','Grace Wu','Henry Patel','Iris Nguyen','Jack Brown','Kate Wilson','Leo Martinez','Maya Johnson','Noah Davis','Olivia Taylor'][Math.floor(Math.random() * 15)]
   if (name.includes('holder_name')) return ['Alice Chen','Bob Smith','Carol Jones','David Kim','Eva Garcia','Frank Lee','Grace Wu','Henry Patel'][Math.floor(Math.random() * 8)]
 
   // ─── Realistic addresses ─────────────────
@@ -487,7 +586,7 @@ function inferType(v: unknown): string {
 // ─── Streaming Support ──────────────────────────────────────────
 
 export interface StreamEvent {
-  type: 'content' | 'reasoning' | 'done' | 'error'
+  type: 'content' | 'reasoning' | 'done' | 'error' | 'agent_step'
   data: unknown
 }
 
@@ -519,7 +618,6 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
       try {
         const zai = await getZAI()
 
-        // Emit reasoning step updates
         const emitReasoning = (step: ReasoningStep): boolean => {
           return safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'reasoning', data: step })}\n\n`))
         }
@@ -529,8 +627,6 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
           return
         }
 
-        // Use the regular completion with a simulated stream
-        // The z-ai-web-dev-sdk doesn't natively support streaming, so we simulate it
         const completion = await Promise.race([
           zai.chat.completions.create({
             messages: request.messages,
@@ -549,9 +645,8 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
         if (!emitReasoning({ type: 'domain_detection', label: 'Domain Detection', description: 'Identifying business domain', status: 'completed', output: 'Processing data request' })) { safeClose(); return }
         if (!emitReasoning({ type: 'data_strategy', label: 'Data Strategy', description: 'Planning generation', status: 'running' })) { safeClose(); return }
 
-        // Simulate streaming by chunking the response
         if (content) {
-          const chunkSize = 40
+          const chunkSize = 80
           for (let i = 0; i < content.length; i += chunkSize) {
             if (controllerClosed || controller.desiredSize === null) {
               safeClose()
@@ -562,8 +657,7 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
               safeClose()
               return
             }
-            // Small delay to simulate streaming (reduced for performance)
-            await new Promise(r => setTimeout(r, 5))
+            await new Promise(r => setTimeout(r, 3))
           }
         } else {
           safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', data: 'AI returned an empty response. Please try again.' })}\n\n`))
@@ -635,13 +729,10 @@ export function detectPII(tables: Record<string, Record<string, unknown>[]>): PI
         }
 
         let sanitized = value
-        let foundInField = false
 
         for (const [name, config] of Object.entries(PII_PATTERNS)) {
           const matches = value.match(config.pattern)
           if (matches && matches.length > 0) {
-            foundInField = true
-            // Check if this is real PII (not synthetic data like @example.com)
             const realPIIMatches = name === 'email'
               ? matches.filter(m => !m.includes('@example.com') && !m.includes('@test.'))
               : name === 'phone'
@@ -709,14 +800,12 @@ export function inferSchemaFromData(tables: Record<string, Record<string, unknow
     const nullCounts: Record<string, number> = {}
     const samples: Record<string, unknown[]> = {}
 
-    // Initialize from first row
     for (const key of Object.keys(rows[0])) {
       valueSets[key] = new Set()
       nullCounts[key] = 0
       samples[key] = []
     }
 
-    // Analyze all rows
     for (const row of rows) {
       for (const [key, value] of Object.entries(row)) {
         if (!valueSets[key]) {
@@ -734,7 +823,6 @@ export function inferSchemaFromData(tables: Record<string, Record<string, unknow
       }
     }
 
-    // Infer column types and properties
     let primaryKey: string | null = null
     const foreignKeys: InferredSchema['tables'][string]['foreignKeys'] = []
     const constraints: InferredSchema['tables'][string]['constraints'] = []
@@ -753,12 +841,10 @@ export function inferSchemaFromData(tables: Record<string, Record<string, unknow
         sample: sampleValues.slice(0, 3)
       }
 
-      // Detect primary key
       if (colName === 'id' && unique) {
         primaryKey = colName
       }
 
-      // Detect foreign keys
       if (colName.endsWith('_id') && colName !== 'id') {
         const refTableName = colName.replace(/_id$/, '') + 's'
         if (tables[refTableName]) {
@@ -771,7 +857,6 @@ export function inferSchemaFromData(tables: Record<string, Record<string, unknow
       }
     }
 
-    // Add constraints
     if (primaryKey) {
       constraints.push({ type: 'PRIMARY_KEY', description: `${primaryKey} is the primary key` })
     }
@@ -793,13 +878,10 @@ export function inferSchemaFromData(tables: Record<string, Record<string, unknow
     }
   }
 
-  // Cross-table relationship detection
   for (const [tableName, tableDef] of Object.entries(result.tables)) {
     for (const fk of tableDef.foreignKeys) {
       const targetTable = result.tables[fk.references.table]
       if (targetTable) {
-        // Check if target has a reverse relationship
-        const reverseFK = targetTable.foreignKeys.find(f => f.references.table === tableName)
         if (!tableDef.relationships.find(r => r.targetTable === fk.references.table)) {
           tableDef.relationships.push({ targetTable: fk.references.table, type: 'many-to-one' })
         }
@@ -815,7 +897,6 @@ function inferTypeFromValues(values: unknown[], colName: string): string {
 
   const name = colName.toLowerCase()
 
-  // Name-based inference
   if (name.includes('email')) return 'VARCHAR(255)'
   if (name.includes('phone') || name.includes('tel')) return 'VARCHAR(20)'
   if (name === 'id') return 'INTEGER'
@@ -824,7 +905,6 @@ function inferTypeFromValues(values: unknown[], colName: string): string {
   if (name.includes('date') || name.includes('time') || name.includes('_at')) return 'TIMESTAMP'
   if (name.includes('status')) return 'VARCHAR(50)'
 
-  // Value-based inference
   const nonNullValues = values.filter(v => v !== null && v !== undefined)
   if (nonNullValues.length === 0) return 'VARCHAR(255)'
 
@@ -846,10 +926,10 @@ function inferTypeFromValues(values: unknown[], colName: string): string {
 export interface DataQualityScore {
   overall: number
   breakdown: {
-    completeness: number  // % of non-null values
-    uniqueness: number    // % of unique values where expected
-    distribution: number  // How well-distributed the data is
-    referentialIntegrity: number  // FK references are valid
+    completeness: number
+    uniqueness: number
+    distribution: number
+    referentialIntegrity: number
   }
   issues: string[]
 }
@@ -874,11 +954,11 @@ export function scoreDataQuality(
 
     tableCount++
 
-    // ─── Completeness ───
+    // Completeness
     let nullCount = 0
     let totalFields = 0
     for (const row of rows) {
-      for (const [key, value] of Object.entries(row)) {
+      for (const [, value] of Object.entries(row)) {
         totalFields++
         if (value === null || value === undefined || value === '') {
           nullCount++
@@ -891,194 +971,66 @@ export function scoreDataQuality(
       issues.push(`Table "${tableName}" has ${nullCount} null/empty values (${100 - completeness}% missing)`)
     }
 
-    // ─── Uniqueness ───
+    // Uniqueness
     const idCol = Object.keys(rows[0]).find(k => k === 'id')
     let uniqueness = 100
     if (idCol) {
-      const idValues = rows.map(r => r[idCol])
-      const uniqueIds = new Set(idValues)
-      uniqueness = Math.round((uniqueIds.size / idValues.length) * 100)
+      const ids = rows.map(r => r[idCol])
+      const uniqueIds = new Set(ids)
+      uniqueness = ids.length > 0 ? Math.round((uniqueIds.size / ids.length) * 100) : 100
       if (uniqueness < 100) {
-        issues.push(`Table "${tableName}" has duplicate IDs (${uniqueness}% unique)`)
-      }
-    } else {
-      // Check first column uniqueness as proxy
-      const firstCol = Object.keys(rows[0])[0]
-      if (firstCol) {
-        const vals = rows.map(r => String(r[firstCol]))
-        const uniqueVals = new Set(vals)
-        uniqueness = Math.round((uniqueVals.size / vals.length) * 100)
+        issues.push(`Table "${tableName}" has duplicate IDs (${ids.length - uniqueIds.size} duplicates)`)
       }
     }
     totalUniqueness += uniqueness
 
-    // ─── Distribution ───
-    let distributionScore = 100
-    for (const [colName, value] of Object.entries(rows[0])) {
-      if (typeof value === 'string') {
-        const vals = rows.map(r => r[colName]).filter(v => v !== null && v !== undefined)
-        const uniqueVals = new Set(vals.map(String))
-        // Good distribution: many unique values relative to row count
-        if (vals.length > 5 && uniqueVals.size < 2) {
-          distributionScore = Math.min(distributionScore, 40)
-          issues.push(`Column "${tableName}.${colName}" has very low distribution (${uniqueVals.size} unique values)`)
-        } else if (vals.length > 5 && uniqueVals.size / vals.length < 0.1) {
-          distributionScore = Math.min(distributionScore, 70)
-        }
-      }
+    // Distribution check
+    const statusCol = Object.keys(rows[0]).find(k => k.includes('status'))
+    let distribution = 80 // default
+    if (statusCol) {
+      const statusValues = rows.map(r => String(r[statusCol] || ''))
+      const statusCounts: Record<string, number> = {}
+      statusValues.forEach(v => { statusCounts[v] = (statusCounts[v] || 0) + 1 })
+      const uniqueStatuses = Object.keys(statusCounts).length
+      distribution = uniqueStatuses >= 2 ? Math.min(100, 70 + uniqueStatuses * 5) : 50
     }
-    totalDistribution += distributionScore
+    totalDistribution += distribution
 
-    // ─── Referential Integrity ───
+    // Referential integrity
     let riScore = 100
-    const fkCols = Object.keys(rows[0]).filter(k => k.endsWith('_id') && k !== 'id')
-    for (const fkCol of fkCols) {
-      const refTableName = fkCol.replace(/_id$/, '') + 's'
-      const refTable = tables[refTableName]
-      if (refTable) {
-        const refIds = new Set(refTable.map(r => r.id))
-        const fkValues = rows.map(r => r[fkCol]).filter(v => v !== null && v !== undefined)
-        const invalidRefs = fkValues.filter(v => !refIds.has(v))
-        if (invalidRefs.length > 0) {
-          riScore = Math.max(0, Math.round(((fkValues.length - invalidRefs.length) / fkValues.length) * 100))
-          issues.push(`FK "${tableName}.${fkCol}" has ${invalidRefs.length} invalid references to "${refTableName}"`)
+    for (const [colName, colValues] of Object.entries(rows[0])) {
+      if (colName.endsWith('_id') && colName !== 'id') {
+        const refTableName = colName.replace(/_id$/, '') + 's'
+        const refTable = tables[refTableName]
+        if (refTable) {
+          const refIds = new Set(refTable.map(r => r.id))
+          const fkValues = rows.map(r => r[colName]).filter(v => v !== null && v !== undefined)
+          const invalidFKs = fkValues.filter(v => !refIds.has(v))
+          if (invalidFKs.length > 0) {
+            riScore = Math.max(0, 100 - (invalidFKs.length * 10))
+            issues.push(`Table "${tableName}.${colName}" has ${invalidFKs.length} invalid foreign key references`)
+          }
         }
       }
     }
     totalRI += riScore
   }
 
-  if (tableCount === 0) {
-    return { overall: 0, breakdown: { completeness: 0, uniqueness: 0, distribution: 0, referentialIntegrity: 0 }, issues: ['No data tables found'] }
-  }
-
-  const completeness = Math.round(totalCompleteness / tableCount)
-  const uniqueness = Math.round(totalUniqueness / tableCount)
-  const distribution = Math.round(totalDistribution / tableCount)
-  const referentialIntegrity = Math.round(totalRI / tableCount)
-
-  const overall = Math.round((completeness * 0.3 + uniqueness * 0.2 + distribution * 0.2 + referentialIntegrity * 0.3))
+  const count = tableCount || 1
+  const avgCompleteness = Math.round(totalCompleteness / count)
+  const avgUniqueness = Math.round(totalUniqueness / count)
+  const avgDistribution = Math.round(totalDistribution / count)
+  const avgRI = Math.round(totalRI / count)
+  const overall = Math.round((avgCompleteness * 0.3 + avgUniqueness * 0.2 + avgDistribution * 0.2 + avgRI * 0.3))
 
   return {
     overall,
-    breakdown: { completeness, uniqueness, distribution, referentialIntegrity },
+    breakdown: {
+      completeness: avgCompleteness,
+      uniqueness: avgUniqueness,
+      distribution: avgDistribution,
+      referentialIntegrity: avgRI
+    },
     issues
   }
-}
-
-// ─── XML Schema Extraction ──────────────────────────────────────
-
-export function extractSchemaFromXML(xmlText: string, filename: string): Record<string, { columns: Record<string, string>; relationships?: string[] }> {
-  const tables: Record<string, { columns: Record<string, string>; relationships?: string[] }> = {}
-
-  try {
-    // Simple XML parsing - extract elements and attributes as schema
-    const elementRegex = /<(\w+)(?:\s+([^>]*))?>([\s\S]*?)<\/\1>/g
-    const attrRegex = /(\w+)="([^"]*)"/g
-    const selfClosingRegex = /<(\w+)(?:\s+([^>]*))?\/>/g
-
-    // Try to detect repeating elements as table rows
-    const elementCounts: Record<string, number> = {}
-    let match
-
-    // Count element occurrences
-    const tempRegex = /<(\w+)[\s>\/]/g
-    while ((match = tempRegex.exec(xmlText)) !== null) {
-      const tagName = match[1]
-      if (!['xml', 'schema', 'xmlns', 'type', 'element', 'attribute', 'sequence', 'complexType', 'simpleType', 'annotation', 'documentation'].includes(tagName)) {
-        elementCounts[tagName] = (elementCounts[tagName] || 0) + 1
-      }
-    }
-
-    // Elements that appear multiple times are likely table rows
-    const tableElements = Object.entries(elementCounts)
-      .filter(([_, count]) => count >= 2)
-      .map(([name]) => name)
-
-    // For each table element, extract its child elements and attributes as columns
-    for (const elementName of tableElements) {
-      const columns: Record<string, string> = {}
-      const relationships: string[] = []
-
-      // Find all instances of this element
-      const elemRegex = new RegExp(`<${elementName}(?:\\s+[^>]*)?>([\\s\\S]*?)<\\/${elementName}>`, 'g')
-      let elemMatch
-      let instanceCount = 0
-
-      while ((elemMatch = elemRegex.exec(xmlText)) !== null && instanceCount < 3) {
-        instanceCount++
-        const content = elemMatch[1]
-
-        // Extract child elements as columns
-        const childRegex = /<(\w+)(?:\s+[^>]*)?>([^<]*)<\/\1>/g
-        let childMatch
-        while ((childMatch = childRegex.exec(content)) !== null) {
-          const childName = childMatch[1]
-          const childValue = childMatch[2].trim()
-          if (!columns[childName]) {
-            columns[childName] = inferType(childValue)
-          }
-        }
-
-        // Extract attributes as columns
-        const attrs = elemMatch[0].match(attrRegex)
-        if (attrs) {
-          for (const attr of attrs) {
-            const attrMatch = attr.match(/(\w+)="([^"]*)"/)
-            if (attrMatch) {
-              const attrName = attrMatch[1]
-              if (!['xmlns', 'version', 'encoding'].includes(attrName) && !columns[attrName]) {
-                columns[attrName] = 'VARCHAR(255)'
-              }
-            }
-          }
-        }
-      }
-
-      // If no child elements found, try self-closing
-      if (Object.keys(columns).length === 0) {
-        const scRegex = new RegExp(`<${elementName}(?:\\s+([^>]*))?\\/>`, 'g')
-        let scMatch
-        while ((scMatch = scRegex.exec(xmlText)) !== null) {
-          const attrs = scMatch[1]
-          if (attrs) {
-            let attrMatch2
-            const attrRegex2 = /(\w+)="([^"]*)"/g
-            while ((attrMatch2 = attrRegex2.exec(attrs)) !== null) {
-              if (!['xmlns', 'version', 'encoding'].includes(attrMatch2[1]) && !columns[attrMatch2[1]]) {
-                columns[attrMatch2[1]] = 'VARCHAR(255)'
-              }
-            }
-          }
-        }
-      }
-
-      // Detect relationships from _id columns
-      for (const colName of Object.keys(columns)) {
-        if (colName.endsWith('_id') && colName !== 'id') {
-          const refTable = colName.replace(/_id$/, '') + 's'
-          relationships.push(`${colName} -> ${refTable}.id`)
-        }
-      }
-
-      if (Object.keys(columns).length > 0) {
-        const baseName = filename.replace(/\.xml$/i, '').replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase()
-        tables[`${baseName}_${elementName}`] = { columns, ...(relationships.length > 0 ? { relationships } : {}) }
-      }
-    }
-
-    // If no repeating elements found, try XSD-style parsing
-    if (Object.keys(tables).length === 0) {
-      const xsdElementRegex = /<xs:element\s+name="(\w+)"[^>]*>/gi
-      let xsdMatch
-      while ((xsdMatch = xsdElementRegex.exec(xmlText)) !== null) {
-        const elemName = xsdMatch[1]
-        tables[elemName] = { columns: { id: 'INTEGER' } }
-      }
-    }
-  } catch {
-    // XML parsing failed
-  }
-
-  return tables
 }

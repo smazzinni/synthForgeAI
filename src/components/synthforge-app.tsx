@@ -15,7 +15,7 @@ import {
   FileDown, ClipboardCheck, Rows3, Target, Network, StopCircle,
   WifiOff, ArrowDown, CheckCircle2, XCircle, Ban, HelpCircle,
   AlignLeft, Terminal, ZoomIn, ZoomOut, Maximize2, Move,
-  GitFork, Sitemap, Search, AlertTriangle, ListOrdered,
+  GitFork, Search, AlertTriangle, ListOrdered,
   Wrench, Bug, CheckCheck, Clock3, Bot, Cpu
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -1061,6 +1061,36 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
 
   const removeFile = useCallback((index: number) => {
     setAttachedFiles(prev => prev.filter((_, i) => i !== index))
+  }, [])
+
+  // ─── Drag & Drop handlers for chat panel ───────────
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragOver(true)
+  }, [])
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragOver(false)
+  }, [])
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragOver(false)
+    const files = Array.from(e.dataTransfer.files)
+    files.forEach(file => {
+      const reader = new FileReader()
+      reader.onload = (ev) => {
+        const content = ev.target?.result as string
+        const ext = file.name.split('.').pop()?.toLowerCase() || ''
+        const type = ext === 'sql' ? 'sql' : ext === 'csv' ? 'csv' : ext === 'json' ? 'json' : ext === 'xml' ? 'xml' : 'text'
+        setAttachedFiles(prev => [...prev, { name: file.name, content, type }])
+      }
+      reader.readAsText(file)
+    })
   }, [])
 
   const createDatabase = async () => {

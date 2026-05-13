@@ -47,7 +47,7 @@ Important:
     const cost = estimateCost(response.tokensIn, response.tokensOut)
 
     // Parse the response
-    let parsed = null
+    let parsed: { tables?: Record<string, unknown[]>; action?: string; explanation?: string } | null = null
     try {
       const jsonMatch = response.content.match(/\{[\s\S]*\}/)
       if (jsonMatch) parsed = JSON.parse(jsonMatch[0])

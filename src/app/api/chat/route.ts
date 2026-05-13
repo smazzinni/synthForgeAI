@@ -1,23 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { chatCompletion, chatCompletionStream, estimateCost, parseAgentResponse, getSystemPrompt, detectPII, scoreDataQuality, inferSchemaFromData, type AgentStep } from '@/lib/ai'
+import { chatCompletion, chatCompletionStream, estimateCost, parseAgentResponse, getSystemPrompt, getSubagentPrompt, detectPII, scoreDataQuality, inferSchemaFromData, type AgentStep, type PIIDetectionResult, type DataQualityScore } from '@/lib/ai'
 
 export const maxDuration = 90
-
-// ─── Specialized subagent system prompts ────────────────────────
-const SCHEMA_AGENT_PROMPT = `You are the SynthForge AI Schema Agent. Design a database schema based on the user's request. Return a JSON object with the schema plan including tables, columns, types, and relationships. Use the standard SynthForge AI response format with action "generate".`
-
-const DATA_AGENT_PROMPT = `You are the SynthForge AI Data Generation Agent. Generate realistic synthetic data based on the provided schema and context. Return a JSON object with the generated tables. Use the standard SynthForge AI response format with action "generate". All data must be synthetic and privacy-safe. Maintain referential integrity. Generate at least 5-10 rows per table.`
-
-const QUALITY_AGENT_PROMPT = `You are the SynthForge AI Quality Agent. Review the generated data for quality issues: null values in important fields, duplicate IDs, orphan foreign keys, type mismatches, and data anomalies. If you find issues, suggest fixes and regenerate corrected data. Return a JSON object with action "generate" containing any corrected tables. If no issues, return the data unchanged.`
-
-function getSubagentPrompt(agentName: string): string {
-  if (agentName.includes('schema')) return SCHEMA_AGENT_PROMPT
-  if (agentName.includes('data')) return DATA_AGENT_PROMPT
-  if (agentName.includes('quality')) return QUALITY_AGENT_PROMPT
-  // Default: use the main auto-mode prompt
-  return getSystemPrompt('auto')
-}
 
 // POST /api/chat - Send message and get AI response
 export async function POST(request: NextRequest) {
@@ -51,7 +36,6 @@ export async function POST(request: NextRequest) {
       : null
 
     if (!conversation && databaseId) {
-      // Find a valid workspaceId if not provided
       let validWorkspaceId = workspaceId
       if (!validWorkspaceId) {
         const firstWorkspace = await db.workspace.findFirst()
@@ -123,7 +107,6 @@ export async function POST(request: NextRequest) {
         maxTokens: 8192
       })
 
-      // We need to process the stream, save the complete response, then pass it through
       const conversationId_ = conversation.id
       const databaseId_ = conversation.databaseId
       const dbRef = database
@@ -173,6 +156,12 @@ export async function POST(request: NextRequest) {
                       const agentSteps: AgentStep[] = parsed.steps
                       let accumulatedContext = fullContent
                       let allTables: Record<string, Record<string, unknown>[]> = {}
+                      let allReasoningSteps: Array<{ type: string; label: string; description: string; status: string; output?: string }> = []
+
+                      // Add initial reasoning from orchestrator
+                      if (parsed.reasoningSteps) {
+                        allReasoningSteps.push(...parsed.reasoningSteps)
+                      }
 
                       // Emit initial step plan
                       for (let i = 0; i < agentSteps.length; i++) {
@@ -196,17 +185,35 @@ export async function POST(request: NextRequest) {
 
                         try {
                           const subagentPrompt = getSubagentPrompt(step.agent)
+
+                          // Build context-aware messages for the subagent
+                          const subagentMessages = [
+                            { role: 'system' as const, content: subagentPrompt },
+                            { role: 'user' as const, content: `Task: ${step.task}\n\nPrevious context:\n${accumulatedContext.slice(-4000)}${schemaContext ? '\n\nDatabase Schema:\n' + schemaContext : ''}` }
+                          ]
+
                           const stepResponse = await chatCompletion({
-                            messages: [
-                              { role: 'system', content: subagentPrompt },
-                              { role: 'user', content: `Task: ${step.task}\n\nPrevious context:\n${accumulatedContext.slice(-3000)}` }
-                            ],
+                            messages: subagentMessages,
                             temperature: 0.7,
                             maxTokens: 4096
                           })
 
                           const stepParsed = parseAgentResponse(stepResponse.content)
                           const stepOutput = stepParsed?.explanation || stepResponse.content.slice(0, 200)
+
+                          // Collect reasoning steps from this agent
+                          if (stepParsed?.reasoningSteps) {
+                            allReasoningSteps.push(...stepParsed.reasoningSteps)
+                          } else {
+                            // Add generic reasoning for this step
+                            allReasoningSteps.push({
+                              type: 'execution',
+                              label: `${step.agent} - ${step.task.slice(0, 50)}`,
+                              description: step.task,
+                              status: 'completed',
+                              output: stepOutput
+                            })
+                          }
 
                           // Accumulate tables from this step
                           if (stepParsed?.tables) {
@@ -219,7 +226,8 @@ export async function POST(request: NextRequest) {
                             data: {
                               stepIndex: i, agent: step.agent, task: step.task,
                               status: 'completed', output: stepOutput,
-                              tables: stepParsed?.tables ? Object.keys(stepParsed.tables) : []
+                              tables: stepParsed?.tables ? Object.keys(stepParsed.tables) : [],
+                              reasoningSteps: stepParsed?.reasoningSteps || []
                             }
                           })}\n\n`))
 
@@ -232,6 +240,13 @@ export async function POST(request: NextRequest) {
                             type: 'agent_step',
                             data: { stepIndex: i, agent: step.agent, task: step.task, status: 'failed', output: stepErrMsg }
                           })}\n\n`))
+                          allReasoningSteps.push({
+                            type: 'execution',
+                            label: `${step.agent} - Failed`,
+                            description: step.task,
+                            status: 'failed',
+                            output: stepErrMsg
+                          })
                         }
                       }
 
@@ -243,7 +258,7 @@ export async function POST(request: NextRequest) {
                           explanation: parsed.explanation + '\n\nAll pipeline steps completed successfully.',
                           tables: allTables,
                           steps: agentSteps.map((s, idx) => ({ ...s, status: 'completed' })),
-                          reasoningSteps: parsed.reasoningSteps || []
+                          reasoningSteps: allReasoningSteps
                         })
                         fullContent = finalContent
 
@@ -267,8 +282,8 @@ export async function POST(request: NextRequest) {
                   const tablesJson = finalParsed?.tables ? JSON.stringify(finalParsed.tables) : '{}'
 
                   // Run PII detection and quality scoring on generated data
-                  let piiResult = null
-                  let qualityScore = null
+                  let piiResult: ReturnType<typeof detectPII> | null = null
+                  let qualityScore: ReturnType<typeof scoreDataQuality> | null = null
                   if (finalParsed?.tables && Object.keys(finalParsed.tables).length > 0) {
                     try {
                       piiResult = detectPII(finalParsed.tables)
@@ -277,7 +292,6 @@ export async function POST(request: NextRequest) {
                   }
 
                   // Save assistant message and update database in background (non-blocking)
-                  // Use fire-and-forget with proper .catch() to prevent unhandled rejections
                   const savePromise = (async () => {
                     try {
                       await db.message.create({
@@ -343,7 +357,6 @@ export async function POST(request: NextRequest) {
                       console.error('[Chat API Stream] Error saving message:', err)
                     }
                   })()
-                  // Prevent unhandled rejection
                   savePromise.catch(() => {})
                 }
               } catch { /* not valid JSON, skip */ }
@@ -447,7 +460,6 @@ export async function POST(request: NextRequest) {
         })
       } catch (dbError) {
         console.error('[Chat API] Error updating database:', dbError)
-        // Non-fatal - continue to return response
       }
     }
 
@@ -489,7 +501,6 @@ export async function GET(request: NextRequest) {
     const conversationId = request.nextUrl.searchParams.get('conversationId')
     const databaseId = request.nextUrl.searchParams.get('databaseId')
 
-    // If databaseId provided, find the latest conversation for that database
     if (!conversationId && databaseId) {
       const latestConversation = await db.conversation.findFirst({
         where: { databaseId },
