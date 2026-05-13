@@ -1,6 +1,6 @@
 # SynthForge AI — Feature Tracking
 
-> Last Updated: 2025-03-05
+> Last Updated: 2026-05-14
 > Status Legend: ✅ Implemented | 🚧 In Progress | 📋 Planned | ❌ Not Started
 
 ---
@@ -9,11 +9,11 @@
 
 | Status | Count |
 |--------|-------|
-| ✅ Implemented | 30 |
+| ✅ Implemented | 31 |
 | 🚧 In Progress | 3 |
 | 📋 Planned | 19 |
 | ❌ Not Started | 8 |
-| **Total** | **60** |
+| **Total** | **61** |
 
 ---
 
@@ -81,6 +81,7 @@
 | A-12 | Streaming Chat (SSE) | ✅ | P0 | Real-time streaming with reasoning, content, agent_step, done, and error event types | TransformStream pipeline |
 | A-13 | Reasoning Steps Display | ✅ | P1 | Live display of AI reasoning during generation (intent, domain detection, constraint planning, etc.) | Timeline component with status indicators |
 | A-14 | Clarification Options | ✅ | P0 | Selectable options in chat for volume, modules, constraints | Multi-choice with descriptions |
+| A-22 | Dynamic AI-Generated Questions | ✅ | P0 | Questions and options are dynamically crafted by AI based on domain research, not hardcoded templates | Context-aware volume, module, and constraint options per domain |
 | A-15 | Agent Pipeline Display | ✅ | P1 | Real-time agent step progress shown in chat during "AI Thinking..." | Step status: pending/running/completed/failed |
 | A-16 | Agent Mode Selector | ✅ | P1 | Switch between plan, execute, and auto modes | Affects pipeline step planning |
 | A-17 | Multi-Step Execution | ✅ | P0 | Complex requests route through multiple agents sequentially | Orchestrator detects multi_step action and chains agents |
@@ -336,17 +337,17 @@ SSE streaming is fully implemented. Agent dashboard is partially built. WebSocke
 
 | Metric | Value |
 |--------|-------|
-| Total Features | 60 |
-| Implemented | 30 (50%) |
+| Total Features | 61 |
+| Implemented | 31 (51%) |
 | In Progress | 3 (5%) |
-| Planned | 19 (32%) |
+| Planned | 19 (31%) |
 | Not Started | 8 (13%) |
 | Core Platform Completion | 100% |
 | AI/Agent System Completion | 100% |
 | Data & Quality Completion | 100% |
 | Enterprise Completion | 7% |
 | Infrastructure Completion | 15% |
-| **Overall Completion** | **55%** |
+| **Overall Completion** | **56%** |
 
 ---
 
@@ -354,6 +355,7 @@ SSE streaming is fully implemented. Agent dashboard is partially built. WebSocke
 
 | Date | Milestone |
 |------|-----------|
+| 2026-05-14 | Dynamic AI-generated questions: replaced hardcoded option templates with context-aware domain-research-driven questions |
 | 2025-03-05 | Feature tracking document created |
 | 2025-03-04 | Multi-agent pipeline with orchestrator fully operational |
 | 2025-03-03 | Heartbeat monitor and message bus implemented |
