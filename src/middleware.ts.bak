@@ -1,0 +1,81 @@
+import { NextRequest, NextResponse } from 'next/server'
+
+// Public pages that don't require authentication
+const PUBLIC_PAGES = [
+  '/',
+  '/pricing',
+  '/about',
+  '/contact',
+  '/login',
+  '/signup',
+  '/forgot-password',
+]
+
+// Public API routes
+const PUBLIC_API_ROUTES = [
+  '/api/auth/login',
+  '/api/auth/register',
+  '/api/auth/logout',
+  '/api/auth/session',
+  '/api/auth/setup-demo',
+  '/api/health',
+]
+
+export async function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl
+
+  // Allow static files and Next.js internals
+  if (
+    pathname.startsWith('/_next/') ||
+    pathname.startsWith('/favicon') ||
+    pathname.includes('.')
+  ) {
+    return NextResponse.next()
+  }
+
+  // Allow public pages
+  if (PUBLIC_PAGES.includes(pathname)) {
+    return NextResponse.next()
+  }
+
+  // Allow auth callback
+  if (pathname.startsWith('/auth/callback')) {
+    return NextResponse.next()
+  }
+
+  // Allow public API routes
+  if (PUBLIC_API_ROUTES.some(route => pathname === route)) {
+    return NextResponse.next()
+  }
+
+  // For API routes, check for auth credentials
+  if (pathname.startsWith('/api/')) {
+    const cookieHeader = request.headers.get('cookie') || ''
+    const hasAccessToken = cookieHeader.includes('sb-access-token=')
+    const hasAuthHeader = request.headers.get('authorization')?.startsWith('Bearer ')
+    const hasUserIdHeader = request.headers.get('x-user-id')
+
+    if (hasAccessToken || hasAuthHeader || hasUserIdHeader) {
+      return NextResponse.next()
+    }
+
+    // If auth is not enabled, allow through
+    if (process.env.NEXT_PUBLIC_AUTH_ENABLED !== 'true') {
+      return NextResponse.next()
+    }
+
+    return NextResponse.json(
+      { error: 'Authentication required', code: 'UNAUTHORIZED' },
+      { status: 401 }
+    )
+  }
+
+  // For dashboard pages, let client-side handle the redirect
+  return NextResponse.next()
+}
+
+export const config = {
+  matcher: [
+    '/((?!_next/static|_next/image|favicon\\.ico).*)',
+  ],
+}

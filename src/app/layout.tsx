@@ -1,8 +1,9 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import { ThemeProvider } from "@/components/theme-provider";
+import { AuthProvider } from "@/hooks/use-auth";
+import { Toaster } from "@/components/ui/sonner";
 import "./globals.css";
-import { Toaster } from "@/components/ui/toaster";
-import { ErrorBoundary } from "@/components/error-boundary";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -15,12 +16,16 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "SynthForge AI - Synthetic Data Generation Platform",
-  description: "AI-powered synthetic data generation platform. Create realistic, privacy-safe data from scratch.",
+  title: "SynthForge AI - AI-Powered Synthetic Data Generation",
+  description:
+    "Create realistic, privacy-safe synthetic data from scratch. Powered by multi-agent AI with schema design, quality assurance, and real-time collaboration.",
+  keywords: ["synthetic data", "AI", "data generation", "privacy", "testing", "development"],
   icons: {
     icon: [
       { url: "/favicon.ico", sizes: "32x32" },
-      { url: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>" },
+      {
+        url: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>",
+      },
     ],
   },
 };
@@ -35,10 +40,17 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground overflow-x-hidden`}
       >
-        <ErrorBoundary>
-          {children}
-        </ErrorBoundary>
-        <Toaster />
+        <ThemeProvider
+          attribute="class"
+          defaultTheme="system"
+          enableSystem
+          disableTransitionOnChange
+        >
+          <AuthProvider>
+            {children}
+          </AuthProvider>
+          <Toaster />
+        </ThemeProvider>
       </body>
     </html>
   );

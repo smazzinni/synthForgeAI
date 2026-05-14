@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "private": true,
   "scripts": {
-    "dev": "next dev -p 3000 --webpack",
+    "dev": "NODE_OPTIONS='--max-old-space-size=4096' next dev -p 3000 --webpack",
     "build": "next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/",
     "start": "NODE_OPTIONS='--max-old-space-size=4096' next start -p 3000",
     "lint": "eslint .",
@@ -63,6 +63,7 @@
     "next-auth": "^4.24.11",
     "next-intl": "^4.3.4",
     "next-themes": "^0.4.6",
+    "pg": "^8.20.0",
     "prisma": "6.11.1",
     "react": "^19.0.0",
     "react-day-picker": "^9.8.0",

@@ -1,35 +1,33 @@
-import { NextRequest, NextResponse } from 'next/server'
-import { requireAuth, isAuthEnabled } from '@/lib/supabase'
+import { NextResponse } from 'next/server'
+import { getSupabaseServerClient } from '@/lib/supabase/server'
 
-export async function GET(request: NextRequest) {
+export async function GET() {
   try {
-    // If auth is disabled (dev mode), return dev user
-    if (!isAuthEnabled()) {
-      return NextResponse.json({
-        authenticated: true,
-        devMode: true,
-        user: {
-          id: 'dev',
-          email: 'dev@synthforge.ai',
-          name: 'Dev User',
-          tenantId: 'dev-tenant',
-          role: 'admin',
-        },
-      })
+    const supabase = await getSupabaseServerClient()
+    const { data: { user } } = await supabase.auth.getUser()
+
+    if (!user) {
+      return NextResponse.json({ user: null, authenticated: false })
     }
 
-    const user = await requireAuth(request)
     return NextResponse.json({
-      authenticated: true,
       user: {
-        id: user.userId,
+        id: user.id,
         email: user.email,
-        name: user.name,
-        tenantId: user.tenantId,
-        role: user.role,
+        full_name: user.user_metadata?.full_name,
       },
+      authenticated: true,
     })
   } catch {
-    return NextResponse.json({ authenticated: false, user: null }, { status: 200 })
+    // Dev mode fallback
+    return NextResponse.json({
+      user: {
+        id: 'dev-user-id',
+        email: 'demo@synthforge.ai',
+        full_name: 'Demo User',
+      },
+      authenticated: true,
+      dev: true,
+    })
   }
 }
