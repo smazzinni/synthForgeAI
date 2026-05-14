@@ -1,6 +1,10 @@
+import Link from 'next/link'
 import { Navbar } from '@/components/layout/navbar'
 import { Footer } from '@/components/layout/footer'
-import Link from 'next/link'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { CheckCircle2, ArrowRight } from 'lucide-react'
 
 const plans = [
   {
@@ -8,14 +12,7 @@ const plans = [
     price: '$0',
     period: '/month',
     description: 'Perfect for exploring synthetic data generation',
-    features: [
-      '3 databases',
-      '1,000 rows per database',
-      'Basic schema generation',
-      'JSON/CSV export',
-      'Community support',
-      '1 workspace',
-    ],
+    features: ['3 databases', '1,000 rows per database', 'Basic schema generation', 'JSON/CSV export', 'Community support'],
     cta: 'Get Started',
     popular: false,
   },
@@ -24,15 +21,7 @@ const plans = [
     price: '$49',
     period: '/month',
     description: 'For teams building production applications',
-    features: [
-      'Unlimited databases',
-      '100,000 rows per database',
-      'Multi-agent AI pipeline',
-      'All export formats',
-      'Priority email support',
-      'Team collaboration (up to 10)',
-      'API access',
-    ],
+    features: ['Unlimited databases', '100,000 rows per database', 'Multi-agent pipeline', 'All export formats', 'Priority support', 'Team collaboration', 'API access'],
     cta: 'Start Free Trial',
     popular: true,
   },
@@ -40,107 +29,81 @@ const plans = [
     name: 'Enterprise',
     price: 'Custom',
     period: '',
-    description: 'For organizations with advanced requirements',
-    features: [
-      'Unlimited everything',
-      'Custom row limits',
-      'Dedicated AI agents',
-      'SLA guarantee (99.9%)',
-      'SSO/SAML authentication',
-      'Custom integrations',
-      'Dedicated support engineer',
-    ],
+    description: 'For organizations with advanced needs',
+    features: ['Unlimited everything', 'Custom data generation', 'Dedicated AI agents', 'SLA guarantee', 'SSO/SAML', 'Custom integrations', 'Dedicated support'],
     cta: 'Contact Sales',
     popular: false,
   },
-]
-
-const faqs = [
-  { q: 'Can I switch plans anytime?', a: 'Yes, you can upgrade or downgrade your plan at any time. Changes take effect immediately, and we\'ll prorate any charges.' },
-  { q: 'Is there a free trial for Pro?', a: 'Yes! The Pro plan comes with a 14-day free trial. No credit card required to start.' },
-  { q: 'What counts as a database?', a: 'A database is a collection of related tables with generated synthetic data. Each database can contain multiple tables and relationships.' },
-  { q: 'Can I use the data commercially?', a: 'Yes. All generated synthetic data is fully yours to use for any purpose, including commercial applications, testing, and analytics.' },
 ]
 
 export default function PricingPage() {
   return (
     <div className="min-h-screen flex flex-col">
       <Navbar />
-      <main className="flex-1">
-        <section className="py-20">
-          <div className="container mx-auto px-4">
-            <div className="text-center max-w-2xl mx-auto mb-16">
-              <span className="inline-block border rounded-md px-3 py-1 text-sm mb-4">Pricing</span>
-              <h1 className="text-3xl md:text-5xl font-bold mb-4">
-                Simple, Transparent Pricing
-              </h1>
-              <p className="text-muted-foreground text-lg">
-                Start free, scale as you grow. No hidden fees, no surprises. Cancel anytime.
-              </p>
-            </div>
+      <section className="py-20 md:py-28">
+        <div className="container mx-auto px-4 md:px-6">
+          <div className="text-center max-w-2xl mx-auto mb-16">
+            <Badge variant="outline" className="mb-4">Pricing</Badge>
+            <h1 className="text-3xl md:text-4xl font-bold tracking-tight mb-4">
+              Simple, Transparent Pricing
+            </h1>
+            <p className="text-muted-foreground text-lg">
+              Start free, scale as you grow. No hidden fees, no surprises.
+            </p>
+          </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 max-w-5xl mx-auto">
-              {plans.map((plan) => (
-                <div
-                  key={plan.name}
-                  className={`rounded-lg border p-6 ${
-                    plan.popular ? 'border-amber-500 border-2' : ''
-                  }`}
-                >
-                  {plan.popular && (
-                    <div className="text-center mb-2">
-                      <span className="bg-amber-600 text-white text-xs font-medium px-2 py-1 rounded">
-                        Most Popular
-                      </span>
-                    </div>
-                  )}
-                  <div className="text-center mb-4">
-                    <h2 className="text-xl font-bold">{plan.name}</h2>
-                    <div className="mt-3">
-                      <span className="text-4xl font-bold">{plan.price}</span>
-                      <span className="text-muted-foreground">{plan.period}</span>
-                    </div>
-                    <p className="text-muted-foreground mt-2 text-sm">{plan.description}</p>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6 max-w-5xl mx-auto">
+            {plans.map((plan) => (
+              <Card
+                key={plan.name}
+                className={`relative ${
+                  plan.popular
+                    ? 'border-amber-500 border-2 shadow-lg shadow-amber-500/10'
+                    : 'border-border/50'
+                }`}
+              >
+                {plan.popular && (
+                  <div className="absolute -top-3 left-1/2 -translate-x-1/2">
+                    <Badge className="bg-gradient-to-r from-amber-600 to-red-600 text-white border-0">
+                      Most Popular
+                    </Badge>
                   </div>
-                  <ul className="space-y-2 mb-6">
+                )}
+                <CardHeader className="text-center pb-2">
+                  <CardTitle className="text-xl">{plan.name}</CardTitle>
+                  <div className="mt-4">
+                    <span className="text-4xl font-bold">{plan.price}</span>
+                    <span className="text-muted-foreground">{plan.period}</span>
+                  </div>
+                  <CardDescription className="mt-2">{plan.description}</CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <ul className="space-y-3 mb-6">
                     {plan.features.map((feature) => (
                       <li key={feature} className="flex items-center gap-2 text-sm">
-                        <span className="text-emerald-500">✓</span>
+                        <CheckCircle2 className="h-4 w-4 text-emerald-500 shrink-0" />
                         {feature}
                       </li>
                     ))}
                   </ul>
-                  <Link
-                    href={plan.name === 'Enterprise' ? '/contact' : '/signup'}
-                    className={`block w-full text-center py-2 px-4 rounded-md text-sm font-medium ${
+                  <Button
+                    className={`w-full ${
                       plan.popular
-                        ? 'bg-amber-600 text-white hover:bg-amber-700'
-                        : 'border hover:bg-accent'
+                        ? 'bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white'
+                        : ''
                     }`}
+                    variant={plan.popular ? 'default' : 'outline'}
+                    asChild
                   >
-                    {plan.cta}
-                  </Link>
-                </div>
-              ))}
-            </div>
-
-            <div className="max-w-3xl mx-auto mt-20">
-              <h2 className="text-2xl font-bold text-center mb-8">Frequently Asked Questions</h2>
-              <div className="space-y-6">
-                {faqs.map((faq) => (
-                  <div key={faq.q}>
-                    <h3 className="font-semibold mb-2">{faq.q}</h3>
-                    <p className="text-muted-foreground">{faq.a}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
+                    <Link href={plan.name === 'Enterprise' ? '/contact' : '/signup'}>{plan.cta}</Link>
+                  </Button>
+                </CardContent>
+              </Card>
+            ))}
           </div>
-        </section>
-      </main>
-      <div className="mt-auto">
-        <Footer />
-      </div>
+        </div>
+      </section>
+      <div className="mt-auto"><Footer /></div>
     </div>
   )
 }

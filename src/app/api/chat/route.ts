@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from 'next/server'
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { message } = body
+    const { message, databaseId, databaseName } = body
 
     if (!message || typeof message !== 'string') {
       return NextResponse.json({ error: 'Message is required' }, { status: 400 })
@@ -13,38 +13,59 @@ export async function POST(request: NextRequest) {
     const ZAI = (await import('z-ai-web-dev-sdk')).default
     const zai = await ZAI.create()
 
-    const systemPrompt = `You are SynthForge AI, an expert synthetic data generation assistant. You help users design database schemas and generate realistic synthetic data.
+    const contextInfo = databaseId
+      ? `\n\nThe user is currently editing database "${databaseName || databaseId}" (ID: ${databaseId}). Help them modify or extend the existing data.`
+      : ''
+
+    const systemPrompt = `You are SynthForge AI, an expert synthetic data generation assistant. You help users design database schemas and generate realistic synthetic data.${contextInfo}
 
 When users describe their data needs:
 1. Understand their requirements (tables, relationships, constraints, volume)
 2. Design an appropriate database schema
-3. Suggest data generation strategies
+3. Generate realistic sample data (5-10 rows per table)
 4. Ensure privacy compliance and data quality
 
-Be concise, technical, and helpful. If they ask you to generate data, describe the schema you'd create and provide sample data in a structured JSON format like:
+IMPORTANT: When generating data, you MUST respond with a JSON code block in this exact format:
+\`\`\`json
 {
   "tables": {
     "table_name": [
       {"column1": "value1", "column2": "value2"},
-      ...
+      {"column2": "value1", "column2": "value2"}
     ]
   }
 }
+\`\`\`
+
+Rules for data generation:
+- Use realistic values (real-looking names, emails, addresses, phone numbers)
+- Use proper data types (numbers for quantities, ISO dates for timestamps, UUIDs for IDs)
+- Include foreign key relationships between tables where appropriate
+- Generate 5-10 rows per table
+- Always include an "id" column as UUID for each table
+- Include timestamps (created_at) as ISO 8601 strings
+
+You can explain your design decisions before the JSON block, but always include the JSON code block with the actual data.
+Do NOT include "thinking" tags or internal reasoning in your response.
 
 Current agent: Orchestrator`
 
-    // Use non-streaming response for stability
     const completion = await zai.chat.completions.create({
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: message },
       ],
       temperature: 0.7,
-      max_tokens: 2000,
+      max_tokens: 3000,
       stream: false,
     })
 
-    const content = completion.choices?.[0]?.message?.content || 'I apologize, I could not generate a response.'
+    let content = completion.choices?.[0]?.message?.content || 'I apologize, I could not generate a response.'
+
+    // Clean up any <think|thinking> tags from the AI response
+    content = content.replace(/<think[\s\S]*?<\/think>/gi, '')
+    content = content.replace(/<thinking[\s\S]*?<\/thinking>/gi, '')
+    content = content.trim()
 
     return NextResponse.json({
       content,

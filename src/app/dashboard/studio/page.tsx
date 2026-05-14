@@ -16,12 +16,13 @@ import {
   Sparkles,
   Copy,
   Download,
+  Save,
   Bot,
   User,
   CheckCircle2,
-  AlertCircle,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import { useAuth } from '@/hooks/use-auth'
 
 interface Message {
   id: string
@@ -43,13 +44,23 @@ interface SchemaTable {
   columns: { name: string; type: string }[]
 }
 
-export default function StudioPage() {
+interface StudioPageProps {
+  databaseId?: string
+  initialName?: string
+  initialSchema?: SchemaTable[]
+  initialData?: Record<string, unknown[]>
+}
+
+export default function StudioPage({ databaseId, initialName, initialSchema, initialData }: StudioPageProps) {
+  const { user } = useAuth()
   const [chatState, setChatState] = useState<ChatState>({
     messages: [
       {
         id: '1',
         role: 'assistant',
-        content: 'Welcome to SynthForge AI Studio! I can help you generate synthetic data. Describe the database you need, and I\'ll design the schema, generate realistic data, and ensure quality compliance.\n\nFor example, try: "Generate an e-commerce database with users, orders, and products"',
+        content: databaseId
+          ? `You're editing database "${initialName || databaseId}". Describe changes or ask me to add more data.`
+          : 'Welcome to SynthForge AI Studio! I can help you generate synthetic data. Describe the database you need, and I\'ll design the schema, generate realistic data, and ensure quality compliance.\n\nFor example, try: "Generate an e-commerce database with users, orders, and products"',
         agentName: 'Orchestrator',
         timestamp: new Date(),
       },
@@ -58,8 +69,10 @@ export default function StudioPage() {
     currentAgent: null,
   })
   const [input, setInput] = useState('')
-  const [generatedSchema, setGeneratedSchema] = useState<SchemaTable[]>([])
-  const [generatedData, setGeneratedData] = useState<Record<string, unknown[]>>({})
+  const [generatedSchema, setGeneratedSchema] = useState<SchemaTable[]>(initialSchema || [])
+  const [generatedData, setGeneratedData] = useState<Record<string, unknown[]>>(initialData || {})
+  const [saving, setSaving] = useState(false)
+  const [databaseName, setDatabaseName] = useState(initialName || '')
   const scrollRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -69,42 +82,61 @@ export default function StudioPage() {
   // Try to parse schema/data from assistant message content
   const tryParseResponse = useCallback((content: string) => {
     try {
-      const jsonMatch = content.match(/\{[\s\S]*\}/)
-      if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0])
+      // Look for a JSON block in the response - try code blocks first, then raw JSON
+      const codeBlockMatch = content.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/)
+      const jsonStr = codeBlockMatch ? codeBlockMatch[1] : null
 
-        // Extract schema
-        if (parsed.tables) {
-          const schema: SchemaTable[] = []
-          for (const [tableName, tableData] of Object.entries(parsed.tables)) {
-            const rows = tableData as Record<string, unknown>[]
-            if (Array.isArray(rows) && rows.length > 0) {
-              const columns = Object.keys(rows[0]).map(key => {
-                const val = rows[0][key]
-                let type = 'varchar(255)'
-                if (typeof val === 'number') type = Number.isInteger(val) ? 'integer' : 'decimal'
-                else if (typeof val === 'boolean') type = 'boolean'
-                else if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}/.test(val)) type = 'timestamp'
-                else if (key === 'id' || key.endsWith('_id')) type = 'uuid'
-                return { name: key, type }
-              })
-              schema.push({ name: tableName, columns })
-            }
-          }
-          if (schema.length > 0) setGeneratedSchema(schema)
-        }
+      let parsed: { tables?: Record<string, unknown[]> } | null = null
 
-        // Extract data
-        if (parsed.tables) {
-          const data: Record<string, unknown[]> = {}
-          for (const [tableName, tableData] of Object.entries(parsed.tables)) {
-            if (Array.isArray(tableData)) {
-              data[tableName] = tableData
-            }
-          }
-          if (Object.keys(data).length > 0) setGeneratedData(data)
+      if (jsonStr) {
+        try {
+          parsed = JSON.parse(jsonStr)
+        } catch {
+          // Code block wasn't valid JSON, try the whole content
         }
       }
+
+      if (!parsed) {
+        // Try to find a JSON object in the content
+        const jsonMatch = content.match(/\{[\s\S]*\}/)
+        if (jsonMatch) {
+          try {
+            parsed = JSON.parse(jsonMatch[0])
+          } catch {
+            return // Not parseable JSON
+          }
+        }
+      }
+
+      if (!parsed || !parsed.tables) return
+
+      // Extract schema from tables
+      const schema: SchemaTable[] = []
+      for (const [tableName, tableData] of Object.entries(parsed.tables)) {
+        const rows = tableData as Record<string, unknown>[]
+        if (Array.isArray(rows) && rows.length > 0) {
+          const columns = Object.keys(rows[0]).map(key => {
+            const val = rows[0][key]
+            let type = 'varchar(255)'
+            if (typeof val === 'number') type = Number.isInteger(val) ? 'integer' : 'decimal'
+            else if (typeof val === 'boolean') type = 'boolean'
+            else if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}/.test(val)) type = 'timestamp'
+            else if (key === 'id' || key.endsWith('_id')) type = 'uuid'
+            return { name: key, type }
+          })
+          schema.push({ name: tableName, columns })
+        }
+      }
+      if (schema.length > 0) setGeneratedSchema(schema)
+
+      // Extract data from tables
+      const data: Record<string, unknown[]> = {}
+      for (const [tableName, tableData] of Object.entries(parsed.tables)) {
+        if (Array.isArray(tableData)) {
+          data[tableName] = tableData
+        }
+      }
+      if (Object.keys(data).length > 0) setGeneratedData(data)
     } catch {
       // Not JSON or couldn't parse - that's fine
     }
@@ -134,7 +166,10 @@ export default function StudioPage() {
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: userMessage.content }),
+        body: JSON.stringify({
+          message: userMessage.content,
+          ...(databaseId ? { databaseId, databaseName } : {}),
+        }),
       })
 
       if (!response.ok) throw new Error('Failed to get response')
@@ -159,7 +194,6 @@ export default function StudioPage() {
       // Try to extract schema/data from the response
       tryParseResponse(assistantMessage.content)
     } catch {
-      // Error - show error message in chat
       const errorMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
@@ -174,7 +208,7 @@ export default function StudioPage() {
         currentAgent: null,
       }))
     }
-  }, [input, chatState.loading, tryParseResponse])
+  }, [input, chatState.loading, tryParseResponse, databaseId, databaseName])
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -196,6 +230,53 @@ export default function StudioPage() {
     a.download = filename
     a.click()
     URL.revokeObjectURL(url)
+  }
+
+  // Save the generated data as a database in Supabase
+  const saveToDatabase = async () => {
+    if (!hasGeneratedData) {
+      toast.error('No data to save. Generate some data first.')
+      return
+    }
+
+    const name = databaseName || generatedSchema[0]?.name || 'Untitled Database'
+    setSaving(true)
+
+    try {
+      let totalRows = 0
+      for (const rows of Object.values(generatedData)) {
+        totalRows += rows.length
+      }
+
+      const body = {
+        name,
+        db_type: 'postgresql',
+        schema_json: generatedSchema,
+        data_json: generatedData,
+        row_count: totalRows,
+        quality_score: 0.85,
+        status: 'ready',
+        ...(databaseId ? { id: databaseId } : {}),
+      }
+
+      const res = await fetch('/api/databases', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}))
+        throw new Error(errData.error || 'Failed to save database')
+      }
+
+      const result = await res.json()
+      toast.success(databaseId ? 'Database updated successfully!' : 'Database saved successfully!')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to save database')
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
@@ -297,24 +378,42 @@ export default function StudioPage() {
       <div className="hidden md:flex flex-col w-1/2">
         {hasGeneratedData ? (
           <Tabs defaultValue="schema" className="flex flex-col h-full">
-            <div className="p-4 border-b">
-              <TabsList className="w-full">
-                <TabsTrigger value="schema" className="flex-1">
-                  <Database className="h-4 w-4 mr-2" />
+            <div className="p-4 border-b flex items-center justify-between">
+              <TabsList>
+                <TabsTrigger value="schema" className="gap-1.5">
+                  <Database className="h-3.5 w-3.5" />
                   Schema
                 </TabsTrigger>
-                <TabsTrigger value="data" className="flex-1">
-                  <Table2 className="h-4 w-4 mr-2" />
+                <TabsTrigger value="data" className="gap-1.5">
+                  <Table2 className="h-3.5 w-3.5" />
                   Data
                 </TabsTrigger>
-                <TabsTrigger value="quality" className="flex-1">
-                  <Shield className="h-4 w-4 mr-2" />
+                <TabsTrigger value="quality" className="gap-1.5">
+                  <Shield className="h-3.5 w-3.5" />
                   Quality
                 </TabsTrigger>
               </TabsList>
+              <Button
+                onClick={saveToDatabase}
+                disabled={saving}
+                size="sm"
+                className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white"
+              >
+                {saving ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Save className="mr-1.5 h-3.5 w-3.5" />}
+                Save to DB
+              </Button>
             </div>
 
             <TabsContent value="schema" className="flex-1 overflow-auto m-0 p-4">
+              {/* Database Name Input */}
+              <div className="mb-4">
+                <Input
+                  value={databaseName}
+                  onChange={(e) => setDatabaseName(e.target.value)}
+                  placeholder="Database name..."
+                  className="font-medium"
+                />
+              </div>
               <div className="space-y-4">
                 {generatedSchema.map((table) => (
                   <Card key={table.name}>

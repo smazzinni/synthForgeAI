@@ -9,6 +9,10 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ databases: [] })
     }
 
+    // Check if a specific database ID was requested
+    const { searchParams } = new URL(request.url)
+    const id = searchParams.get('id')
+
     // Get the authenticated user to filter databases
     let userId: string | null = null
     try {
@@ -17,7 +21,25 @@ export async function GET(request: NextRequest) {
       userId = user?.id || null
     } catch { /* continue without user filter */ }
 
-    // Try to fetch databases from Supabase
+    // If requesting a specific database by ID
+    if (id) {
+      let query = admin
+        .from('synthetic_databases')
+        .select('*')
+        .eq('id', id)
+        .single()
+
+      const { data, error } = await query
+
+      if (error) {
+        console.warn('[Databases API] Query error:', error.message)
+        return NextResponse.json({ database: null })
+      }
+
+      return NextResponse.json({ database: data })
+    }
+
+    // List all databases
     let query = admin
       .from('synthetic_databases')
       .select('*')
@@ -46,7 +68,7 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { name, db_type = 'postgresql', schema_json = [], data_json = {} } = body
+    const { name, db_type = 'postgresql', schema_json = [], data_json = {}, row_count = 0, quality_score = null, status = 'draft' } = body
 
     if (!name) {
       return NextResponse.json(
@@ -71,11 +93,11 @@ export async function POST(request: NextRequest) {
     const insertData: Record<string, unknown> = {
       name,
       db_type,
-      status: 'draft',
+      status,
       schema_json,
       data_json,
-      row_count: 0,
-      quality_score: null,
+      row_count: row_count || 0,
+      quality_score,
       ...(userId ? { user_id: userId } : {}),
     }
 

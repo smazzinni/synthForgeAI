@@ -18,13 +18,12 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next()
   }
 
-  // Only refresh session cookies for dashboard and auth pages
-  // Do NOT redirect - let client-side auth handle redirects
-  // This prevents the redirect loop between middleware and client-side auth
-  const isAuthPage = pathname.startsWith('/login') || pathname.startsWith('/signup') || pathname.startsWith('/forgot-password')
+  // Only refresh session cookies for dashboard pages
+  // Auth pages (login, signup, forgot-password) don't need middleware processing
+  // because the client-side AuthProvider already handles redirect logic
   const isDashboardPage = pathname.startsWith('/dashboard')
 
-  if (!isAuthPage && !isDashboardPage) {
+  if (!isDashboardPage) {
     return NextResponse.next()
   }
 
@@ -47,7 +46,7 @@ export async function middleware(request: NextRequest) {
         },
         setAll(cookiesToSet) {
           try {
-            cookiesToSet.forEach(({ name, value, options }) =>
+            cookiesToSet.forEach(({ name, value }) =>
               request.cookies.set(name, value)
             )
             cookiesToSet.forEach(({ name, value, options }) =>

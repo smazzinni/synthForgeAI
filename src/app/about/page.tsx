@@ -1,78 +1,59 @@
+import Link from 'next/link'
 import { Navbar } from '@/components/layout/navbar'
 import { Footer } from '@/components/layout/footer'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { Zap, Brain, Shield, Workflow, ArrowRight } from 'lucide-react'
 
 const values = [
-  { title: 'Privacy First', description: 'We believe in generating data that protects real people. Every dataset we create is fully synthetic and contains no real PII, ensuring compliance with global privacy regulations.' },
-  { title: 'Quality Over Quantity', description: 'We measure success by the quality of our synthetic data, not just the volume. Our multi-agent pipeline ensures every generated dataset meets the highest standards.' },
-  { title: 'Developer Experience', description: 'We build tools that developers love to use. From natural language conversations to one-click exports, every interaction is designed to be intuitive and efficient.' },
-  { title: 'Open & Accessible', description: 'We democratize access to high-quality synthetic data. Whether you\'re a solo developer or a large enterprise, our platform scales to meet your needs.' },
-]
-
-const team = [
-  { name: 'Alex Chen', role: 'CEO & Co-founder', bio: 'Former ML engineer at Google. Passionate about making AI accessible for data generation.' },
-  { name: 'Sarah Johnson', role: 'CTO & Co-founder', bio: 'Built data platforms at Stripe. Expert in distributed systems and privacy-preserving technologies.' },
-  { name: 'Michael Park', role: 'Head of AI', bio: 'PhD in NLP from Stanford. Leads our multi-agent research and development efforts.' },
-  { name: 'Emma Wilson', role: 'Head of Product', bio: 'Previously product lead at Figma. Focused on creating delightful developer experiences.' },
+  { icon: Brain, title: 'AI-First', description: 'We believe synthetic data generation should be intelligent, automated, and accessible to everyone through natural language interfaces.' },
+  { icon: Shield, title: 'Privacy by Design', description: 'Every feature we build starts with privacy in mind. Our synthetic data contains zero real PII, ensuring compliance by default.' },
+  { icon: Workflow, title: 'Developer Experience', description: 'From API design to UI interactions, we obsess over making the developer experience smooth, intuitive, and productive.' },
 ]
 
 export default function AboutPage() {
   return (
     <div className="min-h-screen flex flex-col">
       <Navbar />
-      <main className="flex-1">
-        <section className="py-20">
-          <div className="container mx-auto px-4">
-            <div className="max-w-3xl mx-auto text-center">
-              <span className="inline-block border rounded-md px-3 py-1 text-sm mb-4">About Us</span>
-              <h1 className="text-3xl md:text-5xl font-bold mb-6">
-                Building the Future of{' '}
-                <span className="text-amber-600">Synthetic Data</span>
-              </h1>
-              <p className="text-lg text-muted-foreground">
-                SynthForge AI was founded with a clear mission: make high-quality synthetic data accessible to every developer and organization. We believe that privacy-safe data generation should be simple, intelligent, and production-ready.
-              </p>
-            </div>
-          </div>
-        </section>
+      <section className="py-20 md:py-28">
+        <div className="container mx-auto px-4 md:px-6 max-w-4xl">
+          <Badge variant="outline" className="mb-4">About Us</Badge>
+          <h1 className="text-4xl md:text-5xl font-bold tracking-tight mb-6">
+            Building the future of{' '}
+            <span className="bg-gradient-to-r from-amber-600 to-red-600 bg-clip-text text-transparent">
+              synthetic data
+            </span>
+          </h1>
+          <p className="text-lg text-muted-foreground mb-12 leading-relaxed">
+            SynthForge AI was born from a simple observation: developers and data teams spend too much time
+            creating test data manually or wrestling with privacy concerns around real data. We built a platform
+            where you describe what you need in plain English, and our multi-agent AI pipeline generates
+            production-quality, privacy-safe synthetic data in minutes.
+          </p>
 
-        <section className="py-16 bg-muted/30">
-          <div className="container mx-auto px-4">
-            <h2 className="text-2xl md:text-3xl font-bold text-center mb-12">Our Values</h2>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 max-w-4xl mx-auto">
-              {values.map((value) => (
-                <div key={value.title} className="rounded-lg border p-6">
-                  <h3 className="text-lg font-bold mb-2">{value.title}</h3>
-                  <p className="text-muted-foreground">{value.description}</p>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-8 mb-16">
+            {values.map((value) => (
+              <div key={value.title} className="text-center">
+                <div className="h-12 w-12 rounded-xl bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center mx-auto mb-4">
+                  <value.icon className="h-6 w-6 text-white" />
                 </div>
-              ))}
-            </div>
+                <h3 className="text-lg font-semibold mb-2">{value.title}</h3>
+                <p className="text-sm text-muted-foreground">{value.description}</p>
+              </div>
+            ))}
           </div>
-        </section>
 
-        <section className="py-16">
-          <div className="container mx-auto px-4">
-            <h2 className="text-2xl md:text-3xl font-bold text-center mb-4">Our Team</h2>
-            <p className="text-muted-foreground text-center mb-12 max-w-xl mx-auto">
-              A team of engineers, researchers, and designers passionate about AI and data privacy.
-            </p>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 max-w-5xl mx-auto">
-              {team.map((member) => (
-                <div key={member.name} className="rounded-lg border p-6 text-center">
-                  <div className="h-12 w-12 rounded-full bg-amber-500 flex items-center justify-center mx-auto mb-3 text-white font-bold">
-                    {member.name.split(' ').map(n => n[0]).join('')}
-                  </div>
-                  <h3 className="font-semibold">{member.name}</h3>
-                  <p className="text-sm text-amber-600 mb-2">{member.role}</p>
-                  <p className="text-sm text-muted-foreground">{member.bio}</p>
-                </div>
-              ))}
-            </div>
+          <div className="text-center bg-gradient-to-br from-amber-500/10 via-red-500/5 to-amber-500/10 dark:from-amber-500/5 dark:via-red-500/2 dark:to-amber-500/5 p-12 rounded-2xl border border-amber-200/50 dark:border-amber-800/30">
+            <Zap className="h-10 w-10 text-amber-600 mx-auto mb-4" />
+            <h2 className="text-2xl font-bold mb-3">Ready to get started?</h2>
+            <p className="text-muted-foreground mb-6">Start generating synthetic data for free today.</p>
+            <Button asChild className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white">
+              <Link href="/signup">Get Started Free <ArrowRight className="ml-2 h-4 w-4" /></Link>
+            </Button>
           </div>
-        </section>
-      </main>
-      <div className="mt-auto">
-        <Footer />
-      </div>
+        </div>
+      </section>
+      <div className="mt-auto"><Footer /></div>
     </div>
   )
 }
