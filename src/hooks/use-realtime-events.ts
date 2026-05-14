@@ -30,6 +30,9 @@ interface RealtimeEvent {
  * Hook for subscribing to real-time server-sent events (SSE).
  * This provides WebSocket-like functionality using HTTP streaming,
  * compatible with Next.js API routes.
+ *
+ * CRITICAL FIX: Uses refs for callbacks to prevent infinite reconnection loops
+ * caused by unstable callback references in the dependency array.
  */
 export function useRealtimeEvents(options: UseRealtimeEventsOptions = {}) {
   const {
@@ -48,18 +51,47 @@ export function useRealtimeEvents(options: UseRealtimeEventsOptions = {}) {
   const abortRef = useRef<AbortController | null>(null)
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
+  // Use refs for callbacks to prevent reconnection loops when callbacks change
+  const onAgentStepRef = useRef(onAgentStep)
+  const onAgentReasoningRef = useRef(onAgentReasoning)
+  const onDataChunkRef = useRef(onDataChunk)
+  const onDataCompleteRef = useRef(onDataComplete)
+  const onPipelineProgressRef = useRef(onPipelineProgress)
+
+  // Update refs when callbacks change (without triggering reconnect)
+  useEffect(() => {
+    onAgentStepRef.current = onAgentStep
+    onAgentReasoningRef.current = onAgentReasoning
+    onDataChunkRef.current = onDataChunk
+    onDataCompleteRef.current = onDataComplete
+    onPipelineProgressRef.current = onPipelineProgress
+  }, [onAgentStep, onAgentReasoning, onDataChunk, onDataComplete, onPipelineProgress])
+
+  const disconnect = useCallback(() => {
+    if (abortRef.current) {
+      abortRef.current.abort()
+      abortRef.current = null
+    }
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current)
+      reconnectTimerRef.current = null
+    }
+    setIsConnected(false)
+  }, [])
+
   const connect = useCallback(() => {
     if (!target || !autoConnect) return
 
     // Disconnect existing connection
-    if (abortRef.current) {
-      abortRef.current.abort()
-    }
+    disconnect()
 
     const controller = new AbortController()
     abortRef.current = controller
 
     const connectSSE = async () => {
+      // Don't attempt if aborted
+      if (controller.signal.aborted) return
+
       try {
         const response = await fetch(`/api/events?target=${encodeURIComponent(target)}&since=${Date.now()}`, {
           signal: controller.signal,
@@ -67,8 +99,10 @@ export function useRealtimeEvents(options: UseRealtimeEventsOptions = {}) {
         })
 
         if (!response.ok || !response.body) {
-          // Schedule reconnect
-          reconnectTimerRef.current = setTimeout(connectSSE, 3000)
+          // Only schedule reconnect if not aborted and autoConnect is still true
+          if (!controller.signal.aborted && autoConnect) {
+            reconnectTimerRef.current = setTimeout(connectSSE, 5000) // Increased from 3s to 5s
+          }
           return
         }
 
@@ -100,22 +134,22 @@ export function useRealtimeEvents(options: UseRealtimeEventsOptions = {}) {
               setLastEvent(event)
               setEventCount(prev => prev + 1)
 
-              // Route to appropriate callback
+              // Route to appropriate callback using refs (stable references)
               switch (event.type) {
                 case 'agent:step':
-                  onAgentStep?.(event.data as any)
+                  onAgentStepRef.current?.(event.data as any)
                   break
                 case 'agent:reasoning':
-                  onAgentReasoning?.(event.data as any)
+                  onAgentReasoningRef.current?.(event.data as any)
                   break
                 case 'data:chunk':
-                  onDataChunk?.(event.data as any)
+                  onDataChunkRef.current?.(event.data as any)
                   break
                 case 'data:complete':
-                  onDataComplete?.(event.data as any)
+                  onDataCompleteRef.current?.(event.data as any)
                   break
                 case 'pipeline:progress':
-                  onPipelineProgress?.(event.data as any)
+                  onPipelineProgressRef.current?.(event.data as any)
                   break
               }
             } catch {
@@ -125,34 +159,22 @@ export function useRealtimeEvents(options: UseRealtimeEventsOptions = {}) {
         }
 
         setIsConnected(false)
-        // Auto-reconnect after connection closes
+        // Auto-reconnect after connection closes (with longer delay to prevent loops)
         if (autoConnect && !controller.signal.aborted) {
-          reconnectTimerRef.current = setTimeout(connectSSE, 2000)
+          reconnectTimerRef.current = setTimeout(connectSSE, 5000) // Increased from 2s to 5s
         }
       } catch (err) {
         setIsConnected(false)
         if (err instanceof DOMException && err.name === 'AbortError') return
-        // Auto-reconnect on error
-        if (autoConnect) {
-          reconnectTimerRef.current = setTimeout(connectSSE, 5000)
+        // Auto-reconnect on error (with longer delay)
+        if (autoConnect && !controller.signal.aborted) {
+          reconnectTimerRef.current = setTimeout(connectSSE, 10000) // Increased from 5s to 10s
         }
       }
     }
 
     connectSSE()
-  }, [target, autoConnect, onAgentStep, onAgentReasoning, onDataChunk, onDataComplete, onPipelineProgress])
-
-  const disconnect = useCallback(() => {
-    if (abortRef.current) {
-      abortRef.current.abort()
-      abortRef.current = null
-    }
-    if (reconnectTimerRef.current) {
-      clearTimeout(reconnectTimerRef.current)
-      reconnectTimerRef.current = null
-    }
-    setIsConnected(false)
-  }, [])
+  }, [target, autoConnect, disconnect]) // Removed callback deps - they're in refs now
 
   // Auto-connect when target changes
   useEffect(() => {

@@ -141,16 +141,15 @@ const DataWorkspacePanel = React.memo(function DataWorkspacePanel({
 
       </TabsList>
 
-      <TabsContent value="preview" className="flex-1 overflow-auto mt-0">
+      <TabsContent value="preview" className="flex-1 overflow-hidden mt-0">
         <div className="flex h-full">
           <div className="w-48 shrink-0 border-r bg-muted/20 overflow-y-auto">
             <div className="p-2">
               <TableTreeView tableNames={Object.keys(allTables)} tableRowCounts={Object.fromEntries(Object.entries(allTables).map(([k, v]) => [k, v.length]))} selectedTable={selectedTableName} onSelectTable={setSelectedTableName} />
             </div>
           </div>
-          <div className="flex-1 overflow-x-auto overflow-y-auto">
-            <ScrollArea className="h-full">
-              <div className="p-4 space-y-4">
+          <div className="flex-1 overflow-auto">
+            <div className="p-4 space-y-4 min-w-0">
                 {isLoading && Object.keys(allTables).length === 0 ? (
                   <div className="space-y-4">{[1, 2].map(i => <Card key={i}><CardHeader className="pb-2"><div className="flex items-center justify-between"><Skeleton className="h-4 w-24" /><Skeleton className="h-5 w-14" /></div></CardHeader><CardContent><div className="space-y-2"><div className="flex gap-4">{[1, 2, 3, 4].map(j => <Skeleton key={j} className="h-3 w-16" />)}</div>{[1, 2, 3, 4, 5].map(j => <div key={j} className="flex gap-4">{[1, 2, 3, 4].map(k => <Skeleton key={k} className="h-3 w-20" />)}</div>)}</div></CardContent></Card>)}</div>
                 ) : selectedTableName && allTables[selectedTableName] ? (
@@ -203,7 +202,6 @@ const DataWorkspacePanel = React.memo(function DataWorkspacePanel({
                   </motion.div>
                 )}
               </div>
-            </ScrollArea>
           </div>
         </div>
       </TabsContent>

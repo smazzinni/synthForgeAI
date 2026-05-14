@@ -98,6 +98,17 @@ class EventBroadcaster {
       }
     }
   }
+
+  /**
+   * Get stats about active rooms and listeners
+   */
+  getStats(): { rooms: number; totalEvents: number; totalListeners: number } {
+    let totalEvents = 0
+    let totalListeners = 0
+    for (const events of this.events.values()) totalEvents += events.length
+    for (const listeners of this.listeners.values()) totalListeners += listeners.size
+    return { rooms: this.events.size, totalEvents, totalListeners }
+  }
 }
 
 // Singleton broadcaster
@@ -108,7 +119,8 @@ if (typeof setInterval !== 'undefined') {
   setInterval(() => eventBroadcaster.cleanup(), 300_000)
 }
 
-// Helper functions for common event types
+// ─── Helper functions for common event types ────────────────────────
+
 export function broadcastAgentStep(conversationId: string, data: {
   stepIndex: number; agent: string; task: string; status: string; output?: string
 }) {
@@ -148,6 +160,22 @@ export function broadcastPipelineProgress(conversationId: string, data: {
 }) {
   eventBroadcaster.broadcast(`conv:${conversationId}`, {
     type: 'pipeline:progress',
+    data: data as Record<string, unknown>
+  })
+}
+
+export function broadcastChatTyping(conversationId: string, isTyping: boolean) {
+  eventBroadcaster.broadcast(`conv:${conversationId}`, {
+    type: 'chat:typing',
+    data: { isTyping }
+  })
+}
+
+export function broadcastQualityCheck(databaseId: string, data: {
+  status: string; score?: number; issues?: number
+}) {
+  eventBroadcaster.broadcast(`db:${databaseId}`, {
+    type: 'quality:check',
     data: data as Record<string, unknown>
   })
 }

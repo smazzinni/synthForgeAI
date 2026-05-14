@@ -9,7 +9,7 @@ import {
   Code2, FileJson, FileText, Plus, X, Check,
   Loader2, Hash, Play, Brain, Wand2, AlertCircle, Circle,
   RefreshCw, Shield, Gauge, Ban, StopCircle,
-  CheckCircle2, XCircle, ScrollArea
+  CheckCircle2, XCircle
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -537,8 +537,8 @@ export const ChatMessages = React.memo(function ChatMessages({
             />
           ))}
 
-          {/* Loading Indicator */}
-          {isLoading && !messages.some(m => m.isStreaming) && (
+          {/* Loading Indicator - only show if no streaming message already visible */}
+          {isLoading && !messages.some(m => m.isStreaming || m.generationStatus === 'thinking') && (
             <motion.div
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}

@@ -186,8 +186,8 @@ export const ChatPanel = React.memo(function ChatPanel({
             />
           ))}
 
-          {/* Loading Indicator */}
-          {isLoading && !messages.some(m => m.isStreaming) && (
+          {/* Loading Indicator - only show if no streaming message already displaying thinking state */}
+          {isLoading && !messages.some(m => m.isStreaming || m.generationStatus === 'thinking') && (
             <motion.div
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}

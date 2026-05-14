@@ -131,3 +131,31 @@ Stage Summary:
 - All previously reported issues verified as fixed
 - Pipeline step limit added to prevent 502s
 - Dev server starts successfully with webpack mode
+---
+Task ID: 1
+Agent: main
+Task: Fix root cause of 502/500/Turbopack errors and implement bug fixes
+
+Work Log:
+- Identified ROOT CAUSE: use-realtime-events.ts had unstable callback references in dependency array causing infinite reconnection loops → server overload → 502s
+- Fixed use-realtime-events.ts: Used refs for callbacks to prevent reconnection loops, increased reconnect delays
+- Fixed next.config.ts: Added CORS headers for __nextjs internal routes and static assets
+- Fixed duplicate "thinking" display in chat-message-bubble.tsx: Removed redundant ReasoningTimeline during generation phase, added proper "Generating" indicator
+- Fixed duplicate "thinking" in chat-panel.tsx: Changed loading indicator condition to check for streaming messages
+- Fixed duplicate "thinking" in chat-messages.tsx: Same fix as chat-panel
+- Fixed ScrollArea import error in chat-messages.tsx (was importing from lucide-react instead of UI component)
+- Fixed data table horizontal scrolling: Removed wrapping ScrollArea, used overflow-auto on parent container
+- Added proper favicon configuration in layout.tsx
+- Improved ZAI SDK initialization with deduplication and retry support
+- Enhanced WebSocket infrastructure: Added connection limits, cleanup, new event types
+- Implemented I-02 WebSocket Updates: Enhanced SSE events API with connection limiting, new broadcast helpers
+- Implemented I-04/I-05/I-06 Agent features: Updated AgentResponse type, parseAgentResponse, auto-agent multi-step templates
+- Updated AgentBadge and AgentPipeline components with new agent type icons/colors
+- Verified TypeScript compilation: No errors in src/ directory
+
+Stage Summary:
+- ROOT CAUSE of 502s fixed: use-realtime-events.ts infinite reconnection loop
+- All duplicate "thinking" displays fixed across 3 files
+- Horizontal scrolling fixed for data tables
+- I-02/I-04/I-05/I-06 agent features implemented
+- NOTE: Turbopack build fails due to @tailwindcss/postcss Bus Error in container environment (not code-related)

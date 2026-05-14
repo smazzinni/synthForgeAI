@@ -18,7 +18,10 @@ export const metadata: Metadata = {
   title: "SynthForge AI - Synthetic Data Generation Platform",
   description: "AI-powered synthetic data generation platform. Create realistic, privacy-safe data from scratch.",
   icons: {
-    icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>",
+    icon: [
+      { url: "/favicon.ico", sizes: "32x32" },
+      { url: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>" },
+    ],
   },
 };
 

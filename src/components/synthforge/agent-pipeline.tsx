@@ -4,7 +4,7 @@ import React, { useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   Brain, Database, CheckCheck, Bot, Check, Loader2, XCircle, Clock3, Cpu,
-  ChevronDown, ChevronRight, Eye, Wand2, Shield
+  ChevronDown, ChevronRight, Eye, Wand2, Shield, Gauge, FileEdit, ArrowLeftRight, Search
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
@@ -19,31 +19,46 @@ export const AgentPipeline = React.memo(function AgentPipeline({ steps }: { step
   const allCompleted = completedCount === steps.length
 
   const getAgentIcon = (agentName: string) => {
+    if (agentName.includes('discovery')) return <Search className="h-3.5 w-3.5 text-purple-600" />
     if (agentName.includes('schema')) return <Brain className="h-3.5 w-3.5 text-purple-600" />
     if (agentName.includes('data')) return <Database className="h-3.5 w-3.5 text-blue-600" />
     if (agentName.includes('quality')) return <Shield className="h-3.5 w-3.5 text-green-600" />
+    if (agentName.includes('validation')) return <Shield className="h-3.5 w-3.5 text-indigo-600" />
     if (agentName.includes('plan')) return <Eye className="h-3.5 w-3.5 text-sky-600" />
     if (agentName.includes('exec')) return <Wand2 className="h-3.5 w-3.5 text-amber-600" />
+    if (agentName.includes('optimization')) return <Gauge className="h-3.5 w-3.5 text-orange-600" />
+    if (agentName.includes('prompt-engineering') || agentName.includes('prompt_engineering')) return <FileEdit className="h-3.5 w-3.5 text-pink-600" />
+    if (agentName.includes('transform')) return <ArrowLeftRight className="h-3.5 w-3.5 text-cyan-600" />
     if (agentName.includes('orchestrat')) return <Cpu className="h-3.5 w-3.5 text-indigo-600" />
     return <Bot className="h-3.5 w-3.5 text-slate-600" />
   }
 
   const getAgentColor = (agentName: string) => {
+    if (agentName.includes('discovery')) return 'border-purple-200 bg-purple-50'
     if (agentName.includes('schema')) return 'border-purple-200 bg-purple-50'
     if (agentName.includes('data')) return 'border-blue-200 bg-blue-50'
     if (agentName.includes('quality')) return 'border-green-200 bg-green-50'
+    if (agentName.includes('validation')) return 'border-indigo-200 bg-indigo-50'
     if (agentName.includes('plan')) return 'border-sky-200 bg-sky-50'
     if (agentName.includes('exec')) return 'border-amber-200 bg-amber-50'
+    if (agentName.includes('optimization')) return 'border-orange-200 bg-orange-50'
+    if (agentName.includes('prompt-engineering') || agentName.includes('prompt_engineering')) return 'border-pink-200 bg-pink-50'
+    if (agentName.includes('transform')) return 'border-cyan-200 bg-cyan-50'
     if (agentName.includes('orchestrat')) return 'border-indigo-200 bg-indigo-50'
     return 'border-slate-200 bg-slate-50'
   }
 
   const getAgentBadgeColor = (agentName: string) => {
+    if (agentName.includes('discovery')) return 'bg-purple-100 text-purple-800 border-purple-200'
     if (agentName.includes('schema')) return 'bg-purple-100 text-purple-800 border-purple-200'
     if (agentName.includes('data')) return 'bg-blue-100 text-blue-800 border-blue-200'
     if (agentName.includes('quality')) return 'bg-green-100 text-green-800 border-green-200'
+    if (agentName.includes('validation')) return 'bg-indigo-100 text-indigo-800 border-indigo-200'
     if (agentName.includes('plan')) return 'bg-sky-100 text-sky-800 border-sky-200'
     if (agentName.includes('exec')) return 'bg-amber-100 text-amber-800 border-amber-200'
+    if (agentName.includes('optimization')) return 'bg-orange-100 text-orange-800 border-orange-200'
+    if (agentName.includes('prompt-engineering') || agentName.includes('prompt_engineering')) return 'bg-pink-100 text-pink-800 border-pink-200'
+    if (agentName.includes('transform')) return 'bg-cyan-100 text-cyan-800 border-cyan-200'
     if (agentName.includes('orchestrat')) return 'bg-indigo-100 text-indigo-800 border-indigo-200'
     return 'bg-slate-100 text-slate-800 border-slate-200'
   }

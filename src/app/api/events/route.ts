@@ -7,6 +7,10 @@ import { eventBroadcaster } from '@/lib/websocket'
 
 export const dynamic = 'force-dynamic'
 
+// Track active connections to prevent connection flooding
+const activeConnections = new Map<string, number>()
+const MAX_CONNECTIONS_PER_TARGET = 3
+
 // GET /api/events?target=conv:xxx&since=0 - SSE stream for real-time updates
 export async function GET(request: NextRequest) {
   const target = request.nextUrl.searchParams.get('target')
@@ -18,6 +22,16 @@ export async function GET(request: NextRequest) {
       headers: { 'Content-Type': 'application/json' }
     })
   }
+
+  // Connection limit per target to prevent flooding
+  const currentCount = activeConnections.get(target) || 0
+  if (currentCount >= MAX_CONNECTIONS_PER_TARGET) {
+    return new Response(JSON.stringify({ error: 'Too many connections for this target' }), {
+      status: 429,
+      headers: { 'Content-Type': 'application/json' }
+    })
+  }
+  activeConnections.set(target, currentCount + 1)
 
   // Create a readable stream that emits SSE events
   const encoder = new TextEncoder()
@@ -57,16 +71,24 @@ export async function GET(request: NextRequest) {
         }
       })
 
-      // Clean up on close
-      // Note: SSE connections will time out after maxDuration
+      // Clean up on close - 55 second max SSE connection (within 60s serverless limit)
       setTimeout(() => {
         if (!streamClosed) {
           streamClosed = true
           unsubscribe()
           clearInterval(heartbeatInterval)
+          // Decrement connection count
+          const count = activeConnections.get(target) || 1
+          activeConnections.set(target, Math.max(0, count - 1))
           try { controller.close() } catch { /* */ }
         }
-      }, 55_000) // 55 second max SSE connection (within 60s serverless limit)
+      }, 55_000)
+    },
+    cancel() {
+      streamClosed = true
+      // Decrement connection count
+      const count = activeConnections.get(target) || 1
+      activeConnections.set(target, Math.max(0, count - 1))
     }
   })
 

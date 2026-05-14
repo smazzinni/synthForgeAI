@@ -45,7 +45,7 @@ export interface AgentStep {
 }
 
 export interface AgentResponse {
-  action: 'generate' | 'modify' | 'clarify' | 'plan' | 'execute' | 'validate' | 'evolve' | 'multi_step' | 'preview' | 'discovery'
+  action: 'generate' | 'modify' | 'clarify' | 'plan' | 'execute' | 'validate' | 'evolve' | 'multi_step' | 'preview' | 'discovery' | 'optimize' | 'transform' | 'prompt_engineering'
   agentName: string
   explanation: string
   tables?: Record<string, Record<string, unknown>[]>
@@ -56,6 +56,10 @@ export interface AgentResponse {
   followUpQuestions?: string[]
   steps?: AgentStep[]
   previewTables?: Record<string, Record<string, unknown>[]>
+  optimizedSchema?: Record<string, unknown>
+  transformedData?: Record<string, Record<string, unknown>[]>
+  migrationScript?: string
+  refinedPrompt?: string
 }
 
 // ─── Agent System Prompts ──────────────────────────────────────────
@@ -453,6 +457,27 @@ RESPONSE FORMATS
   "reasoningSteps": [<your reasoning>]
 }
 
+OPTIONAL AGENTS (include when relevant):
+- optimization-agent: Include when the user wants cost/performance optimization, or when generating large datasets (100+ rows)
+- prompt-engineering-agent: Include when the user's request is vague or ambiguous, to refine the prompt before generation
+- transform-agent: Include when the user wants to transform existing data between schemas, migrate data, or convert formats
+
+Example with optimization:
+"steps": [
+  {"agent": "discovery-agent", "task": "Gather requirements", "status": "pending"},
+  {"agent": "optimization-agent", "task": "Optimize generation strategy for cost and performance", "status": "pending"},
+  {"agent": "schema-agent", "task": "Design optimized schema", "status": "pending"},
+  {"agent": "data-agent", "task": "Generate data with optimized approach", "status": "pending"},
+  {"agent": "validation-agent", "task": "Validate and verify", "status": "pending"}
+]
+
+Example with transform:
+"steps": [
+  {"agent": "discovery-agent", "task": "Understand source and target schemas", "status": "pending"},
+  {"agent": "transform-agent", "task": "Map fields and transform data", "status": "pending"},
+  {"agent": "validation-agent", "task": "Validate transformed data integrity", "status": "pending"}
+]
+
 For simple single-step requests (just generate data with all details provided, just add a table), continue using the "generate" action directly.`
 
 // ─── Subagent Prompts (used in multi-step pipeline) ───────────
@@ -808,17 +833,28 @@ Respond with transformation results:
 // ─── Core API Functions using z-ai-web-dev-sdk ──────────────────
 
 let zaiInstance: ZAI | null = null
+let zaiInitPromise: Promise<ZAI> | null = null
 
 async function getZAI(): Promise<ZAI> {
-  if (!zaiInstance) {
+  if (zaiInstance) return zaiInstance
+  
+  // Deduplicate concurrent initialization calls
+  if (zaiInitPromise) return zaiInitPromise
+  
+  zaiInitPromise = (async () => {
     try {
-      zaiInstance = await ZAI.create()
+      const instance = await ZAI.create()
+      zaiInstance = instance
+      return instance
     } catch (err) {
+      // Reset so we can retry
+      zaiInitPromise = null
       console.error('[SynthForge AI] Failed to initialize ZAI SDK:', err)
       throw err
     }
-  }
-  return zaiInstance
+  })()
+  
+  return zaiInitPromise
 }
 
 export async function chatCompletion(request: ChatRequest): Promise<ChatResponse> {
@@ -892,7 +928,11 @@ export function parseAgentResponse(content: string): AgentResponse | null {
         options: parsed.options || undefined,
         followUpQuestions: parsed.followUpQuestions || undefined,
         steps: parsed.steps || undefined,
-        previewTables: parsed.previewTables || undefined
+        previewTables: parsed.previewTables || undefined,
+        optimizedSchema: parsed.optimizedSchema || undefined,
+        transformedData: parsed.transformedData || undefined,
+        migrationScript: parsed.migrationScript || undefined,
+        refinedPrompt: parsed.refinedPrompt || undefined
       }
     }
   } catch {

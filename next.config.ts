@@ -10,7 +10,16 @@ const nextConfig: NextConfig = {
   async headers() {
     return [
       {
+        // Match all __nextjs internal routes (dev overlay, fonts, stack frames)
         source: '/__nextjs(.*)',
+        headers: [
+          { key: 'Access-Control-Allow-Origin', value: '*' },
+          { key: 'Access-Control-Allow-Methods', value: 'GET, OPTIONS' },
+        ],
+      },
+      {
+        // Match Next.js font optimization routes
+        source: '/_next/static/:path*',
         headers: [
           { key: 'Access-Control-Allow-Origin', value: '*' },
         ],

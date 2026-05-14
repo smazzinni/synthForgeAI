@@ -180,7 +180,7 @@ export const ChatMessageBubble = React.memo(function ChatMessageBubble({
 
         {msg.isStreaming && !msg.content ? (
           <div className="space-y-2">
-            {/* Live reasoning steps while thinking - auto-expanded (replaces duplicate "Thinking" text) */}
+            {/* Live reasoning steps while thinking - auto-expanded */}
             {parsedSteps.length > 0 ? (
               <div className="mt-1">
                 <ReasoningTimeline steps={parsedSteps} msgId={msg.id} autoOpen={true} />
@@ -191,18 +191,21 @@ export const ChatMessageBubble = React.memo(function ChatMessageBubble({
                 <span>Thinking<AnimatedDots /></span>
               </div>
             )}
+            {/* Show agent pipeline during multi-step execution */}
+            {agentSteps.length > 0 && <AgentPipeline steps={agentSteps} />}
           </div>
         ) : (
           <>
-            {renderAssistantContent(msg.content)}
-            {/* Live reasoning steps during generation - auto-expanded */}
-            {msg.isStreaming && parsedSteps.length > 0 && (
-              <div className="mt-1">
-                <ReasoningTimeline steps={parsedSteps} msgId={msg.id} autoOpen={true} />
-              </div>
-            )}
+            {msg.content && renderAssistantContent(msg.content)}
             {/* Show agent pipeline during multi-step execution */}
             {msg.isStreaming && agentSteps.length > 0 && <AgentPipeline steps={agentSteps} />}
+            {/* Show generating indicator when streaming with content but no reasoning steps visible */}
+            {msg.isStreaming && !msg.isCancelled && (
+              <div className="flex items-center gap-1.5 text-xs text-muted-foreground mt-1">
+                <Loader2 className="h-3 w-3 animate-spin text-amber-600" />
+                <span>Generating<AnimatedDots /></span>
+              </div>
+            )}
             {msg.isCancelled && msg.content && (
               <div className="mt-2 pt-1.5 border-t border-border/50 flex items-center gap-1.5 text-xs text-muted-foreground">
                 <Ban className="h-3 w-3" />
