@@ -5,8 +5,8 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: true,
   },
   reactStrictMode: false,
-  output: 'standalone',
-  allowedDevOrigins: ['.space-z.ai', '.space-chatglm.site', 'localhost'],
+  // output: 'standalone', // Disabled - use `next start` for production
+  allowedDevOrigins: ['.space-z.ai', '.space-chatglm.site', 'localhost', '127.0.0.1'],
   async headers() {
     return [
       {
