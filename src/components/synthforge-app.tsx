@@ -313,9 +313,24 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
 
             if (event.type === 'content') {
               fullContent += event.data
-              setMessages(prev => prev.map(m =>
-                m.id === streamId ? { ...m, content: fullContent, generationStatus: 'generating' as const } : m
-              ))
+
+              // Try to parse partial content for progressive data display
+              try {
+                const partialParsed = parseFullContent(fullContent)
+                if (partialParsed.tablesJson && partialParsed.tablesJson !== '{}') {
+                  setMessages(prev => prev.map(m =>
+                    m.id === streamId ? { ...m, content: fullContent, tablesJson: partialParsed.tablesJson, generationStatus: 'generating' as const } : m
+                  ))
+                } else {
+                  setMessages(prev => prev.map(m =>
+                    m.id === streamId ? { ...m, content: fullContent, generationStatus: 'generating' as const } : m
+                  ))
+                }
+              } catch {
+                setMessages(prev => prev.map(m =>
+                  m.id === streamId ? { ...m, content: fullContent, generationStatus: 'generating' as const } : m
+                ))
+              }
             }
 
             if (event.type === 'agent_step') {

@@ -1036,8 +1036,13 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
         console.error('[SynthForge AI] chatCompletionStream error:', error instanceof Error ? error.message : error)
         if (!controllerClosed) {
           try {
-            safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', data: error instanceof Error ? error.message : 'AI service unavailable. Please try again.' })}\n\n`))
-          } catch { /* controller already closed */ }
+            const errMsg = error instanceof Error ? error.message : 'AI service unavailable. Please try again.'
+            safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', data: errMsg })}\n\n`))
+          } catch (enqueueErr) {
+            // Controller may be in a bad state; mark closed and bail out
+            controllerClosed = true
+            console.error('[SynthForge AI] chatCompletionStream: failed to enqueue error event:', enqueueErr instanceof Error ? enqueueErr.message : enqueueErr)
+          }
         }
         safeClose()
       }

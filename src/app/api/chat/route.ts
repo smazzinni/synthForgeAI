@@ -101,11 +101,17 @@ export async function POST(request: NextRequest) {
 
     // ─── Streaming Path ─────────────────────────────────────────
     if (stream) {
-      const streamResponse = await chatCompletionStream({
-        messages: [{ role: 'system', content: systemPrompt }, ...chatMessages],
-        temperature: 0.7,
-        maxTokens: 8192
-      })
+      let streamResponse: ReadableStream<Uint8Array>
+      try {
+        streamResponse = await chatCompletionStream({
+          messages: [{ role: 'system', content: systemPrompt }, ...chatMessages],
+          temperature: 0.7,
+          maxTokens: 8192
+        })
+      } catch (streamErr) {
+        const errMsg = streamErr instanceof Error ? streamErr.message : 'Stream creation failed'
+        return NextResponse.json({ error: errMsg, hint: 'AI service may be temporarily unavailable.' }, { status: 503 })
+      }
 
       const conversationId_ = conversation.id
       const databaseId_ = conversation.databaseId
@@ -292,6 +298,7 @@ export async function POST(request: NextRequest) {
                   }
 
                   // Save assistant message and update database in background (non-blocking)
+                  // Chunked database update for large datasets
                   const savePromise = (async () => {
                     try {
                       await db.message.create({
@@ -310,10 +317,13 @@ export async function POST(request: NextRequest) {
                         }
                       })
 
-                      // Update database schema if tables were generated
+                      // Chunked database update for large datasets
                       if (finalParsed?.tables && Object.keys(finalParsed.tables).length > 0 && dbRef) {
                         try {
                           const currentSchema = JSON.parse(dbRef.schemaJson || '{}')
+                          const currentData = JSON.parse(dbRef.dataJson || '{}')
+
+                          // Update schema first
                           for (const tableName of Object.keys(finalParsed.tables)) {
                             const rows = finalParsed.tables[tableName]
                             if (Array.isArray(rows) && rows.length > 0) {
@@ -329,9 +339,12 @@ export async function POST(request: NextRequest) {
                             }
                           }
 
-                          const currentData = JSON.parse(dbRef.dataJson || '{}')
+                          // Merge data (append rows to existing tables)
                           for (const [tableName, rows] of Object.entries(finalParsed.tables)) {
-                            if (Array.isArray(rows)) currentData[tableName] = rows
+                            if (Array.isArray(rows)) {
+                              const existingRows = Array.isArray(currentData[tableName]) ? currentData[tableName] : []
+                              currentData[tableName] = [...existingRows, ...rows]
+                            }
                           }
 
                           await db.database.update({
@@ -365,16 +378,21 @@ export async function POST(request: NextRequest) {
         }
       })
 
-      const pipedStream = streamResponse.pipeThrough(transformStream)
+      try {
+        const pipedStream = streamResponse.pipeThrough(transformStream)
 
-      return new Response(pipedStream, {
-        headers: {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-          'X-Conversation-Id': conversation.id
-        }
-      })
+        return new Response(pipedStream, {
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Conversation-Id': conversation.id
+          }
+        })
+      } catch (pipeErr) {
+        console.error('[Chat API Stream] Pipe error:', pipeErr)
+        return NextResponse.json({ error: 'Stream processing failed' }, { status: 500 })
+      }
     }
 
     // ─── Non-Streaming Path (backward compatible) ──────────────

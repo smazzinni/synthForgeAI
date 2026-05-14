@@ -110,7 +110,7 @@ export const ChatMessageBubble = React.memo(function ChatMessageBubble({
     if (msg.isStreaming && !msg.content) {
       return (
         <Badge className="text-[10px] bg-amber-100 text-amber-800 border-amber-200 gap-1">
-          <Loader2 className="h-2.5 w-2.5 animate-spin" /> Thinking<AnimatedDots />
+          <Loader2 className="h-2.5 w-2.5 animate-spin" /> Analyzing
         </Badge>
       )
     }
@@ -184,20 +184,20 @@ export const ChatMessageBubble = React.memo(function ChatMessageBubble({
               <Loader2 className="h-4 w-4 animate-spin text-amber-600" />
               <span>Thinking<AnimatedDots /></span>
             </div>
-            {/* Show real-time reasoning steps while thinking */}
+            {/* Live reasoning steps while thinking - auto-expanded */}
             {parsedSteps.length > 0 && (
               <div className="mt-1">
-                <ReasoningTimeline steps={parsedSteps} msgId={msg.id} />
+                <ReasoningTimeline steps={parsedSteps} msgId={msg.id} autoOpen={true} />
               </div>
             )}
           </div>
         ) : (
           <>
             {renderAssistantContent(msg.content)}
-            {/* Show reasoning steps during and after generation */}
+            {/* Live reasoning steps during generation - auto-expanded */}
             {msg.isStreaming && parsedSteps.length > 0 && (
               <div className="mt-1">
-                <ReasoningTimeline steps={parsedSteps} msgId={msg.id} />
+                <ReasoningTimeline steps={parsedSteps} msgId={msg.id} autoOpen={true} />
               </div>
             )}
             {/* Show agent pipeline during multi-step execution */}
@@ -243,8 +243,11 @@ export const ChatMessageBubble = React.memo(function ChatMessageBubble({
           </Collapsible>
         )}
 
-        <ReasoningTimeline steps={parsedSteps} msgId={msg.id} />
-        {agentSteps.length > 0 && <AgentPipeline steps={agentSteps} />}
+        {/* Only show reasoning timeline for completed messages */}
+        {!msg.isStreaming && parsedSteps.length > 0 && (
+          <ReasoningTimeline steps={parsedSteps} msgId={msg.id} />
+        )}
+        {!msg.isStreaming && agentSteps.length > 0 && <AgentPipeline steps={agentSteps} />}
         <ClarificationOptions options={parsedOptions} onSelectOption={onSendMessage} isLoading={isLoading} />
         {hasGeneratedTables && !msg.isStreaming && (
           <QuickActions

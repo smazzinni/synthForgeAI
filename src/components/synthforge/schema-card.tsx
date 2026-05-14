@@ -1,11 +1,12 @@
 'use client'
 
-import React from 'react'
-import { Table2, Key, Link2, Hash, Shield } from 'lucide-react'
+import React, { useState } from 'react'
+import { Table2, Key, Link2, Hash, Shield, ChevronDown, ChevronRight } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
+import { Button } from '@/components/ui/button'
 
 export interface SchemaCardProps {
   tableName: string
@@ -21,6 +22,12 @@ export const SchemaCard = React.memo(function SchemaCard({ tableName, columns, r
   const hasConstraints = constraints && Object.keys(constraints).length > 0
   const hasIndexes = indexes && indexes.length > 0
 
+  const [showAllColumns, setShowAllColumns] = useState(false)
+  const columnEntries = Object.entries(columns)
+  const COLUMN_LIMIT = 10
+  const visibleColumns = showAllColumns ? columnEntries : columnEntries.slice(0, COLUMN_LIMIT)
+  const hasMoreColumns = columnEntries.length > COLUMN_LIMIT
+
   return (
     <Card>
       <CardHeader className="pb-2">
@@ -30,6 +37,9 @@ export const SchemaCard = React.memo(function SchemaCard({ tableName, columns, r
           {rowCount !== undefined && (
             <Badge variant="secondary" className="text-[10px] ml-auto">{rowCount} rows</Badge>
           )}
+          {columnEntries.length > COLUMN_LIMIT && (
+            <Badge variant="outline" className="text-[10px]">{columnEntries.length} cols</Badge>
+          )}
         </CardTitle>
       </CardHeader>
       <CardContent>
@@ -37,7 +47,7 @@ export const SchemaCard = React.memo(function SchemaCard({ tableName, columns, r
           <div className="space-y-3">
             {/* Columns section */}
             <div className="space-y-1">
-              {Object.entries(columns).map(([colName, colType]) => (
+              {visibleColumns.map(([colName, colType]) => (
                 <div key={colName} className="flex items-center justify-between text-xs py-1.5 border-b last:border-0 hover:bg-muted/30 px-1 rounded">
                   <div className="flex items-center gap-2">
                     {colName.toLowerCase() === 'id' && <Key className="h-3 w-3 text-amber-600" />}
@@ -47,6 +57,20 @@ export const SchemaCard = React.memo(function SchemaCard({ tableName, columns, r
                   <Badge variant="secondary" className="text-[10px] font-mono">{colType}</Badge>
                 </div>
               ))}
+              {hasMoreColumns && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="w-full text-xs text-muted-foreground hover:text-foreground h-6"
+                  onClick={() => setShowAllColumns(!showAllColumns)}
+                >
+                  {showAllColumns ? (
+                    <><ChevronRight className="h-3 w-3 mr-1" /> Show less</>
+                  ) : (
+                    <><ChevronDown className="h-3 w-3 mr-1" /> Show {columnEntries.length - COLUMN_LIMIT} more columns</>
+                  )}
+                </Button>
+              )}
             </div>
 
             {/* Relationships section */}

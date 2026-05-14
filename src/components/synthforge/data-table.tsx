@@ -5,7 +5,6 @@ import { Table2, Download, Copy, Code2, FileJson, FileText, Database, RotateCcw,
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 
@@ -30,7 +29,9 @@ export const DataTable = React.memo(function DataTable({
 }) {
   const [page, setPage] = useState(0)
   const [visibleCount, setVisibleCount] = useState(initialPageSize ?? 50)
-  const pageSize = 20
+  const colCount = allRows.length > 0 ? Object.keys(allRows[0]).length : 0
+  const dynamicPageSize = colCount > 15 ? 10 : colCount > 10 ? 15 : 20
+  const pageSize = dynamicPageSize
   const visibleRows = allRows.slice(0, visibleCount)
   const hasMore = visibleCount < allRows.length
   const totalPages = Math.ceil(visibleRows.length / pageSize)
@@ -126,9 +127,8 @@ export const DataTable = React.memo(function DataTable({
       </CardHeader>
       <CardContent>
         {pageRows.length > 0 ? (
-          <ScrollArea className="max-h-80">
-            <div className="overflow-x-auto">
-            <table className="w-full text-xs" role="table">
+          <div className="max-h-80 overflow-auto">
+            <table className="w-full text-xs min-w-max" role="table">
               <thead>
                 <tr className="border-b bg-muted/30 sticky top-0">
                   {Object.keys(pageRows[0]).map(key => {
@@ -165,7 +165,6 @@ export const DataTable = React.memo(function DataTable({
                 ))}
               </tbody>
             </table>
-            </div>
             {totalPages > 1 && (
               <div className="flex items-center justify-between mt-3 pt-2 border-t">
                 <p className="text-xs text-muted-foreground">Page {page + 1} of {totalPages}</p>
@@ -179,7 +178,7 @@ export const DataTable = React.memo(function DataTable({
                 </div>
               </div>
             )}
-          </ScrollArea>
+          </div>
         ) : (
           <p className="text-xs text-muted-foreground">No data rows</p>
         )}

@@ -10,12 +10,23 @@ import { Badge } from '@/components/ui/badge'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import type { ReasoningStep } from './types'
 
-export const ReasoningTimeline = React.memo(function ReasoningTimeline({ steps, msgId }: { steps: ReasoningStep[]; msgId: string }) {
+export const ReasoningTimeline = React.memo(function ReasoningTimeline({ 
+  steps, 
+  msgId,
+  autoOpen = false 
+}: { 
+  steps: ReasoningStep[]; 
+  msgId: string;
+  autoOpen?: boolean 
+}) {
   const [isOpen, setIsOpen] = useState(false)
+
   if (!steps || steps.length === 0) return null
 
   const completedCount = steps.filter(s => s.status === 'completed').length
   const isRunning = steps.some(s => s.status === 'running')
+  // When autoOpen is true (streaming), force open; otherwise use user's toggle
+  const effectiveIsOpen = autoOpen || isOpen
 
   const getStepIcon = (type: string) => {
     switch (type) {
@@ -48,9 +59,9 @@ export const ReasoningTimeline = React.memo(function ReasoningTimeline({ steps, 
   }
 
   return (
-    <Collapsible open={isOpen} onOpenChange={setIsOpen}>
-      <CollapsibleTrigger className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors mt-2 cursor-pointer group">
-        {isOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+    <Collapsible open={effectiveIsOpen} onOpenChange={setIsOpen}>
+      <CollapsibleTrigger className={`flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors mt-2 cursor-pointer group ${isRunning ? 'animate-pulse' : ''}`}>
+        {effectiveIsOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
         <Brain className="h-3 w-3 text-amber-600" />
         <span className="group-hover:text-foreground transition-colors">
           Agent Reasoning ({completedCount}/{steps.length})
