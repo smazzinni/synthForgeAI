@@ -15,6 +15,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Auth service not configured' }, { status: 503 })
     }
 
+    // Verify credentials using admin (just for validation)
     const { data, error } = await admin.auth.signInWithPassword({ email, password })
 
     if (error) {
@@ -22,8 +23,12 @@ export async function POST(request: NextRequest) {
     }
 
     return NextResponse.json({
-      user: data.user,
-      session: data.session,
+      user: {
+        id: data.user.id,
+        email: data.user.email,
+        name: data.user.user_metadata?.full_name,
+      },
+      authenticated: true,
     })
   } catch (err) {
     console.error('[Auth Login] Error:', err)

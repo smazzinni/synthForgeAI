@@ -1,6 +1,11 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js'
 import type { Database } from './types'
 
+// ─── Auth enabled check ─────────────────────────────────────────
+export function isAuthEnabled(): boolean {
+  return process.env.NEXT_PUBLIC_AUTH_ENABLED === 'true'
+}
+
 let adminClient: SupabaseClient<Database> | null = null
 
 export function getSupabaseAdmin(): SupabaseClient<Database> | null {

@@ -4,7 +4,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   Database, MessageSquare, Plus, Send, ChevronRight,
-  Table2, Download, Copy, Sparkles, LayoutDashboard,
+  Table2, Download, Copy, Sparkles,
   Code2, FileJson, FileText, Trash2, Zap, Upload, X, Check,
   Loader2, ArrowRight, Hash, Play, FolderTree,
   Brain, Wand2, AlertCircle,
@@ -21,7 +21,6 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
-import { Separator } from '@/components/ui/separator'
 import { Textarea } from '@/components/ui/textarea'
 import {
   Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger
@@ -53,7 +52,7 @@ import { RegisterForm } from '@/components/synthforge/auth/register-form'
 import { UserMenu, type UserInfo } from '@/components/synthforge/auth/user-menu'
 
 // Shared types and animation variants
-import type { Workspace, Project, Database_, Message, Conversation, AgentStepUI, QualityReportData, View, AgentMode, ReasoningStep } from '@/components/synthforge/types'
+import type { Database_, Message, Conversation, AgentStepUI, QualityReportData, View, AgentMode, ReasoningStep } from '@/components/synthforge/types'
 import { fadeInUp, staggerContainer, staggerItem, gradientStyle } from '@/components/synthforge/types'
 
 // Real-time events hook for WebSocket/SSE updates
@@ -69,9 +68,7 @@ const safeTrim = (val: unknown): string => {
 // ─── Main App ──────────────────────────────────────────
 export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId?: string }) {
   const [view, setView] = useState<View>('landing')
-  const [workspaces, setWorkspaces] = useState<Workspace[]>([])
-  const [activeWorkspace, setActiveWorkspace] = useState<Workspace | null>(null)
-  const [projects, setProjects] = useState<Project[]>([])
+  const [databases, setDatabases] = useState<Database_[]>([])
   const [activeDb, setActiveDb] = useState<Database_ | null>(null)
   const [conversation, setConversation] = useState<Conversation | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -208,13 +205,10 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
           role: data.user.role,
           tenantId: data.user.tenantId,
         })
-        // Store token in cookie for API requests
-        if (data.accessToken) {
-          document.cookie = `sb-access-token=${data.accessToken}; path=/; max-age=86400; samesite=lax`
-        }
+        // The SSR browser client handles cookies automatically
         setAuthView(null)
         setView('dashboard')
-        await loadWorkspaces()
+        await loadDatabases()
       }
     } catch (err) {
       setAuthError(err instanceof Error ? err.message : 'Login failed')
@@ -245,7 +239,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
         })
         setAuthView(null)
         setView('dashboard')
-        await loadWorkspaces()
+        await loadDatabases()
       }
     } catch (err) {
       setAuthError(err instanceof Error ? err.message : 'Registration failed')
@@ -262,9 +256,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
     setCurrentUser(null)
     setAuthView(null)
     setView('landing')
-    setWorkspaces([])
-    setActiveWorkspace(null)
-    setProjects([])
+    setDatabases([])
     setActiveDb(null)
     setConversation(null)
     setMessages([])
@@ -279,10 +271,10 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
     }
   }
 
-  // Load workspaces on mount
+  // Load databases on mount
   useEffect(() => {
     const init = async () => {
-      await loadWorkspaces()
+      await loadDatabases()
       if (initialDatabaseId) {
         try {
           const res = await fetch('/api/databases')
@@ -310,27 +302,13 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
     }
   }, [])
 
-  const loadWorkspaces = async () => {
+  const loadDatabases = async () => {
     try {
-      const res = await fetch('/api/workspaces')
+      const res = await fetch('/api/databases')
       const data = await res.json()
-      if (data.workspaces?.length > 0) {
-        setWorkspaces(data.workspaces)
-        setActiveWorkspace(data.workspaces[0])
-        loadProjects(data.workspaces[0].id)
-      }
+      if (data.databases) setDatabases(data.databases)
     } catch {
-      toast({ title: 'Error', description: 'Failed to load workspaces', variant: 'destructive' })
-    }
-  }
-
-  const loadProjects = async (workspaceId: string) => {
-    try {
-      const res = await fetch(`/api/projects?workspaceId=${workspaceId}`)
-      const data = await res.json()
-      if (data.projects) setProjects(data.projects)
-    } catch {
-      toast({ title: 'Error', description: 'Failed to load projects', variant: 'destructive' })
+      toast({ title: 'Error', description: 'Failed to load databases', variant: 'destructive' })
     }
   }
 
@@ -343,7 +321,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
     } catch { /* silent */ }
   }
 
-  const allDatabases = useMemo(() => projects.flatMap(p => p.databases || []), [projects])
+  const allDatabases = useMemo(() => databases, [databases])
 
   const openDatabase = async (db: Database_) => {
     setActiveDb(db)
@@ -421,7 +399,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
         body: JSON.stringify({
           conversationId: conversation?.id || null,
           databaseId: activeDb.id,
-          workspaceId: activeWorkspace?.id,
+          // workspaceId removed - individual users don't need workspace filtering
           message: msgText,
           stream: true,
           agentMode,
@@ -601,7 +579,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
       streamingIdRef.current = null
       setAgentSteps([])
     }
-  }, [isLoading, activeDb, conversation, activeWorkspace, toast, agentMode])
+  }, [isLoading, activeDb, conversation, toast, agentMode])
 
   // ─── Parse full SSE content into structured message fields ──
   const parseFullContent = useCallback((content: string) => {
@@ -739,7 +717,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
   }, [])
 
   const createDatabase = async () => {
-    if (!safeTrim(newDbName) || !projects[0]) return
+    if (!safeTrim(newDbName)) return
     let schemaObj = {}
     if (safeTrim(newDbSchema)) {
       try { schemaObj = JSON.parse(newDbSchema) } catch {
@@ -749,11 +727,11 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
     try {
       const res = await fetch('/api/databases', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: newDbName, dbType: 'postgresql', schemaJson: schemaObj, projectId: projects[0].id })
+        body: JSON.stringify({ name: newDbName, dbType: 'postgresql', schemaJson: schemaObj })
       })
       const data = await res.json()
       if (data.database) {
-        await loadProjects(activeWorkspace!.id)
+        await loadDatabases()
         setShowNewDbDialog(false); setNewDbName(''); setNewDbSchema('')
         toast({ title: 'Database Created', description: `${newDbName} is ready` })
       }
@@ -764,7 +742,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
     try {
       await fetch(`/api/databases?id=${dbId}`, { method: 'DELETE' })
       if (activeDb?.id === dbId) { setActiveDb(null); setView('dashboard') }
-      await loadProjects(activeWorkspace!.id)
+      await loadDatabases()
       toast({ title: 'Deleted', description: 'Database removed' })
     } catch { toast({ title: 'Error', description: 'Failed to delete database', variant: 'destructive' }) }
   }
@@ -1157,26 +1135,12 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
               </div>
               <ScrollArea className="flex-1">
                 <div className="p-3 space-y-1">
-                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2 px-2">Workspaces</p>
-                  {workspaces.map(ws => (
-                    <button key={ws.id} className={`w-full text-left p-2 rounded-md text-sm transition-colors ${activeWorkspace?.id === ws.id ? 'bg-muted font-medium' : 'hover:bg-muted/50'}`} onClick={() => { setActiveWorkspace(ws); loadProjects(ws.id) }}>
-                      <div className="flex items-center gap-2"><LayoutDashboard className="h-4 w-4 text-muted-foreground" />{ws.name}</div>
-                    </button>
-                  ))}
-                </div>
-                <Separator className="my-2" />
-                <div className="p-3 space-y-1">
-                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2 px-2">Projects</p>
-                  {projects.map(proj => (
-                    <div key={proj.id} className="px-2">
-                      <p className="text-sm font-medium py-1">{proj.name}</p>
-                      {(proj.databases || []).map(db => (
-                        <motion.button key={db.id} whileHover={{ x: 2 }} className="w-full text-left p-2 rounded-md text-xs hover:bg-muted/50 transition-colors flex items-center gap-2" onClick={() => openDatabase(db)} aria-label={`Open ${db.name}`}>
-                          <Database className="h-3.5 w-3.5 text-amber-700 shrink-0" /><span className="truncate">{db.name}</span>
-                          {db._count?.datasets !== undefined && <Badge variant="secondary" className="text-[9px] ml-auto">{db._count.datasets}</Badge>}
-                        </motion.button>
-                      ))}
-                    </div>
+                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2 px-2">Databases</p>
+                  {allDatabases.map(db => (
+                    <motion.button key={db.id} whileHover={{ x: 2 }} className="w-full text-left p-2 rounded-md text-xs hover:bg-muted/50 transition-colors flex items-center gap-2" onClick={() => openDatabase(db)} aria-label={`Open ${db.name}`}>
+                      <Database className="h-3.5 w-3.5 text-amber-700 shrink-0" /><span className="truncate">{db.name}</span>
+                      {db._count?.datasets !== undefined && <Badge variant="secondary" className="text-[9px] ml-auto">{db._count.datasets}</Badge>}
+                    </motion.button>
                   ))}
                 </div>
               </ScrollArea>

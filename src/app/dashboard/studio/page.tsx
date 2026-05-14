@@ -13,10 +13,7 @@ import {
   Database,
   Table2,
   Shield,
-  Brain,
-  Workflow,
   Sparkles,
-  ChevronDown,
   Copy,
   Download,
   Bot,
@@ -30,9 +27,6 @@ interface Message {
   role: 'user' | 'assistant' | 'system'
   content: string
   agentName?: string
-  reasoningSteps?: string[]
-  tables?: { name: string; columns: { name: string; type: string }[] }[]
-  data?: Record<string, unknown[]>
   timestamp: Date
 }
 
@@ -42,45 +36,11 @@ interface ChatState {
   currentAgent: string | null
 }
 
-const mockSchema = [
-  { name: 'users', columns: [
-    { name: 'id', type: 'uuid' },
-    { name: 'email', type: 'varchar(255)' },
-    { name: 'full_name', type: 'varchar(255)' },
-    { name: 'created_at', type: 'timestamp' },
-  ]},
-  { name: 'orders', columns: [
-    { name: 'id', type: 'uuid' },
-    { name: 'user_id', type: 'uuid' },
-    { name: 'total', type: 'decimal(10,2)' },
-    { name: 'status', type: 'varchar(50)' },
-    { name: 'created_at', type: 'timestamp' },
-  ]},
-]
-
-const mockData = {
-  users: [
-    { id: 'a1b2c3d4', email: 'sarah.johnson@example.com', full_name: 'Sarah Johnson', created_at: '2026-01-15' },
-    { id: 'e5f6g7h8', email: 'michael.chen@example.com', full_name: 'Michael Chen', created_at: '2026-02-03' },
-    { id: 'i9j0k1l2', email: 'emma.wilson@example.com', full_name: 'Emma Wilson', created_at: '2026-02-20' },
-    { id: 'm3n4o5p6', email: 'james.davis@example.com', full_name: 'James Davis', created_at: '2026-03-10' },
-    { id: 'q7r8s9t0', email: 'olivia.brown@example.com', full_name: 'Olivia Brown', created_at: '2026-03-22' },
-  ],
-  orders: [
-    { id: 'ord-001', user_id: 'a1b2c3d4', total: '$129.99', status: 'completed', created_at: '2026-03-01' },
-    { id: 'ord-002', user_id: 'e5f6g7h8', total: '$59.50', status: 'pending', created_at: '2026-03-05' },
-    { id: 'ord-003', user_id: 'i9j0k1l2', total: '$245.00', status: 'completed', created_at: '2026-03-08' },
-    { id: 'ord-004', user_id: 'm3n4o5p6', total: '$89.99', status: 'shipped', created_at: '2026-03-12' },
-  ],
+// Schema type derived from AI responses
+interface SchemaTable {
+  name: string
+  columns: { name: string; type: string }[]
 }
-
-const agentPipeline = [
-  { name: 'Discovery', icon: Brain, status: 'complete', description: 'Understood requirements' },
-  { name: 'Schema', icon: Database, status: 'complete', description: 'Designed schema' },
-  { name: 'Generation', icon: Workflow, status: 'active', description: 'Generating data...' },
-  { name: 'Validation', icon: CheckCircle2, status: 'pending', description: 'Quality check' },
-  { name: 'PII Shield', icon: Shield, status: 'pending', description: 'Privacy scan' },
-]
 
 export default function StudioPage() {
   const [chatState, setChatState] = useState<ChatState>({
@@ -97,11 +57,59 @@ export default function StudioPage() {
     currentAgent: null,
   })
   const [input, setInput] = useState('')
+  const [generatedSchema, setGeneratedSchema] = useState<SchemaTable[]>([])
+  const [generatedData, setGeneratedData] = useState<Record<string, unknown[]>>({})
   const scrollRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [chatState.messages])
+
+  // Try to parse schema/data from assistant message content
+  const tryParseResponse = useCallback((content: string) => {
+    try {
+      const jsonMatch = content.match(/\{[\s\S]*\}/)
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0])
+
+        // Extract schema
+        if (parsed.tables) {
+          const schema: SchemaTable[] = []
+          for (const [tableName, tableData] of Object.entries(parsed.tables)) {
+            const rows = tableData as Record<string, unknown>[]
+            if (Array.isArray(rows) && rows.length > 0) {
+              const columns = Object.keys(rows[0]).map(key => {
+                const val = rows[0][key]
+                let type = 'varchar(255)'
+                if (typeof val === 'number') type = Number.isInteger(val) ? 'integer' : 'decimal'
+                else if (typeof val === 'boolean') type = 'boolean'
+                else if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}/.test(val)) type = 'timestamp'
+                else if (key === 'id' || key.endsWith('_id')) type = 'uuid'
+                return { name: key, type }
+              })
+              schema.push({ name: tableName, columns })
+            }
+          }
+          if (schema.length > 0) setGeneratedSchema(schema)
+        }
+
+        // Extract data
+        if (parsed.tables) {
+          const data: Record<string, unknown[]> = {}
+          for (const [tableName, tableData] of Object.entries(parsed.tables)) {
+            if (Array.isArray(tableData)) {
+              data[tableName] = tableData
+            }
+          }
+          if (Object.keys(data).length > 0) setGeneratedData(data)
+        }
+      }
+    } catch {
+      // Not JSON or couldn't parse - that's fine
+    }
+  }, [])
+
+  const hasGeneratedData = generatedSchema.length > 0 || Object.keys(generatedData).length > 0
 
   const sendMessage = useCallback(async () => {
     if (!input.trim() || chatState.loading) return
@@ -139,7 +147,6 @@ export default function StudioPage() {
         role: 'assistant',
         content: '',
         agentName: 'Orchestrator',
-        tables: [],
         timestamp: new Date(),
       }
 
@@ -173,6 +180,8 @@ export default function StudioPage() {
                         : m
                     ),
                   }))
+                  // Try to extract schema/data from streaming content
+                  tryParseResponse(assistantContent)
                 }
                 if (parsed.agent) {
                   setChatState((prev) => ({
@@ -201,31 +210,38 @@ export default function StudioPage() {
           }
         }
       }
+
+      // Final parse attempt after stream completes
+      if (assistantContent) {
+        tryParseResponse(assistantContent)
+      }
     } catch {
-      // Fallback: generate a mock response
-      const fallbackMessage: Message = {
+      // Error - show error message in chat
+      const errorMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: 'I\'ll create a synthetic database based on your requirements. Here\'s what I\'ve designed:\n\n**Schema:**\n- `users` table with id, email, full_name, created_at\n- `orders` table with id, user_id, total, status, created_at\n\nI\'ve generated 5 users and 4 orders with realistic data. Check the Data tab to see the results!',
-        agentName: 'Schema Agent',
-        tables: mockSchema,
-        data: mockData,
+        content: 'Sorry, I encountered an error connecting to the AI service. Please try again.',
+        agentName: 'System',
         timestamp: new Date(),
       }
       setChatState((prev) => ({
         ...prev,
-        messages: [...prev.messages.filter((m) => m.role !== 'assistant' || m.content), fallbackMessage],
+        messages: [...prev.messages.filter((m) => m.role !== 'assistant' || m.content), errorMessage],
       }))
     } finally {
       setChatState((prev) => ({ ...prev, loading: false, currentAgent: null }))
     }
-  }, [input, chatState.loading])
+  }, [input, chatState.loading, tryParseResponse])
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       sendMessage()
     }
+  }
+
+  const copyToClipboard = (text: string) => {
+    navigator.clipboard.writeText(text)
   }
 
   return (
@@ -241,19 +257,17 @@ export default function StudioPage() {
             </p>
           </div>
           <div className="flex items-center gap-2">
-            {agentPipeline.map((agent) => (
-              <div
-                key={agent.name}
-                className={`h-2 w-2 rounded-full ${
-                  agent.status === 'complete'
-                    ? 'bg-emerald-500'
-                    : agent.status === 'active'
-                    ? 'bg-amber-500 animate-pulse'
-                    : 'bg-muted'
-                }`}
-                title={`${agent.name}: ${agent.description}`}
-              />
-            ))}
+            {hasGeneratedData ? (
+              <Badge variant="outline" className="text-xs gap-1">
+                <CheckCircle2 className="h-3 w-3 text-emerald-500" />
+                Data Generated
+              </Badge>
+            ) : (
+              <Badge variant="outline" className="text-xs gap-1">
+                <Sparkles className="h-3 w-3 text-amber-500" />
+                Ready
+              </Badge>
+            )}
           </div>
         </div>
 
@@ -325,171 +339,134 @@ export default function StudioPage() {
         </div>
       </div>
 
-      {/* Data Panel */}
+      {/* Data Panel - only shows when data has been generated */}
       <div className="hidden md:flex flex-col w-1/2">
-        <Tabs defaultValue="schema" className="flex flex-col h-full">
-          <div className="p-4 border-b">
-            <TabsList className="w-full">
-              <TabsTrigger value="schema" className="flex-1">
-                <Database className="h-4 w-4 mr-2" />
-                Schema
-              </TabsTrigger>
-              <TabsTrigger value="data" className="flex-1">
-                <Table2 className="h-4 w-4 mr-2" />
-                Data
-              </TabsTrigger>
-              <TabsTrigger value="quality" className="flex-1">
-                <Shield className="h-4 w-4 mr-2" />
-                Quality
-              </TabsTrigger>
-            </TabsList>
-          </div>
-
-          <TabsContent value="schema" className="flex-1 overflow-auto m-0 p-4">
-            <div className="space-y-4">
-              {mockSchema.map((table) => (
-                <Card key={table.name}>
-                  <CardHeader className="pb-3">
-                    <div className="flex items-center gap-2">
-                      <Table2 className="h-4 w-4 text-amber-600" />
-                      <CardTitle className="text-base">{table.name}</CardTitle>
-                      <Badge variant="outline" className="text-xs">{table.columns.length} columns</Badge>
-                    </div>
-                  </CardHeader>
-                  <CardContent>
-                    <div className="space-y-1">
-                      {table.columns.map((col) => (
-                        <div key={col.name} className="flex items-center justify-between py-1 px-2 rounded hover:bg-muted text-sm">
-                          <span className="font-mono">{col.name}</span>
-                          <Badge variant="secondary" className="text-xs font-mono">{col.type}</Badge>
-                        </div>
-                      ))}
-                    </div>
-                  </CardContent>
-                </Card>
-              ))}
+        {hasGeneratedData ? (
+          <Tabs defaultValue="schema" className="flex flex-col h-full">
+            <div className="p-4 border-b">
+              <TabsList className="w-full">
+                <TabsTrigger value="schema" className="flex-1">
+                  <Database className="h-4 w-4 mr-2" />
+                  Schema
+                </TabsTrigger>
+                <TabsTrigger value="data" className="flex-1">
+                  <Table2 className="h-4 w-4 mr-2" />
+                  Data
+                </TabsTrigger>
+                <TabsTrigger value="quality" className="flex-1">
+                  <Shield className="h-4 w-4 mr-2" />
+                  Quality
+                </TabsTrigger>
+              </TabsList>
             </div>
-          </TabsContent>
 
-          <TabsContent value="data" className="flex-1 overflow-auto m-0 p-4">
-            <div className="space-y-4">
-              {Object.entries(mockData).map(([tableName, rows]) => (
-                <Card key={tableName}>
-                  <CardHeader className="pb-3">
-                    <div className="flex items-center justify-between">
+            <TabsContent value="schema" className="flex-1 overflow-auto m-0 p-4">
+              <div className="space-y-4">
+                {generatedSchema.map((table) => (
+                  <Card key={table.name}>
+                    <CardHeader className="pb-3">
                       <div className="flex items-center gap-2">
                         <Table2 className="h-4 w-4 text-amber-600" />
-                        <CardTitle className="text-base">{tableName}</CardTitle>
+                        <CardTitle className="text-base">{table.name}</CardTitle>
+                        <Badge variant="outline" className="text-xs">{table.columns.length} columns</Badge>
                       </div>
-                      <div className="flex gap-1">
-                        <Button variant="ghost" size="icon" className="h-7 w-7">
-                          <Copy className="h-3.5 w-3.5" />
-                        </Button>
-                        <Button variant="ghost" size="icon" className="h-7 w-7">
-                          <Download className="h-3.5 w-3.5" />
-                        </Button>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="space-y-1">
+                        {table.columns.map((col) => (
+                          <div key={col.name} className="flex items-center justify-between py-1 px-2 rounded hover:bg-muted text-sm">
+                            <span className="font-mono">{col.name}</span>
+                            <Badge variant="secondary" className="text-xs font-mono">{col.type}</Badge>
+                          </div>
+                        ))}
                       </div>
-                    </div>
-                  </CardHeader>
-                  <CardContent>
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-sm">
-                        <thead>
-                          <tr className="border-b">
-                            {Object.keys(rows[0] || {}).map((key) => (
-                              <th key={key} className="text-left py-2 px-3 font-medium text-muted-foreground">
-                                {key}
-                              </th>
-                            ))}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {rows.map((row, i) => (
-                            <tr key={i} className="border-b last:border-0 hover:bg-muted/50">
-                              {Object.values(row).map((val, j) => (
-                                <td key={j} className="py-2 px-3 font-mono text-xs">
-                                  {String(val)}
-                                </td>
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            </TabsContent>
+
+            <TabsContent value="data" className="flex-1 overflow-auto m-0 p-4">
+              <div className="space-y-4">
+                {Object.entries(generatedData).map(([tableName, rows]) => (
+                  <Card key={tableName}>
+                    <CardHeader className="pb-3">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <Table2 className="h-4 w-4 text-amber-600" />
+                          <CardTitle className="text-base">{tableName}</CardTitle>
+                          <Badge variant="outline" className="text-xs">{rows.length} rows</Badge>
+                        </div>
+                        <div className="flex gap-1">
+                          <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => copyToClipboard(JSON.stringify(rows, null, 2))}>
+                            <Copy className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button variant="ghost" size="icon" className="h-7 w-7">
+                            <Download className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                      </div>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="border-b">
+                              {Object.keys(rows[0] || {}).map((key) => (
+                                <th key={key} className="text-left py-2 px-3 font-medium text-muted-foreground">
+                                  {key}
+                                </th>
                               ))}
                             </tr>
-                          ))}
-                        </tbody>
-                      </table>
+                          </thead>
+                          <tbody>
+                            {rows.map((row, i) => (
+                              <tr key={i} className="border-b last:border-0 hover:bg-muted/50">
+                                {Object.values(row as Record<string, unknown>).map((val, j) => (
+                                  <td key={j} className="py-2 px-3 font-mono text-xs">
+                                    {String(val ?? '')}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            </TabsContent>
+
+            <TabsContent value="quality" className="flex-1 overflow-auto m-0 p-4">
+              <div className="space-y-4">
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-lg flex items-center gap-2">
+                      <Shield className="h-5 w-5 text-amber-600" />
+                      Quality Report
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="text-center py-8 text-muted-foreground">
+                      <CheckCircle2 className="h-10 w-10 mx-auto mb-3 text-emerald-500" />
+                      <p className="font-medium">Data Generated Successfully</p>
+                      <p className="text-sm mt-1">Run a quality check from the main Studio for detailed analysis.</p>
                     </div>
                   </CardContent>
                 </Card>
-              ))}
-            </div>
-          </TabsContent>
-
-          <TabsContent value="quality" className="flex-1 overflow-auto m-0 p-4">
-            <div className="space-y-4">
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-lg">Quality Report</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-4">
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm font-medium">Overall Score</span>
-                    <Badge className="bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400">95%</Badge>
-                  </div>
-                  <div className="space-y-3">
-                    {[
-                      { label: 'Data Realism', score: 97 },
-                      { label: 'Referential Integrity', score: 100 },
-                      { label: 'PII Compliance', score: 95 },
-                      { label: 'Statistical Distribution', score: 89 },
-                    ].map((item) => (
-                      <div key={item.label} className="space-y-1">
-                        <div className="flex items-center justify-between text-sm">
-                          <span>{item.label}</span>
-                          <span className={item.score >= 90 ? 'text-emerald-600' : 'text-amber-600'}>{item.score}%</span>
-                        </div>
-                        <div className="h-2 rounded-full bg-muted overflow-hidden">
-                          <div
-                            className={`h-full rounded-full ${item.score >= 90 ? 'bg-emerald-500' : 'bg-amber-500'}`}
-                            style={{ width: `${item.score}%` }}
-                          />
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-lg">Agent Pipeline</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="space-y-3">
-                    {agentPipeline.map((agent) => (
-                      <div key={agent.name} className="flex items-center gap-3">
-                        <div className={`h-8 w-8 rounded-lg flex items-center justify-center ${
-                          agent.status === 'complete' ? 'bg-emerald-100 dark:bg-emerald-900/30' :
-                          agent.status === 'active' ? 'bg-amber-100 dark:bg-amber-900/30' :
-                          'bg-muted'
-                        }`}>
-                          <agent.icon className={`h-4 w-4 ${
-                            agent.status === 'complete' ? 'text-emerald-600' :
-                            agent.status === 'active' ? 'text-amber-600' :
-                            'text-muted-foreground'
-                          }`} />
-                        </div>
-                        <div className="flex-1">
-                          <p className="text-sm font-medium">{agent.name}</p>
-                          <p className="text-xs text-muted-foreground">{agent.description}</p>
-                        </div>
-                        {agent.status === 'complete' && <CheckCircle2 className="h-4 w-4 text-emerald-500" />}
-                        {agent.status === 'active' && <Loader2 className="h-4 w-4 text-amber-500 animate-spin" />}
-                      </div>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
-            </div>
-          </TabsContent>
-        </Tabs>
+              </div>
+            </TabsContent>
+          </Tabs>
+        ) : (
+          <div className="flex flex-col items-center justify-center h-full text-center p-8">
+            <Database className="h-16 w-16 text-muted-foreground/20 mb-4" />
+            <h3 className="text-lg font-medium text-muted-foreground mb-2">No Data Yet</h3>
+            <p className="text-sm text-muted-foreground max-w-xs">
+              Describe the database you need in the chat, and the AI will generate the schema and data for you.
+            </p>
+          </div>
+        )}
       </div>
     </div>
   )

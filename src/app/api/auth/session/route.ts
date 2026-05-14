@@ -14,20 +14,11 @@ export async function GET() {
       user: {
         id: user.id,
         email: user.email,
-        full_name: user.user_metadata?.full_name,
+        name: user.user_metadata?.full_name || user.email?.split('@')[0],
       },
       authenticated: true,
     })
   } catch {
-    // Dev mode fallback
-    return NextResponse.json({
-      user: {
-        id: 'dev-user-id',
-        email: 'demo@synthforge.ai',
-        full_name: 'Demo User',
-      },
-      authenticated: true,
-      dev: true,
-    })
+    return NextResponse.json({ user: null, authenticated: false })
   }
 }

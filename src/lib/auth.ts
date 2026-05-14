@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server'
-import { isAuthEnabled } from '@/lib/supabase'
+import { isAuthEnabled } from '@/lib/supabase/admin'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
 import { mockUser } from '@/lib/mock-data'
 

@@ -1,12 +1,11 @@
 'use client'
 
 import Link from 'next/link'
-import { usePathname, useRouter } from 'next/navigation'
+import { usePathname } from 'next/navigation'
 import { useTheme } from 'next-themes'
 import { useAuth } from '@/hooks/use-auth'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import { Separator } from '@/components/ui/separator'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import {
   DropdownMenu,
@@ -22,23 +21,19 @@ import {
   FlaskConical,
   FolderOpen,
   Settings,
-  Users,
   Key,
   Moon,
   Sun,
   LogOut,
   Menu,
   ChevronDown,
-  Building2,
 } from 'lucide-react'
-import { mockOrganizations } from '@/lib/mock-data'
 import { useState } from 'react'
 
 const sidebarLinks = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/dashboard/studio', label: 'AI Studio', icon: FlaskConical },
-  { href: '/dashboard/workspaces', label: 'Workspaces', icon: FolderOpen },
-  { href: '/dashboard/organization', label: 'Organization', icon: Users },
+  { href: '/dashboard/workspaces', label: 'My Projects', icon: FolderOpen },
   { href: '/dashboard/api-keys', label: 'API Keys', icon: Key },
   { href: '/dashboard/settings', label: 'Settings', icon: Settings },
 ]
@@ -47,8 +42,6 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = usePathname()
   const { theme, setTheme } = useTheme()
   const { user, signOut } = useAuth()
-  const router = useRouter()
-  const [currentOrg] = useState(mockOrganizations[0])
 
   const handleSignOut = async () => {
     await signOut()
@@ -56,43 +49,14 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Org Header */}
+      {/* Logo Header */}
       <div className="p-4 border-b">
-        <Link href="/" className="flex items-center gap-2 mb-3">
+        <Link href="/" className="flex items-center gap-2">
           <div className="h-8 w-8 rounded-lg bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center">
             <Zap className="h-4 w-4 text-white" />
           </div>
           <span className="text-lg font-bold">SynthForge<span className="text-amber-600">AI</span></span>
         </Link>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="outline" className="w-full justify-between h-auto py-2">
-              <div className="flex items-center gap-2 text-left">
-                <Building2 className="h-4 w-4 text-muted-foreground" />
-                <div>
-                  <p className="text-sm font-medium truncate max-w-[140px]">{currentOrg?.name || 'Demo Org'}</p>
-                  <p className="text-xs text-muted-foreground capitalize">{currentOrg?.plan || 'free'} plan</p>
-                </div>
-              </div>
-              <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="w-56">
-            {mockOrganizations.map((org) => (
-              <DropdownMenuItem key={org.id}>
-                <Building2 className="mr-2 h-4 w-4" />
-                <span>{org.name}</span>
-              </DropdownMenuItem>
-            ))}
-            <DropdownMenuSeparator />
-            <DropdownMenuItem asChild>
-              <Link href="/dashboard/organization">
-                <Users className="mr-2 h-4 w-4" />
-                Manage Organizations
-              </Link>
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
       </div>
 
       {/* Navigation */}

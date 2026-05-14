@@ -1,7 +1,6 @@
 'use client'
 
 import { useEffect } from 'react'
-import { useRouter, usePathname } from 'next/navigation'
 import { useAuth } from '@/hooks/use-auth'
 import { DashboardSidebar } from '@/components/layout/dashboard-sidebar'
 import { Loader2 } from 'lucide-react'
@@ -12,18 +11,16 @@ export default function DashboardLayout({
   children: React.ReactNode
 }) {
   const { user, loading } = useAuth()
-  const router = useRouter()
-  const pathname = usePathname()
+  const authEnabled = process.env.NEXT_PUBLIC_AUTH_ENABLED === 'true'
+  const shouldRedirect = !loading && !user && authEnabled
 
+  // Middleware handles redirect, but as a fallback - use hard redirect via useEffect
+  // to avoid client-side router issues and satisfy immutability lint rule
   useEffect(() => {
-    // Only redirect after loading is complete and we know there's no user
-    if (!loading && !user) {
-      const authEnabled = process.env.NEXT_PUBLIC_AUTH_ENABLED === 'true'
-      if (authEnabled) {
-        router.replace(`/login?redirect=${encodeURIComponent(pathname)}`)
-      }
+    if (shouldRedirect && typeof window !== 'undefined') {
+      window.location.href = '/login'
     }
-  }, [user, loading, router, pathname])
+  }, [shouldRedirect])
 
   if (loading) {
     return (
@@ -36,9 +33,7 @@ export default function DashboardLayout({
     )
   }
 
-  const authEnabled = process.env.NEXT_PUBLIC_AUTH_ENABLED === 'true'
-  if (authEnabled && !user) {
-    // Show loading while redirect is happening
+  if (shouldRedirect) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
         <div className="flex flex-col items-center gap-3">

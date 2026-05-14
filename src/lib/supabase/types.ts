@@ -140,7 +140,7 @@ export interface Database {
       synthetic_databases: {
         Row: {
           id: string
-          project_id: string
+          project_id: string | null
           name: string
           db_type: string
           schema_json: Json
@@ -153,7 +153,7 @@ export interface Database {
         }
         Insert: {
           id?: string
-          project_id: string
+          project_id?: string | null
           name: string
           db_type?: string
           schema_json?: Json

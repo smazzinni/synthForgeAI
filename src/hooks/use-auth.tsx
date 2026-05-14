@@ -36,7 +36,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     if (!supabase) {
       // No Supabase client available - run in dev/demo mode (no auth)
-      setLoading(false)
+      // Use microtask to defer setState and avoid cascading render warning
+      queueMicrotask(() => setLoading(false))
       return
     }
 

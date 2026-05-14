@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
-import { isAuthEnabled } from '@/lib/supabase'
+import { isAuthEnabled } from '@/lib/supabase/admin'
 
 // POST /api/auth/seed - Create demo user for testing
 export async function POST() {
