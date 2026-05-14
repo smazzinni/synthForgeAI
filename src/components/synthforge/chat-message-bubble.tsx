@@ -180,14 +180,15 @@ export const ChatMessageBubble = React.memo(function ChatMessageBubble({
 
         {msg.isStreaming && !msg.content ? (
           <div className="space-y-2">
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 className="h-4 w-4 animate-spin text-amber-600" />
-              <span>Thinking<AnimatedDots /></span>
-            </div>
-            {/* Live reasoning steps while thinking - auto-expanded */}
-            {parsedSteps.length > 0 && (
+            {/* Live reasoning steps while thinking - auto-expanded (replaces duplicate "Thinking" text) */}
+            {parsedSteps.length > 0 ? (
               <div className="mt-1">
                 <ReasoningTimeline steps={parsedSteps} msgId={msg.id} autoOpen={true} />
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin text-amber-600" />
+                <span>Thinking<AnimatedDots /></span>
               </div>
             )}
           </div>

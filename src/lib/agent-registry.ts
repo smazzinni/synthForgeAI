@@ -5,7 +5,7 @@
 // right sub-agent based on capability matching.
 
 export type AgentStatus = 'available' | 'busy' | 'offline' | 'error'
-export type SkillCategory = 'discovery' | 'schema' | 'generation' | 'validation' | 'quality' | 'orchestration' | 'pii' | 'transform'
+export type SkillCategory = 'discovery' | 'schema' | 'generation' | 'validation' | 'quality' | 'orchestration' | 'pii' | 'transform' | 'optimization' | 'prompt_engineering'
 
 export interface AgentSkill {
   /** Unique skill identifier, e.g. "domain_detection" */
@@ -259,6 +259,78 @@ export const SKILLS: Record<string, AgentSkill> = {
     tags: ['orchestration', 'pipeline'],
     estimatedDurationMs: 1000,
     priority: 1
+  },
+
+  // Optimization Agent Skills
+  cost_analysis: {
+    id: 'cost_analysis',
+    name: 'Cost Analysis',
+    category: 'optimization',
+    description: 'Analyzes token usage and estimates costs for data generation. Recommends cost-effective strategies.',
+    inputSchema: { tokenUsage: 'object', rowCount: 'number', columnCount: 'number' },
+    outputSchema: { estimatedCost: 'number', recommendations: 'string[]', reasoningSteps: 'ReasoningStep[]' },
+    tags: ['optimization', 'cost'],
+    estimatedDurationMs: 3000,
+    priority: 1
+  },
+  performance_optimization: {
+    id: 'performance_optimization',
+    name: 'Performance Optimization',
+    category: 'optimization',
+    description: 'Analyzes generation speed bottlenecks and recommends batch sizes and schema simplifications.',
+    inputSchema: { tables: 'object', generationTime: 'number?' },
+    outputSchema: { recommendations: 'string[]', optimalBatchSize: 'number', reasoningSteps: 'ReasoningStep[]' },
+    tags: ['optimization', 'performance'],
+    estimatedDurationMs: 4000,
+    priority: 2
+  },
+
+  // Prompt Engineering Agent Skills
+  prompt_analysis: {
+    id: 'prompt_analysis',
+    name: 'Prompt Analysis',
+    category: 'prompt_engineering',
+    description: 'Analyzes user prompts for clarity and specificity. Identifies ambiguous requirements and missing constraints.',
+    inputSchema: { userPrompt: 'string', domain: 'string?' },
+    outputSchema: { clarityScore: 'number', issues: 'string[]', reasoningSteps: 'ReasoningStep[]' },
+    tags: ['prompt_engineering', 'analysis'],
+    estimatedDurationMs: 3000,
+    priority: 1
+  },
+  prompt_refinement: {
+    id: 'prompt_refinement',
+    name: 'Prompt Refinement',
+    category: 'prompt_engineering',
+    description: 'Reformulates vague requests into specific data generation instructions with domain context and constraints.',
+    inputSchema: { userPrompt: 'string', analysis: 'object' },
+    outputSchema: { refinedPrompt: 'string', improvements: 'string[]', reasoningSteps: 'ReasoningStep[]' },
+    tags: ['prompt_engineering', 'refinement'],
+    estimatedDurationMs: 5000,
+    priority: 2
+  },
+
+  // Transform Agent Skills
+  data_transformation: {
+    id: 'data_transformation',
+    name: 'Data Transformation',
+    category: 'transform',
+    description: 'Transforms data between schema formats, converts data types, and applies field mappings.',
+    inputSchema: { sourceData: 'object', targetSchema: 'object', mapping: 'object?' },
+    outputSchema: { transformedData: 'object', sqlCode: 'string?', reasoningSteps: 'ReasoningStep[]' },
+    tags: ['transform', 'data'],
+    estimatedDurationMs: 8000,
+    priority: 1
+  },
+  schema_migration: {
+    id: 'schema_migration',
+    name: 'Schema Migration',
+    category: 'transform',
+    description: 'Migrates data from one schema version to another, handling schema evolution and preserving integrity.',
+    inputSchema: { sourceData: 'object', sourceSchema: 'object', targetSchema: 'object' },
+    outputSchema: { migratedData: 'object', migrationSQL: 'string', reasoningSteps: 'ReasoningStep[]' },
+    tags: ['transform', 'migration'],
+    estimatedDurationMs: 6000,
+    priority: 2
   }
 }
 
@@ -370,6 +442,54 @@ class AgentRegistry {
       systemPromptKey: 'auto',
       skills: [SKILLS.task_routing, SKILLS.pipeline_orchestration],
       maxConcurrency: 3,
+      status: 'available',
+      lastHeartbeat: now,
+      tasksCompleted: 0,
+      tasksFailed: 0,
+      avgExecutionTimeMs: 0,
+      activeTaskIds: []
+    })
+
+    this.agents.set('optimization-agent', {
+      id: 'optimization-agent',
+      name: 'Optimization Agent',
+      role: 'Analyzes and optimizes cost and performance of synthetic data generation',
+      phase: 2,
+      systemPromptKey: 'optimization',
+      skills: [SKILLS.cost_analysis, SKILLS.performance_optimization],
+      maxConcurrency: 2,
+      status: 'available',
+      lastHeartbeat: now,
+      tasksCompleted: 0,
+      tasksFailed: 0,
+      avgExecutionTimeMs: 0,
+      activeTaskIds: []
+    })
+
+    this.agents.set('prompt-engineering-agent', {
+      id: 'prompt-engineering-agent',
+      name: 'Prompt Engineering Agent',
+      role: 'Refines and optimizes prompts for better data generation results',
+      phase: 1,
+      systemPromptKey: 'prompt_engineering',
+      skills: [SKILLS.prompt_analysis, SKILLS.prompt_refinement],
+      maxConcurrency: 2,
+      status: 'available',
+      lastHeartbeat: now,
+      tasksCompleted: 0,
+      tasksFailed: 0,
+      avgExecutionTimeMs: 0,
+      activeTaskIds: []
+    })
+
+    this.agents.set('transform-agent', {
+      id: 'transform-agent',
+      name: 'Transform Agent',
+      role: 'Handles data transformation and migration between schemas',
+      phase: 3,
+      systemPromptKey: 'transform',
+      skills: [SKILLS.data_transformation, SKILLS.schema_migration],
+      maxConcurrency: 1,
       status: 'available',
       lastHeartbeat: now,
       tasksCompleted: 0,

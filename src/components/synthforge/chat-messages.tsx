@@ -239,9 +239,42 @@ const ChatMessage = React.memo(function ChatMessage({
         </div>
 
         {msg.isStreaming && !msg.content ? (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin text-amber-600" />
-            <span>Thinking<AnimatedDots /></span>
+          <div className="space-y-2">
+            {parsedSteps.length > 0 ? (
+              <div className="mt-1">
+                <div className="flex items-center gap-1 text-xs text-muted-foreground mb-2">
+                  <Loader2 className="h-4 w-4 animate-spin text-amber-600" />
+                  <span className="font-medium">Agent Reasoning</span>
+                </div>
+                <div className="space-y-1.5 pl-1">
+                  {parsedSteps.map((step, i) => (
+                    <div key={i} className="flex items-start gap-2 text-xs">
+                      <div className="mt-0.5 shrink-0">
+                        {step.status === 'completed' && <Check className="h-3 w-3 text-green-600" />}
+                        {step.status === 'running' && <Loader2 className="h-3 w-3 text-yellow-600 animate-spin" />}
+                        {step.status === 'failed' && <AlertCircle className="h-3 w-3 text-red-600" />}
+                        {step.status === 'pending' && <Circle className="h-3 w-3 text-slate-300" />}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-medium">{step.label}</span>
+                          <Badge variant="outline" className="text-[10px] px-1 py-0 font-mono">{step.type.replace('_', ' ')}</Badge>
+                        </div>
+                        <p className="text-muted-foreground">{step.description}</p>
+                        {step.output && (
+                          <p className="text-green-700 mt-0.5 font-mono text-[11px] leading-tight">{step.output}</p>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin text-amber-600" />
+                <span>Thinking<AnimatedDots /></span>
+              </div>
+            )}
           </div>
         ) : (
           <>
@@ -513,7 +546,7 @@ export const ChatMessages = React.memo(function ChatMessages({
             >
               <div className="bg-muted/50 rounded-2xl rounded-bl-md px-3 py-2.5 flex items-center gap-2">
                 <Loader2 className="h-4 w-4 animate-spin text-amber-600" />
-                <span className="text-sm text-muted-foreground">Thinking<AnimatedDots /></span>
+                <span className="text-sm text-muted-foreground">Processing<AnimatedDots /></span>
               </div>
             </motion.div>
           )}

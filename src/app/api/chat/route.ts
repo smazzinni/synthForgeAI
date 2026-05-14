@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { chatCompletion, chatCompletionStream, estimateCost, parseAgentResponse, getSystemPrompt, getSubagentPrompt, detectPII, scoreDataQuality, inferSchemaFromData, type AgentStep, type PIIDetectionResult, type DataQualityScore } from '@/lib/ai'
+import { broadcastAgentStep, broadcastAgentReasoning, broadcastDataChunk, broadcastDataComplete } from '@/lib/websocket'
 
-export const maxDuration = 90
+export const maxDuration = 60
 
 // POST /api/chat - Send message and get AI response
 export async function POST(request: NextRequest) {
@@ -160,6 +161,14 @@ export async function POST(request: NextRequest) {
                       // ─── Multi-Step Agent Execution ──────────────────
                       multiStepHandled = true
                       const agentSteps: AgentStep[] = parsed.steps
+                      // Limit steps to prevent runaway pipelines (max 4 steps in streaming mode)
+                      const stepsToExecute = agentSteps.slice(0, 4)
+                      if (agentSteps.length > 4) {
+                        safeEnqueue(encoder.encode(`data: ${JSON.stringify({
+                          type: 'agent_step',
+                          data: { stepIndex: -1, agent: 'orchestrator', task: `Pipeline limited to 4 steps (${agentSteps.length} requested)`, status: 'completed' }
+                        })}\n\n`))
+                      }
                       let accumulatedContext = fullContent
                       let allTables: Record<string, Record<string, unknown>[]> = {}
                       let allReasoningSteps: Array<{ type: string; label: string; description: string; status: string; output?: string }> = []
@@ -170,24 +179,26 @@ export async function POST(request: NextRequest) {
                       }
 
                       // Emit initial step plan
-                      for (let i = 0; i < agentSteps.length; i++) {
+                      for (let i = 0; i < stepsToExecute.length; i++) {
                         if (streamClosed) break
                         safeEnqueue(encoder.encode(`data: ${JSON.stringify({
                           type: 'agent_step',
-                          data: { stepIndex: i, agent: agentSteps[i].agent, task: agentSteps[i].task, status: 'pending' }
+                          data: { stepIndex: i, agent: stepsToExecute[i].agent, task: stepsToExecute[i].task, status: 'pending' }
                         })}\n\n`))
                       }
 
                       // Execute each step sequentially
-                      for (let i = 0; i < agentSteps.length; i++) {
+                      for (let i = 0; i < stepsToExecute.length; i++) {
                         if (streamClosed) break
-                        const step = agentSteps[i]
+                        const step = stepsToExecute[i]
 
                         // Mark step as running
                         safeEnqueue(encoder.encode(`data: ${JSON.stringify({
                           type: 'agent_step',
                           data: { stepIndex: i, agent: step.agent, task: step.task, status: 'running' }
                         })}\n\n`))
+                        // WebSocket broadcast for agent step
+                        try { broadcastAgentStep(conversationId_, { stepIndex: i, agent: step.agent, task: step.task, status: 'running' }) } catch { /* non-fatal */ }
 
                         try {
                           const subagentPrompt = getSubagentPrompt(step.agent)
@@ -198,11 +209,16 @@ export async function POST(request: NextRequest) {
                             { role: 'user' as const, content: `Task: ${step.task}\n\nPrevious context:\n${accumulatedContext.slice(-4000)}${schemaContext ? '\n\nDatabase Schema:\n' + schemaContext : ''}` }
                           ]
 
-                          const stepResponse = await chatCompletion({
-                            messages: subagentMessages,
-                            temperature: 0.7,
-                            maxTokens: 4096
-                          })
+                          const stepResponse = await Promise.race([
+                            chatCompletion({
+                              messages: subagentMessages,
+                              temperature: 0.7,
+                              maxTokens: 4096
+                            }),
+                            new Promise<never>((_, reject) =>
+                              setTimeout(() => reject(new Error('Step timed out')), 30_000)
+                            )
+                          ])
 
                           const stepParsed = parseAgentResponse(stepResponse.content)
                           const stepOutput = stepParsed?.explanation || stepResponse.content.slice(0, 200)
@@ -236,6 +252,8 @@ export async function POST(request: NextRequest) {
                               reasoningSteps: stepParsed?.reasoningSteps || []
                             }
                           })}\n\n`))
+                          // WebSocket broadcast for completed step
+                          try { broadcastAgentStep(conversationId_, { stepIndex: i, agent: step.agent, task: step.task, status: 'completed', output: stepOutput }) } catch { /* non-fatal */ }
 
                           accumulatedContext += `\n\nStep ${i + 1} (${step.agent}) output: ${stepOutput}`
                           tokensIn += stepResponse.tokensIn
@@ -256,8 +274,26 @@ export async function POST(request: NextRequest) {
                         }
                       }
 
-                      // If any tables were generated across all steps, emit them as content
+                      // If any tables were generated across all steps, emit them with chunked data support
                       if (Object.keys(allTables).length > 0 && !streamClosed) {
+                        // Progressive data emission - send tables in chunks for large datasets
+                        for (const [tableName, rows] of Object.entries(allTables)) {
+                          if (Array.isArray(rows) && rows.length > 50 && !streamClosed) {
+                            // Split into chunks of 25 rows for progressive loading
+                            const chunkSize = 25
+                            for (let j = 0; j < rows.length; j += chunkSize) {
+                              if (streamClosed) break
+                              const chunk = rows.slice(j, j + chunkSize)
+                              safeEnqueue(encoder.encode(`data: ${JSON.stringify({
+                                type: 'data_chunk',
+                                data: { tableName, rows: chunk, offset: j, total: rows.length }
+                              })}\n\n`))
+                              // WebSocket broadcast for data chunk
+                              try { broadcastDataChunk(databaseId_, { tableName, rows: chunk, offset: j, total: rows.length }) } catch { /* non-fatal */ }
+                            }
+                          }
+                        }
+
                         const finalContent = JSON.stringify({
                           action: 'generate',
                           agentName: 'orchestrator',
@@ -273,6 +309,8 @@ export async function POST(request: NextRequest) {
                           type: 'content',
                           data: finalContent
                         })}\n\n`))
+                        // WebSocket broadcast for data complete
+                        try { broadcastDataComplete(databaseId_, Object.keys(allTables), Object.values(allTables).reduce((s, r) => s + (Array.isArray(r) ? r.length : 0), 0)) } catch { /* non-fatal */ }
                       }
                     }
                   }

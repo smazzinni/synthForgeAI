@@ -53,6 +53,16 @@ import { StudioView } from '@/components/synthforge/studio-view'
 import type { Workspace, Project, Database_, Message, Conversation, AgentStepUI, QualityReportData, View, AgentMode, ReasoningStep } from '@/components/synthforge/types'
 import { fadeInUp, staggerContainer, staggerItem, gradientStyle } from '@/components/synthforge/types'
 
+// Real-time events hook for WebSocket/SSE updates
+import { useRealtimeEvents } from '@/hooks/use-realtime-events'
+
+// ─── Safe trim that handles non-string values ──────────────────
+const safeTrim = (val: unknown): string => {
+  if (typeof val === 'string') return val.trim()
+  if (val == null) return ''
+  return String(val).trim()
+}
+
 // ─── Main App ──────────────────────────────────────────
 export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId?: string }) {
   const [view, setView] = useState<View>('landing')
@@ -95,6 +105,43 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
   const abortControllerRef = useRef<AbortController | null>(null)
   const streamingIdRef = useRef<string | null>(null)
   const { toast } = useToast()
+
+  // ─── Real-time events (WebSocket/SSE) ──────────────
+  const { isConnected: isWSConnected } = useRealtimeEvents({
+    target: conversation?.id ? `conv:${conversation.id}` : activeDb?.id ? `db:${activeDb.id}` : undefined,
+    onAgentStep: (data) => {
+      // Update agent steps in real-time from WebSocket
+      setAgentSteps(prev => {
+        const existing = prev.findIndex((_, i) => i === data.stepIndex)
+        const newStep: AgentStepUI = {
+          agent: data.agent,
+          task: data.task,
+          status: data.status as AgentStepUI['status'],
+          output: data.output
+        }
+        if (existing >= 0) {
+          const updated = [...prev]
+          updated[existing] = newStep
+          return updated
+        }
+        return [...prev, newStep]
+      })
+    },
+    onDataChunk: (data) => {
+      // Progressively update data in the active database view
+      if (activeDb?.id && !isLoading) {
+        // Only update if we're not in the middle of a streaming chat response
+        // (the chat SSE handler already manages streaming data)
+      }
+    },
+    onDataComplete: (data) => {
+      // Refresh database data when generation completes
+      if (activeDb?.id) {
+        refreshDatabase(activeDb.id)
+      }
+    },
+    autoConnect: false // Don't auto-connect; SSE is the primary transport during chat
+  })
 
   // ─── Network status tracking ────────────────────────
   useEffect(() => {
@@ -351,6 +398,26 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
               setAgentSteps([...currentAgentSteps])
             }
 
+            // Handle progressive data chunks for large datasets
+            if (event.type === 'data_chunk') {
+              const { tableName, rows: chunkRows, offset, total } = event.data as { tableName: string; rows: Record<string, unknown>[]; offset: number; total: number }
+              setMessages(prev => prev.map(m => {
+                if (m.id !== streamId) return m
+                try {
+                  const existing = JSON.parse(m.tablesJson || '{}')
+                  if (!existing[tableName]) existing[tableName] = []
+                  // Only append if this chunk starts where our current data ends
+                  const currentLen = existing[tableName].length
+                  if (offset <= currentLen) {
+                    existing[tableName] = [...existing[tableName].slice(0, offset), ...chunkRows]
+                  } else {
+                    existing[tableName] = [...existing[tableName], ...chunkRows]
+                  }
+                  return { ...m, tablesJson: JSON.stringify(existing), generationStatus: 'generating' as const }
+                } catch { return m }
+              }))
+            }
+
             if (event.type === 'done') {
               const tokensIn = event.data?.tokensIn || 0
               const tokensOut = event.data?.tokensOut || 0
@@ -473,7 +540,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
   }, [messages, sendMessage])
 
   const handleSendMessage = useCallback(async (messageText: string, files: { name: string; content: string; type: string }[] = []) => {
-    const msgText = messageText.trim() || 'Generate data from the attached file(s)'
+    const msgText = safeTrim(messageText) || 'Generate data from the attached file(s)'
     setAttachedFiles([])
     await sendMessage(msgText, files)
   }, [sendMessage])
@@ -548,9 +615,9 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
   }, [])
 
   const createDatabase = async () => {
-    if (!newDbName.trim() || !projects[0]) return
+    if (!safeTrim(newDbName) || !projects[0]) return
     let schemaObj = {}
-    if (newDbSchema.trim()) {
+    if (safeTrim(newDbSchema)) {
       try { schemaObj = JSON.parse(newDbSchema) } catch {
         toast({ title: 'Invalid JSON', description: 'Schema must be valid JSON', variant: 'destructive' }); return
       }

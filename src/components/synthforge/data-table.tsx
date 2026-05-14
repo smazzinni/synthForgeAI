@@ -30,8 +30,19 @@ export const DataTable = React.memo(function DataTable({
   const [page, setPage] = useState(0)
   const [visibleCount, setVisibleCount] = useState(initialPageSize ?? 50)
   const colCount = allRows.length > 0 ? Object.keys(allRows[0]).length : 0
-  const dynamicPageSize = colCount > 15 ? 10 : colCount > 10 ? 15 : 20
-  const pageSize = dynamicPageSize
+  const rowCount = allRows.length
+
+  // Dynamic page size based on columns and data characteristics
+  const getDynamicPageSize = () => {
+    if (colCount > 20) return 10   // Very wide tables - fewer rows visible
+    if (colCount > 15) return 15
+    if (colCount > 10) return 20
+    if (rowCount > 200) return 20  // Large datasets - moderate page size
+    return 25
+  }
+  const pageSize = getDynamicPageSize()
+  // Dynamic load-more increment based on data size
+  const loadMoreIncrement = rowCount > 200 ? 100 : rowCount > 50 ? 50 : 25
   const visibleRows = allRows.slice(0, visibleCount)
   const hasMore = visibleCount < allRows.length
   const totalPages = Math.ceil(visibleRows.length / pageSize)
@@ -127,8 +138,8 @@ export const DataTable = React.memo(function DataTable({
       </CardHeader>
       <CardContent>
         {pageRows.length > 0 ? (
-          <div className="max-h-80 overflow-auto">
-            <table className="w-full text-xs min-w-max" role="table">
+          <div className="max-h-80 overflow-x-auto overflow-y-auto">
+            <table className="w-full text-xs min-w-max" role="table" style={{ tableLayout: 'auto' }}>
               <thead>
                 <tr className="border-b bg-muted/30 sticky top-0">
                   {Object.keys(pageRows[0]).map(key => {
@@ -188,7 +199,7 @@ export const DataTable = React.memo(function DataTable({
               variant="outline"
               size="sm"
               className="text-xs"
-              onClick={() => setVisibleCount(prev => prev + 50)}
+              onClick={() => setVisibleCount(prev => prev + loadMoreIncrement)}
             >
               <ArrowDown className="h-3 w-3 mr-1" />
               Load More ({allRows.length - visibleCount} remaining)
