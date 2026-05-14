@@ -12,46 +12,54 @@ export function isAuthEnabled(): boolean {
 let _adminClient: SupabaseClient | null = null
 export function getSupabaseAdmin(): SupabaseClient {
   if (!_adminClient) {
-    _adminClient = createClient(
-      process.env.SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_KEY!,
-      { auth: { autoRefreshToken: false, persistSession: false } }
-    )
+    const url = process.env.SUPABASE_URL
+    const key = process.env.SUPABASE_SERVICE_KEY
+    if (!url || !key) {
+      throw new Error('[Supabase] Missing SUPABASE_URL or SUPABASE_SERVICE_KEY env vars')
+    }
+    _adminClient = createClient(url, key, {
+      auth: { autoRefreshToken: false, persistSession: false }
+    })
   }
   return _adminClient
 }
 
 // ─── Client-side public client (limited access via anon key) ────
+let _publicClient: SupabaseClient | null = null
 export function getSupabaseClient(): SupabaseClient {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-  )
+  if (!_publicClient) {
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL
+    const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    if (!url || !key) {
+      throw new Error('[Supabase] Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY env vars')
+    }
+    _publicClient = createClient(url, key)
+  }
+  return _publicClient
 }
 
 // ─── Server-side client with cookie-based auth ──────────────────
-export async function getSupabaseServerClient(request?: NextRequest) {
+export async function getSupabaseServerClient(_request?: NextRequest) {
   const cookieStore = await cookies()
-  return createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        getAll() {
-          return cookieStore.getAll()
-        },
-        setAll(cookiesToSet) {
-          try {
-            cookiesToSet.forEach(({ name, value, options }) =>
-              cookieStore.set(name, value, options)
-            )
-          } catch {
-            // Called from Server Component — cannot set cookies
-          }
-        },
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL!
+  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+
+  return createServerClient(url, key, {
+    cookies: {
+      getAll() {
+        return cookieStore.getAll()
       },
-    }
-  )
+      setAll(cookiesToSet) {
+        try {
+          cookiesToSet.forEach(({ name, value, options }) =>
+            cookieStore.set(name, value, options)
+          )
+        } catch {
+          // Called from Server Component — cannot set cookies
+        }
+      },
+    },
+  })
 }
 
 // ─── Get user info from request (headers or cookies) ────────────
@@ -121,14 +129,4 @@ export interface AuthenticatedUser {
 export async function requireAuth(request: NextRequest): Promise<AuthenticatedUser> {
   const { getAuthenticatedUser } = await import('@/lib/auth')
   return getAuthenticatedUser(request)
-}
-
-// ─── Get user's workspace IDs for tenant isolation ──────────────
-export async function getUserWorkspaceIds(userId: string): Promise<string[]> {
-  const { db } = await import('@/lib/db')
-  const workspaces = await db.workspace.findMany({
-    where: { userId },
-    select: { id: true },
-  })
-  return workspaces.map(w => w.id)
 }

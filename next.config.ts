@@ -29,7 +29,11 @@ const nextConfig: NextConfig = {
       },
     ]
   },
-  serverExternalPackages: ['sharp'],
+  // Remove sharp from serverExternalPackages to avoid SIGBUS
+  // serverExternalPackages: ['sharp'],
+  images: {
+    unoptimized: true,
+  },
 };
 
 export default nextConfig;

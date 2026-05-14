@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { Suspense, useState } from 'react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { useAuth } from '@/hooks/use-auth'
@@ -11,7 +11,7 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Zap, Loader2, AlertCircle } from 'lucide-react'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 
-export default function LoginPage() {
+function LoginForm() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const { signIn } = useAuth()
@@ -29,7 +29,7 @@ export default function LoginPage() {
     try {
       const { error } = await signIn(email, password)
       if (error) {
-        setError(error.message)
+        setError(error instanceof Error ? error.message : String(error))
       } else {
         router.push(redirect)
         router.refresh()
@@ -118,5 +118,17 @@ export default function LoginPage() {
         </CardFooter>
       </Card>
     </div>
+  )
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={
+      <div className="min-h-screen flex items-center justify-center">
+        <Loader2 className="h-8 w-8 animate-spin text-amber-600" />
+      </div>
+    }>
+      <LoginForm />
+    </Suspense>
   )
 }

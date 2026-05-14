@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
-import { db } from '@/lib/db'
-import { getSupabaseAdmin, isAuthEnabled } from '@/lib/supabase'
+import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import { isAuthEnabled } from '@/lib/supabase'
 
 // POST /api/auth/seed - Create demo user for testing
 export async function POST() {
@@ -8,20 +8,9 @@ export async function POST() {
     const demoEmail = 'demo@synthforge.ai'
     const demoPassword = 'Demo@1234'
 
-    // Check if demo user already exists locally
-    const existing = await db.user.findUnique({ where: { email: demoEmail } })
-
-    if (existing) {
-      return NextResponse.json({
-        message: 'Demo user already exists',
-        credentials: { email: demoEmail, password: demoPassword },
-        user: { id: existing.id, email: existing.email, name: existing.name, tenantId: existing.tenantId },
-      })
-    }
-
     let supabaseId = 'demo-supabase-id'
 
-    // If auth is enabled, create user in Supabase too
+    // If auth is enabled, create user in Supabase
     if (isAuthEnabled()) {
       try {
         const supabase = getSupabaseAdmin()
@@ -55,56 +44,23 @@ export async function POST() {
       }
     }
 
-    // Create demo user locally
-    const user = await db.user.create({
-      data: {
+    // Create demo profile in Supabase
+    try {
+      const supabase = getSupabaseAdmin()
+      await supabase.from('profiles').upsert({
+        id: supabaseId,
         email: demoEmail,
-        name: 'Demo User',
-        supabaseId,
-        tenantId: 'demo-tenant',
-        role: 'admin',
-      },
-    })
-
-    // Create demo workspace
-    const workspace = await db.workspace.create({
-      data: {
-        name: 'Demo Workspace',
-        slug: 'demo-workspace',
-        userId: user.id,
-      },
-    })
-
-    // Create demo project
-    const project = await db.project.create({
-      data: {
-        name: 'Sample Project',
-        description: 'Demo project for testing SynthForge AI',
-        workspaceId: workspace.id,
-      },
-    })
-
-    // Create demo database
-    const database = await db.database.create({
-      data: {
-        name: 'Sample Database',
-        dbType: 'postgresql',
-        schemaJson: JSON.stringify({
-          users: { columns: { id: 'INTEGER', name: 'VARCHAR(255)', email: 'VARCHAR(255)', role: 'VARCHAR(50)', created_at: 'TIMESTAMP' } },
-          orders: { columns: { id: 'INTEGER', user_id: 'INTEGER', total: 'DECIMAL(10,2)', status: 'VARCHAR(50)', created_at: 'TIMESTAMP' } },
-        }),
-        dataJson: '{}',
-        projectId: project.id,
-      },
-    })
+        full_name: 'Demo User',
+        role: 'owner',
+      })
+    } catch {
+      // Profile creation is optional
+    }
 
     return NextResponse.json({
-      message: 'Demo user created successfully',
+      message: 'Demo user ready',
       credentials: { email: demoEmail, password: demoPassword },
-      user: { id: user.id, email: user.email, name: user.name, tenantId: user.tenantId },
-      workspace: { id: workspace.id, name: workspace.name },
-      project: { id: project.id, name: project.name },
-      database: { id: database.id, name: database.name },
+      user: { id: supabaseId, email: demoEmail, name: 'Demo User', tenantId: 'demo-tenant' },
     }, { status: 201 })
   } catch (error) {
     console.error('[Auth Seed] Error:', error)

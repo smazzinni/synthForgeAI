@@ -1,27 +1,45 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { agentRegistry, SKILLS } from '@/lib/agent-registry'
-import { agentBus } from '@/lib/agent-bus'
-import { heartbeatMonitor, ensureHeartbeatStarted } from '@/lib/agent-heartbeat'
-import { agentOrchestrator } from '@/lib/agent-orchestrator'
 
-// Ensure heartbeat monitoring is started
-ensureHeartbeatStarted()
+// Lazy-loaded agent modules to prevent background intervals from running on startup
+let _agentRegistry: typeof import('@/lib/agent-registry').agentRegistry | null = null
+let _heartbeatMonitor: typeof import('@/lib/agent-heartbeat').heartbeatMonitor | null = null
+let _agentOrchestrator: typeof import('@/lib/agent-orchestrator').agentOrchestrator | null = null
+let _agentBus: typeof import('@/lib/agent-bus').agentBus | null = null
+let _SKILLS: typeof import('@/lib/agent-registry').SKILLS | null = null
+
+async function loadModules() {
+  if (!_agentRegistry) {
+    const registry = await import('@/lib/agent-registry')
+    _agentRegistry = registry.agentRegistry
+    _SKILLS = registry.SKILLS
+    
+    const heartbeat = await import('@/lib/agent-heartbeat')
+    _heartbeatMonitor = heartbeat.heartbeatMonitor
+    
+    const orchestrator = await import('@/lib/agent-orchestrator')
+    _agentOrchestrator = orchestrator.agentOrchestrator
+    
+    const bus = await import('@/lib/agent-bus')
+    _agentBus = bus.agentBus
+  }
+}
 
 // GET /api/agents - Get agent registry status, skills, and heartbeat info
 export async function GET(request: NextRequest) {
   try {
+    await loadModules()
+    
     const view = request.nextUrl.searchParams.get('view') || 'status'
 
-    if (view === 'skills') {
-      // Return skills registry
-      const skills = agentOrchestrator.getSkillsRegistry()
+    if (view === 'skills' && _agentOrchestrator && _SKILLS) {
+      const skills = _agentOrchestrator.getSkillsRegistry()
       const categories = [...new Set(skills.map(s => s.category))]
       return NextResponse.json({
         skills,
         categories,
         totalSkills: skills.length,
         skillDefinitions: Object.fromEntries(
-          Object.entries(SKILLS).map(([key, skill]) => [key, {
+          Object.entries(_SKILLS).map(([key, skill]) => [key, {
             id: skill.id,
             name: skill.name,
             category: skill.category,
@@ -35,31 +53,32 @@ export async function GET(request: NextRequest) {
       })
     }
 
-    if (view === 'heartbeat') {
-      // Return heartbeat status for all agents
+    if (view === 'heartbeat' && _heartbeatMonitor) {
       return NextResponse.json({
-        agents: heartbeatMonitor.getStatus(),
-        config: heartbeatMonitor.getConfig()
+        agents: _heartbeatMonitor.getStatus(),
+        config: _heartbeatMonitor.getConfig()
       })
     }
 
-    if (view === 'bus') {
-      // Return message bus status
+    if (view === 'bus' && _agentBus) {
       const limit = parseInt(request.nextUrl.searchParams.get('limit') || '50')
       const channel = request.nextUrl.searchParams.get('channel') || undefined
       return NextResponse.json({
-        messages: agentBus.getHistory({ channel, limit }),
-        pipelineStates: agentBus.getStateByPrefix('pipeline:')
+        messages: _agentBus.getHistory({ channel, limit }),
+        pipelineStates: _agentBus.getStateByPrefix('pipeline:')
       })
     }
 
-    if (view === 'system') {
-      // Return full system diagnostics
-      return NextResponse.json(agentOrchestrator.getSystemStatus())
+    if (view === 'system' && _agentOrchestrator) {
+      return NextResponse.json(_agentOrchestrator.getSystemStatus())
     }
 
     // Default: Return agent status overview
-    const agents = agentRegistry.getAll().map(a => ({
+    if (!_agentRegistry) {
+      return NextResponse.json({ error: 'Agent registry not available' }, { status: 503 })
+    }
+
+    const agents = _agentRegistry.getAll().map(a => ({
       id: a.id,
       name: a.name,
       role: a.role,
@@ -74,7 +93,7 @@ export async function GET(request: NextRequest) {
       lastHeartbeat: a.lastHeartbeat
     }))
 
-    const summary = agentRegistry.getSummary()
+    const summary = _agentRegistry.getSummary()
 
     return NextResponse.json({
       agents,
@@ -90,6 +109,8 @@ export async function GET(request: NextRequest) {
 // POST /api/agents - Send heartbeat, update agent status, or route tasks
 export async function POST(request: NextRequest) {
   try {
+    await loadModules()
+    
     let body: Record<string, unknown>
     try {
       body = await request.json()
@@ -108,9 +129,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'action required' }, { status: 400 })
     }
 
-    if (action === 'heartbeat' && agentId) {
-      heartbeatMonitor.processHeartbeat(agentId)
-      const agent = agentRegistry.get(agentId)
+    if (action === 'heartbeat' && agentId && _heartbeatMonitor && _agentRegistry) {
+      _heartbeatMonitor.processHeartbeat(agentId)
+      const agent = _agentRegistry.get(agentId)
       return NextResponse.json({
         agentId,
         status: agent?.status || 'unknown',
@@ -118,13 +139,13 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    if (action === 'ping' && agentId) {
-      heartbeatMonitor.ping(agentId)
+    if (action === 'ping' && agentId && _heartbeatMonitor) {
+      _heartbeatMonitor.ping(agentId)
       return NextResponse.json({ agentId, pong: true })
     }
 
-    if (action === 'route' && skillId) {
-      const bestAgent = agentOrchestrator.routeTask(skillId, priority || 0)
+    if (action === 'route' && skillId && _agentOrchestrator) {
+      const bestAgent = _agentOrchestrator.routeTask(skillId, priority || 0)
       return NextResponse.json({
         skillId,
         assignedAgent: bestAgent ? {
@@ -137,13 +158,12 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    if (action === 'reset') {
-      // Reset agent metrics (for testing)
-      for (const agent of agentRegistry.getAll()) {
-        agentRegistry.updateStatus(agent.id, 'available')
-        heartbeatMonitor.ping(agent.id)
+    if (action === 'reset' && _agentRegistry && _heartbeatMonitor && _agentBus) {
+      for (const agent of _agentRegistry.getAll()) {
+        _agentRegistry.updateStatus(agent.id, 'available')
+        _heartbeatMonitor.ping(agent.id)
       }
-      agentBus.reset()
+      _agentBus.reset()
       return NextResponse.json({ message: 'Agent system reset' })
     }
 

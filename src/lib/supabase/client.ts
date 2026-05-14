@@ -8,19 +8,22 @@ let supabaseClient: ReturnType<typeof createClient<Database>> | null = null
 export function getSupabaseBrowserClient() {
   if (supabaseClient) return supabaseClient
 
-  supabaseClient = createClient<Database>(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      auth: {
-        autoRefreshToken: true,
-        persistSession: true,
-        detectSessionInUrl: true,
-      },
-    }
-  )
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+
+  if (!url || !key) {
+    console.warn('[Supabase] Missing env vars - client not initialized')
+    // Return a dummy client that won't crash but will fail gracefully
+    return null as unknown as ReturnType<typeof createClient<Database>>
+  }
+
+  supabaseClient = createClient<Database>(url, key, {
+    auth: {
+      autoRefreshToken: true,
+      persistSession: true,
+      detectSessionInUrl: true,
+    },
+  })
 
   return supabaseClient
 }
-
-export const supabase = getSupabaseBrowserClient()

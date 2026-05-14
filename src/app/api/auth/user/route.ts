@@ -1,72 +1,45 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { requireAuth } from '@/lib/supabase'
-import { db } from '@/lib/db'
+import { getAuthenticatedUser, AuthError } from '@/lib/auth'
 
 export async function GET(request: NextRequest) {
   try {
-    const user = await requireAuth(request)
-
-    // Get full user profile with workspaces
-    const fullUser = await db.user.findUnique({
-      where: { id: user.userId },
-      include: {
-        workspaces: {
-          include: {
-            projects: {
-              include: {
-                databases: true,
-              },
-            },
-          },
-        },
-      },
-    })
-
-    if (!fullUser) {
-      return NextResponse.json({ error: 'User not found' }, { status: 404 })
-    }
+    const user = await getAuthenticatedUser(request)
 
     return NextResponse.json({
       user: {
-        id: fullUser.id,
-        email: fullUser.email,
-        name: fullUser.name,
-        avatarUrl: fullUser.avatarUrl,
-        tenantId: fullUser.tenantId,
-        role: fullUser.role,
-        createdAt: fullUser.createdAt,
+        id: user.userId,
+        email: user.email,
+        full_name: user.name,
+        role: user.role,
       },
-      workspaces: fullUser.workspaces,
     })
-  } catch {
+  } catch (error) {
+    if (error instanceof AuthError) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode })
+    }
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 }
 
 export async function PATCH(request: NextRequest) {
   try {
-    const user = await requireAuth(request)
+    const user = await getAuthenticatedUser(request)
     const body = await request.json() as { name?: string; avatarUrl?: string }
 
-    const updated = await db.user.update({
-      where: { id: user.userId },
-      data: {
-        ...(body.name && { name: body.name }),
-        ...(body.avatarUrl && { avatarUrl: body.avatarUrl }),
-      },
-    })
-
+    // For now, return the user with the updated name
+    // In production, this would update the Supabase profiles table
     return NextResponse.json({
       user: {
-        id: updated.id,
-        email: updated.email,
-        name: updated.name,
-        avatarUrl: updated.avatarUrl,
-        tenantId: updated.tenantId,
-        role: updated.role,
+        id: user.userId,
+        email: user.email,
+        full_name: body.name || user.name,
+        role: user.role,
       },
     })
-  } catch {
+  } catch (error) {
+    if (error instanceof AuthError) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode })
+    }
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 }

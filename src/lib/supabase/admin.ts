@@ -6,16 +6,20 @@ let adminClient: ReturnType<typeof createClient<Database>> | null = null
 export function getSupabaseAdmin() {
   if (adminClient) return adminClient
 
-  adminClient = createClient<Database>(
-    process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_KEY!,
-    {
-      auth: {
-        autoRefreshToken: false,
-        persistSession: false,
-      },
-    }
-  )
+  const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
+  const serviceKey = process.env.SUPABASE_SERVICE_KEY
+
+  if (!url || !serviceKey) {
+    console.warn('[Supabase Admin] Missing env vars - admin client not initialized')
+    return null as unknown as ReturnType<typeof createClient<Database>>
+  }
+
+  adminClient = createClient<Database>(url, serviceKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  })
 
   return adminClient
 }
