@@ -9,10 +9,10 @@
 
 | Status | Count |
 |--------|-------|
-| ✅ Implemented | 31 |
+| ✅ Implemented | 34 |
 | 🚧 In Progress | 3 |
-| 📋 Planned | 19 |
-| ❌ Not Started | 8 |
+| 📋 Planned | 18 |
+| ❌ Not Started | 6 |
 | **Total** | **61** |
 
 ---
@@ -170,16 +170,16 @@
 | # | Feature | Status | Priority | Description | Notes |
 |---|---------|--------|----------|-------------|-------|
 | I-01 | SSE Streaming | ✅ | P0 | Server-Sent Events for real-time AI response streaming | Fully implemented in chat API |
-| I-02 | WebSocket Updates | 📋 | P1 | WebSocket-based real-time updates for agent status, pipeline progress | Socket.io infrastructure available |
+| I-02 | WebSocket/SSE Real-Time Updates | ✅ | P1 | SSE-based real-time updates for agent status, pipeline progress, data chunks | EventBroadcaster with room-based delivery, useRealtimeEvents hook |
 | I-03 | Live Agent Dashboard | 🚧 | P1 | Real-time agent health, pipeline status, message bus visualization | Agent status API exists, UI partially built |
 
 ### 5.2 Additional Agents
 
 | # | Feature | Status | Priority | Description | Notes |
 |---|---------|--------|----------|-------------|-------|
-| I-04 | Optimization Agent | ❌ | P2 | Cost/performance optimization for data generation | |
-| I-05 | Prompt Engineering Agent | ❌ | P2 | Automated prompt refinement and testing | |
-| I-06 | Transform Agent | ❌ | P2 | Data transformation and migration between schemas | Skill category defined in registry |
+| I-04 | Optimization Agent | ✅ | P2 | Cost/performance optimization for data generation | Prompt defined in ai.ts, registered in agent-registry.ts, routes via orchestrator |
+| I-05 | Prompt Engineering Agent | ✅ | P2 | Automated prompt refinement and testing | Prompt defined in ai.ts, registered in agent-registry.ts, routes via orchestrator |
+| I-06 | Transform Agent | ✅ | P2 | Data transformation and migration between schemas | Prompt defined in ai.ts, registered in agent-registry.ts, routes via orchestrator |
 
 ### 5.3 Export & Integration
 
@@ -234,13 +234,13 @@ Data generation, domain detection, quality scoring, PII detection, auto-fix, and
 
 Minimal progress on enterprise features. ApiKey model exists but is not yet wired up. Auth, RBAC, billing, compliance, and advanced features are planned but not started.
 
-### Infrastructure — 2/13 (15%)
+### Infrastructure — 5/13 (38%)
 
 ```
-██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 15%
+███████████████░░░░░░░░░░░░░░░░░░░░░░░░░ 38%
 ```
 
-SSE streaming is fully implemented. Agent dashboard is partially built. WebSocket, additional agents, advanced export, and developer tooling are not yet started.
+SSE streaming, SSE real-time updates (I-02), and 3 additional agents (I-04/I-05/I-06) are implemented. Health check endpoint added. Agent dashboard is partially built. Advanced export and developer tooling are not yet started.
 
 ---
 
@@ -301,7 +301,7 @@ SSE streaming is fully implemented. Agent dashboard is partially built. WebSocke
 | Workflow Automation | 📋 |
 | Custom Skills | 📋 |
 | Live Connect | 📋 |
-| WebSocket Updates | 📋 |
+| WebSocket Updates | ✅ |
 | Live Agent Dashboard | 🚧 |
 | API Documentation (OpenAPI) | 🚧 |
 
@@ -316,9 +316,9 @@ SSE streaming is fully implemented. Agent dashboard is partially built. WebSocke
 | Mock REST API | 📋 |
 | Database Profiling | 📋 |
 | Prompt Versioning & A/B Testing | 📋 |
-| Optimization Agent | ❌ |
-| Prompt Engineering Agent | ❌ |
-| Transform Agent | ❌ |
+| Optimization Agent | ✅ |
+| Prompt Engineering Agent | ✅ |
+| Transform Agent | ✅ |
 | PDF Export | ❌ |
 | DOCX Export | ❌ |
 | SDK Generation | ❌ |
@@ -338,16 +338,16 @@ SSE streaming is fully implemented. Agent dashboard is partially built. WebSocke
 | Metric | Value |
 |--------|-------|
 | Total Features | 61 |
-| Implemented | 31 (51%) |
+| Implemented | 34 (56%) |
 | In Progress | 3 (5%) |
-| Planned | 19 (31%) |
-| Not Started | 8 (13%) |
+| Planned | 18 (30%) |
+| Not Started | 6 (10%) |
 | Core Platform Completion | 100% |
 | AI/Agent System Completion | 100% |
 | Data & Quality Completion | 100% |
 | Enterprise Completion | 7% |
-| Infrastructure Completion | 15% |
-| **Overall Completion** | **56%** |
+| Infrastructure Completion | 38% |
+| **Overall Completion** | **61%** |
 
 ---
 
@@ -355,6 +355,7 @@ SSE streaming is fully implemented. Agent dashboard is partially built. WebSocke
 
 | Date | Milestone |
 |------|-----------|
+| 2026-05-14 | Server stability fixes: Prisma resilience, SSE flood protection, instrumentation.ts, health endpoint, SSE debounce |
 | 2026-05-14 | Dynamic AI-generated questions: replaced hardcoded option templates with context-aware domain-research-driven questions |
 | 2025-03-05 | Feature tracking document created |
 | 2025-03-04 | Multi-agent pipeline with orchestrator fully operational |

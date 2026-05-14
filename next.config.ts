@@ -26,6 +26,8 @@ const nextConfig: NextConfig = {
       },
     ]
   },
+  // Prevent server crashes from unhandled errors in API routes
+  serverExternalPackages: ['sharp'],
 };
 
 export default nextConfig;

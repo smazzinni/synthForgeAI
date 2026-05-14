@@ -33,6 +33,7 @@ interface RealtimeEvent {
  *
  * CRITICAL FIX: Uses refs for callbacks to prevent infinite reconnection loops
  * caused by unstable callback references in the dependency array.
+ * Also adds debounce to prevent rapid reconnection when target changes.
  */
 export function useRealtimeEvents(options: UseRealtimeEventsOptions = {}) {
   const {
@@ -101,7 +102,7 @@ export function useRealtimeEvents(options: UseRealtimeEventsOptions = {}) {
         if (!response.ok || !response.body) {
           // Only schedule reconnect if not aborted and autoConnect is still true
           if (!controller.signal.aborted && autoConnect) {
-            reconnectTimerRef.current = setTimeout(connectSSE, 5000) // Increased from 3s to 5s
+            reconnectTimerRef.current = setTimeout(connectSSE, 5000)
           }
           return
         }
@@ -161,14 +162,14 @@ export function useRealtimeEvents(options: UseRealtimeEventsOptions = {}) {
         setIsConnected(false)
         // Auto-reconnect after connection closes (with longer delay to prevent loops)
         if (autoConnect && !controller.signal.aborted) {
-          reconnectTimerRef.current = setTimeout(connectSSE, 5000) // Increased from 2s to 5s
+          reconnectTimerRef.current = setTimeout(connectSSE, 5000)
         }
       } catch (err) {
         setIsConnected(false)
         if (err instanceof DOMException && err.name === 'AbortError') return
         // Auto-reconnect on error (with longer delay)
         if (autoConnect && !controller.signal.aborted) {
-          reconnectTimerRef.current = setTimeout(connectSSE, 10000) // Increased from 5s to 10s
+          reconnectTimerRef.current = setTimeout(connectSSE, 10000)
         }
       }
     }
@@ -176,14 +177,16 @@ export function useRealtimeEvents(options: UseRealtimeEventsOptions = {}) {
     connectSSE()
   }, [target, autoConnect, disconnect]) // Removed callback deps - they're in refs now
 
-  // Auto-connect when target changes
+  // Auto-connect when target changes (with 300ms debounce to prevent rapid reconnection)
   useEffect(() => {
     if (target && autoConnect) {
-      connect()
+      const timer = setTimeout(() => connect(), 300)
+      return () => {
+        clearTimeout(timer)
+        disconnect()
+      }
     }
-    return () => {
-      disconnect()
-    }
+    return () => disconnect()
   }, [target, autoConnect, connect, disconnect])
 
   return {

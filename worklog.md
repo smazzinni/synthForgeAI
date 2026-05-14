@@ -159,3 +159,51 @@ Stage Summary:
 - Horizontal scrolling fixed for data tables
 - I-02/I-04/I-05/I-06 agent features implemented
 - NOTE: Turbopack build fails due to @tailwindcss/postcss Bus Error in container environment (not code-related)
+
+---
+Task ID: 5
+Agent: Main Agent
+Task: Fix 502 Bad Gateway root cause, add workarounds, fix fixable bugs, update tracking docs
+
+Work Log:
+- Diagnosed 502 root cause: Server process crashes due to multiple issues
+  1. Unhandled errors in API routes crashing the Node.js process
+  2. SSE connections flooding the server (no global connection limit)
+  3. No process-level error handlers (uncaughtException/unhandledRejection)
+  4. Prisma client had no error handler or connection retry
+- Fixed /home/z/my-project/src/lib/db.ts:
+  - Added Prisma $on('error') handler to prevent unhandled Prisma errors from crashing the process
+  - Added connectWithRetry() with 3 attempts for initial database connection
+  - Made beforeExit handler more resilient with try-catch
+- Created /home/z/my-project/src/instrumentation.ts:
+  - Added unhandledRejection handler (log but don't crash)
+  - Initially had uncaughtException handler too but it caused server instability, simplified to only handle unhandledRejection
+- Created /home/z/my-project/src/app/api/health/route.ts:
+  - Health check endpoint that verifies database connectivity
+  - Returns 503 if database is unreachable
+- Fixed /home/z/my-project/src/app/api/events/route.ts:
+  - Reduced MAX_CONNECTIONS_PER_TARGET from 3 to 2
+  - Added MAX_GLOBAL_CONNECTIONS = 10 (total across all targets)
+  - Reduced SSE connection timeout from 55s to 30s to prevent resource exhaustion
+  - Improved cleanup logic with dedicated cleanup() function
+  - Added connection counting for better resource tracking
+- Fixed /home/z/my-project/src/hooks/use-realtime-events.ts:
+  - Added 300ms debounce to connect() call in useEffect to prevent rapid reconnection when target changes during navigation
+- Fixed /home/z/my-project/next.config.ts:
+  - Added serverExternalPackages: ['sharp'] for better module handling
+  - Removed invalid experimental.serverTimeout option that was causing warnings
+- Fixed duplicate "thinking" display:
+  - chat-panel.tsx already fixed (checks generationStatus === 'generating' too)
+  - chat-message-bubble.tsx already fixed (shows reasoning OR thinking, not both)
+- Horizontal scrolling already fixed (overflow-x-auto + min-w-fit in studio-view.tsx)
+- Verified favicon.ico exists at public/favicon.ico and returns 200
+- Verified all API endpoints work: /api/health, /api/workspaces, /api/databases, /
+- Server is stable with webpack mode (npm run dev)
+
+Stage Summary:
+- ROOT CAUSE of 502s: Multiple factors - unhandled errors, SSE flooding, no process error handlers
+- Fixes applied: db.ts resilience, SSE flood protection, instrumentation.ts, health endpoint, SSE debounce, next.config.ts improvements
+- All API endpoints return 200: health, workspaces, databases, homepage, favicon
+- Server runs stable on port 3000 with webpack mode
+- Known workaround: Use webpack mode (--webpack flag) instead of turbopack due to container environment CSS processing issues
+- Pending for production: 403 on __nextjs internal routes (hosting proxy issue, not code), Turbopack CSS Bus Error

@@ -9,7 +9,9 @@ export const dynamic = 'force-dynamic'
 
 // Track active connections to prevent connection flooding
 const activeConnections = new Map<string, number>()
-const MAX_CONNECTIONS_PER_TARGET = 3
+const MAX_CONNECTIONS_PER_TARGET = 2
+const MAX_GLOBAL_CONNECTIONS = 10
+let totalActiveConnections = 0
 
 // GET /api/events?target=conv:xxx&since=0 - SSE stream for real-time updates
 export async function GET(request: NextRequest) {
@@ -23,6 +25,14 @@ export async function GET(request: NextRequest) {
     })
   }
 
+  // Global connection limit to prevent server overload
+  if (totalActiveConnections >= MAX_GLOBAL_CONNECTIONS) {
+    return new Response(JSON.stringify({ error: 'Server connection limit reached. Try again later.' }), {
+      status: 429,
+      headers: { 'Content-Type': 'application/json' }
+    })
+  }
+
   // Connection limit per target to prevent flooding
   const currentCount = activeConnections.get(target) || 0
   if (currentCount >= MAX_CONNECTIONS_PER_TARGET) {
@@ -32,10 +42,20 @@ export async function GET(request: NextRequest) {
     })
   }
   activeConnections.set(target, currentCount + 1)
+  totalActiveConnections++
 
   // Create a readable stream that emits SSE events
   const encoder = new TextEncoder()
   let streamClosed = false
+
+  const cleanup = () => {
+    if (!streamClosed) {
+      streamClosed = true
+      const count = activeConnections.get(target) || 1
+      activeConnections.set(target, Math.max(0, count - 1))
+      totalActiveConnections = Math.max(0, totalActiveConnections - 1)
+    }
+  }
 
   const stream = new ReadableStream({
     start(controller) {
@@ -55,6 +75,9 @@ export async function GET(request: NextRequest) {
         } catch {
           streamClosed = true
           clearInterval(heartbeatInterval)
+          unsubscribe()
+          cleanup()
+          try { controller.close() } catch { /* */ }
         }
       }, 15_000)
 
@@ -67,28 +90,24 @@ export async function GET(request: NextRequest) {
           streamClosed = true
           unsubscribe()
           clearInterval(heartbeatInterval)
+          cleanup()
           try { controller.close() } catch { /* */ }
         }
       })
 
-      // Clean up on close - 55 second max SSE connection (within 60s serverless limit)
+      // 30 second max SSE connection (prevents resource exhaustion in dev)
       setTimeout(() => {
         if (!streamClosed) {
           streamClosed = true
           unsubscribe()
           clearInterval(heartbeatInterval)
-          // Decrement connection count
-          const count = activeConnections.get(target) || 1
-          activeConnections.set(target, Math.max(0, count - 1))
+          cleanup()
           try { controller.close() } catch { /* */ }
         }
-      }, 55_000)
+      }, 30_000)
     },
     cancel() {
-      streamClosed = true
-      // Decrement connection count
-      const count = activeConnections.get(target) || 1
-      activeConnections.set(target, Math.max(0, count - 1))
+      cleanup()
     }
   })
 

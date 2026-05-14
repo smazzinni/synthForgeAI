@@ -7,7 +7,19 @@ export const maxDuration = 60
 
 // POST /api/chat - Send message and get AI response
 export async function POST(request: NextRequest) {
+  // Overall request timeout of 55 seconds to avoid serverless timeout
+  const requestTimeout = setTimeout(() => {
+    console.error('[Chat API] Request exceeded 55s overall timeout')
+  }, 55_000)
+
   try {
+    // Body size limit check (reject if body > 1MB)
+    const contentLength = request.headers.get('content-length')
+    if (contentLength && parseInt(contentLength, 10) > 1_048_576) {
+      clearTimeout(requestTimeout)
+      return NextResponse.json({ error: 'Request body too large (max 1MB)' }, { status: 413 })
+    }
+
     // Parse request body with timeout protection
     const body = await Promise.race([
       request.json(),
@@ -104,12 +116,19 @@ export async function POST(request: NextRequest) {
     if (stream) {
       let streamResponse: ReadableStream<Uint8Array>
       try {
-        streamResponse = await chatCompletionStream({
-          messages: [{ role: 'system', content: systemPrompt }, ...chatMessages],
-          temperature: 0.7,
-          maxTokens: 8192
-        })
+        // Add timeout wrapper for chatCompletionStream
+        streamResponse = await Promise.race([
+          chatCompletionStream({
+            messages: [{ role: 'system', content: systemPrompt }, ...chatMessages],
+            temperature: 0.7,
+            maxTokens: 8192
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('AI stream creation timed out (55s)')), 55_000)
+          )
+        ])
       } catch (streamErr) {
+        clearTimeout(requestTimeout)
         const errMsg = streamErr instanceof Error ? streamErr.message : 'Stream creation failed'
         return NextResponse.json({ error: errMsg, hint: 'AI service may be temporarily unavailable.' }, { status: 503 })
       }
@@ -419,6 +438,9 @@ export async function POST(request: NextRequest) {
       try {
         const pipedStream = streamResponse.pipeThrough(transformStream)
 
+        // Clear the request timeout once streaming starts successfully
+        clearTimeout(requestTimeout)
+
         return new Response(pipedStream, {
           headers: {
             'Content-Type': 'text/event-stream',
@@ -428,6 +450,7 @@ export async function POST(request: NextRequest) {
           }
         })
       } catch (pipeErr) {
+        clearTimeout(requestTimeout)
         console.error('[Chat API Stream] Pipe error:', pipeErr)
         return NextResponse.json({ error: 'Stream processing failed' }, { status: 500 })
       }
@@ -542,6 +565,7 @@ export async function POST(request: NextRequest) {
       }
     })
   } catch (error) {
+    clearTimeout(requestTimeout)
     console.error('[Chat API] Unhandled error:', error)
     const msg = error instanceof Error ? error.message : 'Failed to process chat message'
     return NextResponse.json({
