@@ -24,6 +24,13 @@ const nextConfig: NextConfig = {
           { key: 'Access-Control-Allow-Origin', value: '*' },
         ],
       },
+      {
+        // Match Next.js image optimization routes (used by font proxy)
+        source: '/_next/image(.*)',
+        headers: [
+          { key: 'Access-Control-Allow-Origin', value: '*' },
+        ],
+      },
     ]
   },
   // Prevent server crashes from unhandled errors in API routes

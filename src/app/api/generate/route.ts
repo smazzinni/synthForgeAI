@@ -1,16 +1,45 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { chatCompletion, estimateCost } from '@/lib/ai'
+import { chatCompletion, estimateCost, safeTrim } from '@/lib/ai'
+import { getAuthenticatedUser, AuthError, verifyDatabaseAccess } from '@/lib/auth'
 
-// POST /api/generate - Generate synthetic data directly
+// POST /api/generate - Generate synthetic data directly (tenant-scoped)
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json()
-    const { databaseId, prompt, rowCount = 10, format = 'json' } = body
+    const user = await getAuthenticatedUser(request)
 
-    if (!databaseId || !prompt) {
-      return NextResponse.json({ error: 'databaseId and prompt required' }, { status: 400 })
+    // Body size limit check
+    const contentLength = request.headers.get('content-length')
+    if (contentLength && parseInt(contentLength, 10) > 1_048_576) {
+      return NextResponse.json({ error: 'Request body too large (max 1MB)' }, { status: 413 })
     }
+
+    let body: Record<string, unknown>
+    try {
+      body = await request.json()
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+    }
+
+    const { databaseId, prompt, rowCount = 10, format = 'json' } = body as {
+      databaseId?: string; prompt?: string; rowCount?: number; format?: string
+    }
+
+    if (!databaseId || typeof databaseId !== 'string') {
+      return NextResponse.json({ error: 'databaseId required' }, { status: 400 })
+    }
+    if (!prompt || typeof prompt !== 'string' || !safeTrim(prompt)) {
+      return NextResponse.json({ error: 'prompt required' }, { status: 400 })
+    }
+
+    // Verify database belongs to user
+    const dbAccess = await verifyDatabaseAccess(databaseId, user.userId)
+    if (!dbAccess) {
+      return NextResponse.json({ error: 'Database not found or access denied' }, { status: 403 })
+    }
+
+    // Validate rowCount is a reasonable number
+    const safeRowCount = Math.max(1, Math.min(typeof rowCount === 'number' ? rowCount : 10, 1000))
 
     const database = await db.database.findUnique({ where: { id: databaseId } })
     if (!database) {
@@ -19,13 +48,13 @@ export async function POST(request: NextRequest) {
 
     const schemaContext = database.schemaJson ? `\n\nSchema: ${database.schemaJson}` : ''
 
-    const generatePrompt = `Generate ${rowCount} rows of realistic synthetic data for the following request: ${prompt}${schemaContext}
+    const generatePrompt = `Generate ${safeRowCount} rows of realistic synthetic data for the following request: ${prompt}${schemaContext}
 
 Return ONLY a JSON object with this exact format:
 {
   "action": "generate",
   "tables": {
-    "table_name": [array of ${rowCount} row objects with realistic data]
+    "table_name": [array of ${safeRowCount} row objects with realistic data]
   },
   "sqlCode": "INSERT INTO table_name (columns) VALUES (values);",
   "explanation": "Brief explanation"
@@ -59,7 +88,7 @@ Important:
         data: {
           name: `Generated - ${new Date().toLocaleString()}`,
           format,
-          rowCount,
+          rowCount: safeRowCount,
           dataJson: JSON.stringify(parsed.tables),
           schemaJson: database.schemaJson,
           databaseId
@@ -70,7 +99,11 @@ Important:
 
     return NextResponse.json({ content: response.content, cost })
   } catch (error) {
-    console.error('Generate error:', error)
-    return NextResponse.json({ error: 'Failed to generate data' }, { status: 500 })
+    if (error instanceof AuthError) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode })
+    }
+    console.error('[Generate API] Error:', error)
+    const msg = error instanceof Error ? error.message : 'Failed to generate data'
+    return NextResponse.json({ error: msg }, { status: 500 })
   }
 }

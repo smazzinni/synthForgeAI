@@ -7,13 +7,28 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String    @default("")
+  avatarUrl     String    @default("")
+  supabaseId    String    @unique  // Supabase auth user ID
+  role          String    @default("user")  // user | admin
+  tenantId      String    @default("")  // Tenant/org isolation key
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  workspaces    Workspace[]
+}
+
 model Workspace {
   id               String   @id @default(cuid())
   name             String
   slug             String   @unique
   agentInstructions String   @default("")
+  userId           String
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   projects         Project[]
   conversations    Conversation[]
   apiKeys          ApiKey[]

@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { chatCompletion, chatCompletionStream, estimateCost, parseAgentResponse, getSystemPrompt, getSubagentPrompt, detectPII, scoreDataQuality, inferSchemaFromData, type AgentStep, type PIIDetectionResult, type DataQualityScore } from '@/lib/ai'
+import { chatCompletion, chatCompletionStream, estimateCost, parseAgentResponse, getSystemPrompt, getSubagentPrompt, detectPII, scoreDataQuality, inferSchemaFromData, safeTrim, type AgentStep, type PIIDetectionResult, type DataQualityScore } from '@/lib/ai'
 import { broadcastAgentStep, broadcastAgentReasoning, broadcastDataChunk, broadcastDataComplete } from '@/lib/websocket'
+import { getAuthenticatedUser, AuthError, verifyDatabaseAccess, verifyConversationAccess, verifyWorkspaceAccess } from '@/lib/auth'
 
 export const maxDuration = 60
 
-// POST /api/chat - Send message and get AI response
+// POST /api/chat - Send message and get AI response (tenant-scoped)
 export async function POST(request: NextRequest) {
   // Overall request timeout of 55 seconds to avoid serverless timeout
   const requestTimeout = setTimeout(() => {
@@ -13,6 +14,9 @@ export async function POST(request: NextRequest) {
   }, 55_000)
 
   try {
+    // Authenticate user
+    const user = await getAuthenticatedUser(request)
+
     // Body size limit check (reject if body > 1MB)
     const contentLength = request.headers.get('content-length')
     if (contentLength && parseInt(contentLength, 10) > 1_048_576) {
@@ -21,12 +25,20 @@ export async function POST(request: NextRequest) {
     }
 
     // Parse request body with timeout protection
-    const body = await Promise.race([
-      request.json(),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Request body parse timeout')), 10_000)
-      )
-    ]) as {
+    let body: Record<string, unknown>
+    try {
+      body = await Promise.race([
+        request.json(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Request body parse timeout')), 10_000)
+        )
+      ])
+    } catch (parseErr) {
+      clearTimeout(requestTimeout)
+      return NextResponse.json({ error: 'Invalid request body' }, { status: 400 })
+    }
+
+    const { conversationId, message, workspaceId, databaseId, agentMode = 'auto', stream = false, rowCount, files = [] } = body as {
       conversationId?: string
       message?: string
       workspaceId?: string
@@ -37,11 +49,14 @@ export async function POST(request: NextRequest) {
       files?: { name: string; content: string; type: string }[]
     }
 
-    const { conversationId, message, workspaceId, databaseId, agentMode = 'auto', stream = false, rowCount, files = [] } = body
-
-    if (!message || typeof message !== 'string') {
-      return NextResponse.json({ error: 'Message required' }, { status: 400 })
+    if (!message || typeof message !== 'string' || !safeTrim(message)) {
+      clearTimeout(requestTimeout)
+      return NextResponse.json({ error: 'Message required and must be non-empty' }, { status: 400 })
     }
+
+    // Validate agentMode
+    const validAgentModes = ['auto', 'plan', 'execute']
+    const safeAgentMode = validAgentModes.includes(agentMode) ? agentMode : 'auto'
 
     // Find or create conversation
     let conversation = conversationId
@@ -49,17 +64,31 @@ export async function POST(request: NextRequest) {
       : null
 
     if (!conversation && databaseId) {
+      // Verify database belongs to user
+      const dbAccess = await verifyDatabaseAccess(databaseId, user.userId)
+      if (!dbAccess) {
+        clearTimeout(requestTimeout)
+        return NextResponse.json({ error: 'Database not found or access denied' }, { status: 403 })
+      }
+
       let validWorkspaceId = workspaceId
       if (!validWorkspaceId) {
-        const firstWorkspace = await db.workspace.findFirst()
+        const firstWorkspace = await db.workspace.findFirst({ where: { userId: user.userId } })
         validWorkspaceId = firstWorkspace?.id || ''
+      } else {
+        // Verify workspace belongs to user
+        const wsAccess = await verifyWorkspaceAccess(validWorkspaceId, user.userId)
+        if (!wsAccess) {
+          clearTimeout(requestTimeout)
+          return NextResponse.json({ error: 'Workspace not found or access denied' }, { status: 403 })
+        }
       }
       conversation = await db.conversation.create({
         data: {
           title: message.slice(0, 60),
           databaseId,
           workspaceId: validWorkspaceId,
-          agentMode
+          agentMode: safeAgentMode
         },
         include: { messages: true }
       })
@@ -67,6 +96,13 @@ export async function POST(request: NextRequest) {
 
     if (!conversation) {
       return NextResponse.json({ error: 'Conversation not found and no databaseId provided' }, { status: 400 })
+    }
+
+    // Verify conversation belongs to user via workspace
+    const convAccess = await verifyConversationAccess(conversation.id, user.userId)
+    if (!convAccess) {
+      clearTimeout(requestTimeout)
+      return NextResponse.json({ error: 'Conversation not found or access denied' }, { status: 403 })
     }
 
     // Save user message
@@ -101,11 +137,12 @@ export async function POST(request: NextRequest) {
         content: m.content
       }))
 
-    const currentAgentMode = agentMode || conversation.agentMode || 'auto'
+    const currentAgentMode = safeAgentMode || conversation.agentMode || 'auto'
     const systemPrompt = getSystemPrompt(currentAgentMode)
 
-    // Build row count context if specified
-    const rowContext = rowCount ? `\n\nUser wants to generate approximately ${rowCount} rows per table.` : ''
+    // Build row count context if specified (validate rowCount)
+    const safeRowCount = (typeof rowCount === 'number' && rowCount > 0) ? Math.min(rowCount, 1000) : undefined
+    const rowContext = safeRowCount ? `\n\nUser wants to generate approximately ${safeRowCount} rows per table.` : ''
 
     const chatMessages = [
       ...previousMessages,
@@ -566,6 +603,9 @@ export async function POST(request: NextRequest) {
     })
   } catch (error) {
     clearTimeout(requestTimeout)
+    if (error instanceof AuthError) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode })
+    }
     console.error('[Chat API] Unhandled error:', error)
     const msg = error instanceof Error ? error.message : 'Failed to process chat message'
     return NextResponse.json({
@@ -575,15 +615,22 @@ export async function POST(request: NextRequest) {
   }
 }
 
-// GET /api/chat?conversationId=xxx
+// GET /api/chat?conversationId=xxx (tenant-scoped)
 export async function GET(request: NextRequest) {
   try {
+    const user = await getAuthenticatedUser(request)
     const conversationId = request.nextUrl.searchParams.get('conversationId')
     const databaseId = request.nextUrl.searchParams.get('databaseId')
 
     if (!conversationId && databaseId) {
+      // Verify database belongs to user
+      const dbAccess = await verifyDatabaseAccess(databaseId, user.userId)
+      if (!dbAccess) {
+        return NextResponse.json({ error: 'Database not found or access denied' }, { status: 403 })
+      }
+
       const latestConversation = await db.conversation.findFirst({
-        where: { databaseId },
+        where: { databaseId, workspace: { userId: user.userId } },
         include: { messages: { orderBy: { createdAt: 'asc' } } },
         orderBy: { updatedAt: 'desc' }
       })
@@ -596,6 +643,13 @@ export async function GET(request: NextRequest) {
     if (!conversationId) {
       return NextResponse.json({ error: 'conversationId or databaseId required' }, { status: 400 })
     }
+
+    // Verify conversation belongs to user
+    const convAccess = await verifyConversationAccess(conversationId, user.userId)
+    if (!convAccess) {
+      return NextResponse.json({ error: 'Conversation not found or access denied' }, { status: 403 })
+    }
+
     const conversation = await db.conversation.findUnique({
       where: { id: conversationId },
       include: { messages: { orderBy: { createdAt: 'asc' } } }
@@ -605,6 +659,9 @@ export async function GET(request: NextRequest) {
     }
     return NextResponse.json({ conversation })
   } catch (error) {
+    if (error instanceof AuthError) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode })
+    }
     return NextResponse.json({ error: 'Failed to fetch conversation' }, { status: 500 })
   }
 }

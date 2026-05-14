@@ -48,6 +48,9 @@ import { QualityReportPanel } from '@/components/synthforge/quality-report-panel
 import { ERDiagram } from '@/components/synthforge/er-diagram'
 import { ExplorerPanel } from '@/components/explorer-panel'
 import { StudioView } from '@/components/synthforge/studio-view'
+import { LoginForm } from '@/components/synthforge/auth/login-form'
+import { RegisterForm } from '@/components/synthforge/auth/register-form'
+import { UserMenu, type UserInfo } from '@/components/synthforge/auth/user-menu'
 
 // Shared types and animation variants
 import type { Workspace, Project, Database_, Message, Conversation, AgentStepUI, QualityReportData, View, AgentMode, ReasoningStep } from '@/components/synthforge/types'
@@ -87,6 +90,13 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
   const [totalTokens, setTotalTokens] = useState(0)
   const [selectedTableName, setSelectedTableName] = useState<string | null>(null)
   const [isOnline, setIsOnline] = useState(true)
+
+  // ─── Auth state ────────────────────────────────────────
+  const [currentUser, setCurrentUser] = useState<UserInfo | null>(null)
+  const [authView, setAuthView] = useState<'login' | 'register' | null>(null)
+  const [authChecked, setAuthChecked] = useState(false)
+  const [authLoading, setAuthLoading] = useState(false)
+  const [authError, setAuthError] = useState<string | null>(null)
 
   const [explorerView, setExplorerView] = useState<'tree' | 'graph'>('tree')
   const [topologicalSortResult, setTopologicalSortResult] = useState<string[] | null>(null)
@@ -155,6 +165,119 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
       window.removeEventListener('offline', handleOffline)
     }
   }, [])
+
+  // ─── Auth: Check session on mount ──────────────────────
+  useEffect(() => {
+    const checkSession = async () => {
+      try {
+        const res = await fetch('/api/auth/session')
+        const data = await res.json()
+        if (data.authenticated && data.user) {
+          setCurrentUser({
+            id: data.user.id,
+            email: data.user.email,
+            name: data.user.name,
+            role: data.user.role,
+            tenantId: data.user.tenantId,
+            avatarUrl: data.user.avatarUrl,
+          })
+        }
+      } catch { /* silent */ }
+      setAuthChecked(true)
+    }
+    checkSession()
+  }, [])
+
+  // ─── Auth: Login handler ──────────────────────────────
+  const handleLogin = async (email: string, password: string) => {
+    setAuthLoading(true)
+    setAuthError(null)
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Login failed')
+      if (data.user) {
+        setCurrentUser({
+          id: data.user.id,
+          email: data.user.email,
+          name: data.user.name,
+          role: data.user.role,
+          tenantId: data.user.tenantId,
+        })
+        // Store token in cookie for API requests
+        if (data.accessToken) {
+          document.cookie = `sb-access-token=${data.accessToken}; path=/; max-age=86400; samesite=lax`
+        }
+        setAuthView(null)
+        setView('dashboard')
+        await loadWorkspaces()
+      }
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : 'Login failed')
+    } finally {
+      setAuthLoading(false)
+    }
+  }
+
+  // ─── Auth: Register handler ───────────────────────────
+  const handleRegister = async (name: string, email: string, password: string) => {
+    setAuthLoading(true)
+    setAuthError(null)
+    try {
+      const res = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, name }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Registration failed')
+      if (data.user) {
+        setCurrentUser({
+          id: data.user.id,
+          email: data.user.email,
+          name: data.user.name,
+          role: data.user.role,
+          tenantId: data.user.tenantId,
+        })
+        setAuthView(null)
+        setView('dashboard')
+        await loadWorkspaces()
+      }
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : 'Registration failed')
+    } finally {
+      setAuthLoading(false)
+    }
+  }
+
+  // ─── Auth: Logout handler ─────────────────────────────
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' })
+    } catch { /* silent */ }
+    setCurrentUser(null)
+    setAuthView(null)
+    setView('landing')
+    setWorkspaces([])
+    setActiveWorkspace(null)
+    setProjects([])
+    setActiveDb(null)
+    setConversation(null)
+    setMessages([])
+  }
+
+  // ─── Auth: Navigate to dashboard (with auth check) ────
+  const goToDashboard = () => {
+    if (!currentUser) {
+      setAuthView('login')
+    } else {
+      setView('dashboard')
+    }
+  }
 
   // Load workspaces on mount
   useEffect(() => {
@@ -337,7 +460,8 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
 
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue
-          const jsonStr = line.slice(6).trim()
+          const rawJson = line.slice(6)
+          const jsonStr = typeof rawJson === 'string' ? rawJson.trim() : ''
           if (!jsonStr) continue
 
           try {
@@ -834,10 +958,16 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
               <button className="hover:text-foreground transition-colors">Docs</button>
             </div>
             <div className="flex items-center gap-3">
-              <Button variant="ghost" size="sm" onClick={() => setView('dashboard')}>Dashboard</Button>
-              <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-                <Button size="sm" className="bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white" onClick={() => setView('dashboard')}>Get Started Free</Button>
-              </motion.div>
+              {currentUser ? (
+                <UserMenu user={currentUser} onLogout={handleLogout} />
+              ) : (
+                <>
+                  <Button variant="ghost" size="sm" onClick={() => setAuthView('login')}>Sign In</Button>
+                  <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
+                    <Button size="sm" className="bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white" onClick={() => setAuthView('register')}>Get Started Free</Button>
+                  </motion.div>
+                </>
+              )}
             </div>
           </div>
         </motion.nav>
@@ -857,11 +987,11 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
                   </p>
                   <div className="flex flex-wrap gap-3 mb-8">
                     <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-                      <Button size="lg" className="bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white text-base px-8" onClick={() => setView('dashboard')}>
+                      <Button size="lg" className="bg-gradient-to-r from-amber-600 to-red-700 hover:from-amber-700 hover:to-red-800 text-white text-base px-8" onClick={goToDashboard}>
                         Start Generating <ArrowRight className="ml-2 h-4 w-4" />
                       </Button>
                     </motion.div>
-                    <Button size="lg" variant="outline" className="text-base" onClick={() => setView('dashboard')}>Try Demo</Button>
+                    <Button size="lg" variant="outline" className="text-base" onClick={goToDashboard}>Try Demo</Button>
                   </div>
                   <div className="flex gap-6 sm:gap-8">
                     {[{ value: '10M+', label: 'Rows Generated' }, { value: '99.2%', label: 'FK Integrity' }, { value: '<3s', label: 'Avg Gen Time' }].map((stat, i) => (
@@ -958,7 +1088,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
               <h2 className="text-2xl sm:text-3xl font-bold text-white mb-4">Ready to Generate Synthetic Data?</h2>
               <p className="text-white/80 text-base sm:text-lg mb-8 max-w-xl mx-auto">Start creating privacy-safe, realistic synthetic data in seconds. No credit card required.</p>
               <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-                <Button size="lg" className="bg-white text-amber-700 hover:bg-white/90 text-base px-8 font-semibold" onClick={() => setView('dashboard')}>
+                <Button size="lg" className="bg-white text-amber-700 hover:bg-white/90 text-base px-8 font-semibold" onClick={goToDashboard}>
                   Get Started Free <ArrowRight className="ml-2 h-4 w-4" />
                 </Button>
               </motion.div>
@@ -972,6 +1102,37 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
             <p className="text-xs text-muted-foreground">Privacy-safe synthetic data generation</p>
           </div>
         </footer>
+
+        {/* Auth overlay */}
+        <AnimatePresence>
+          {authView && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4"
+              onClick={() => setAuthView(null)}
+            >
+              <div onClick={(e) => e.stopPropagation()}>
+                {authView === 'login' ? (
+                  <LoginForm
+                    onLogin={handleLogin}
+                    onSwitchToRegister={() => { setAuthError(null); setAuthView('register') }}
+                    isLoading={authLoading}
+                    error={authError}
+                  />
+                ) : (
+                  <RegisterForm
+                    onRegister={handleRegister}
+                    onSwitchToLogin={() => { setAuthError(null); setAuthView('login') }}
+                    isLoading={authLoading}
+                    error={authError}
+                  />
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
     )
   }
@@ -1041,6 +1202,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
                   </div>
                 </DialogContent>
               </Dialog>
+              {currentUser && <UserMenu user={currentUser} onLogout={handleLogout} />}
             </div>
           </header>
 

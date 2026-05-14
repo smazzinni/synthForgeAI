@@ -199,8 +199,12 @@ export const ChatMessageBubble = React.memo(function ChatMessageBubble({
             {msg.content && renderAssistantContent(msg.content)}
             {/* Show agent pipeline during multi-step execution */}
             {msg.isStreaming && agentSteps.length > 0 && <AgentPipeline steps={agentSteps} />}
+            {/* Show reasoning timeline while streaming with content (avoid duplicate with completed section below) */}
+            {msg.isStreaming && parsedSteps.length > 0 && (
+              <ReasoningTimeline steps={parsedSteps} msgId={msg.id} autoOpen={true} />
+            )}
             {/* Show generating indicator when streaming with content but no reasoning steps visible */}
-            {msg.isStreaming && !msg.isCancelled && (
+            {msg.isStreaming && !msg.isCancelled && parsedSteps.length === 0 && (
               <div className="flex items-center gap-1.5 text-xs text-muted-foreground mt-1">
                 <Loader2 className="h-3 w-3 animate-spin text-amber-600" />
                 <span>Generating<AnimatedDots /></span>

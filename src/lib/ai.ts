@@ -3,6 +3,13 @@
 
 import ZAI from 'z-ai-web-dev-sdk'
 
+// ─── Safe trim utility to prevent "e.trim is not a function" TypeError ───
+export const safeTrim = (val: unknown): string => {
+  if (typeof val === 'string') return val.trim()
+  if (val == null) return ''
+  return String(val).trim()
+}
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
   content: string
@@ -872,7 +879,9 @@ export async function chatCompletion(request: ChatRequest): Promise<ChatResponse
       )
     ])
 
-    const content = completion.choices[0]?.message?.content || ''
+    // Defensive: ensure content is always a string (API may return null/undefined/non-string)
+    const rawContent = completion.choices[0]?.message?.content
+    const content = typeof rawContent === 'string' ? rawContent : (rawContent != null ? String(rawContent) : '')
     if (!content) {
       throw new Error('AI returned an empty response. Please try again.')
     }
@@ -914,25 +923,27 @@ export function getSubagentPrompt(agentName: string): string {
 
 export function parseAgentResponse(content: string): AgentResponse | null {
   try {
+    // Defensive: ensure content is a string before matching
+    if (typeof content !== 'string' || !content) return null
     const jsonMatch = content.match(/\{[\s\S]*\}/)
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0])
       return {
-        action: parsed.action || 'generate',
-        agentName: parsed.agentName || 'auto-agent',
-        explanation: parsed.explanation || '',
+        action: typeof parsed.action === 'string' ? parsed.action : 'generate',
+        agentName: typeof parsed.agentName === 'string' ? parsed.agentName : 'auto-agent',
+        explanation: typeof parsed.explanation === 'string' ? parsed.explanation : '',
         tables: parsed.tables || undefined,
-        sqlCode: parsed.sqlCode || undefined,
+        sqlCode: typeof parsed.sqlCode === 'string' ? parsed.sqlCode : undefined,
         schemaPlan: parsed.schemaPlan || undefined,
-        reasoningSteps: parsed.reasoningSteps || undefined,
-        options: parsed.options || undefined,
-        followUpQuestions: parsed.followUpQuestions || undefined,
-        steps: parsed.steps || undefined,
+        reasoningSteps: Array.isArray(parsed.reasoningSteps) ? parsed.reasoningSteps : undefined,
+        options: Array.isArray(parsed.options) ? parsed.options : undefined,
+        followUpQuestions: Array.isArray(parsed.followUpQuestions) ? parsed.followUpQuestions : undefined,
+        steps: Array.isArray(parsed.steps) ? parsed.steps : undefined,
         previewTables: parsed.previewTables || undefined,
         optimizedSchema: parsed.optimizedSchema || undefined,
         transformedData: parsed.transformedData || undefined,
-        migrationScript: parsed.migrationScript || undefined,
-        refinedPrompt: parsed.refinedPrompt || undefined
+        migrationScript: typeof parsed.migrationScript === 'string' ? parsed.migrationScript : undefined,
+        refinedPrompt: typeof parsed.refinedPrompt === 'string' ? parsed.refinedPrompt : undefined
       }
     }
   } catch {
@@ -1068,12 +1079,17 @@ export function extractSchemaFromSQL(sql: string): Record<string, { columns: Rec
 }
 
 export function extractSchemaFromCSV(csvText: string, filename: string): Record<string, { columns: Record<string, string> }> {
-  const lines = csvText.trim().split('\n')
+  // Defensive: ensure csvText is actually a string before calling .trim()
+  const safeInput = typeof csvText === 'string' ? csvText : String(csvText ?? '')
+  const lines = safeInput.trim().split('\n')
   if (lines.length === 0) return {}
-  const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''))
+  const headers = lines[0].split(',').map(h => typeof h === 'string' ? h.trim().replace(/"/g, '') : '')
   const columns: Record<string, string> = {}
   for (const header of headers) {
-    const samples = lines.slice(1, 5).map(l => l.split(',')[headers.indexOf(header)]?.trim().replace(/"/g, '')).filter(Boolean)
+    const samples = lines.slice(1, 5).map(l => {
+      const cell = l.split(',')[headers.indexOf(header)]
+      return typeof cell === 'string' ? cell.trim().replace(/"/g, '') : ''
+    }).filter(Boolean)
     if (samples.every(v => /^-?\d+$/.test(v))) columns[header] = 'INTEGER'
     else if (samples.every(v => /^-?\d+\.\d+$/.test(v))) columns[header] = 'DECIMAL'
     else columns[header] = 'VARCHAR(255)'
@@ -1166,7 +1182,9 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
           )
         ])
 
-        const content = completion.choices[0]?.message?.content || ''
+        // Defensive: ensure content is always a string (API may return null/undefined/non-string)
+        const rawContent = completion.choices[0]?.message?.content
+        const content = typeof rawContent === 'string' ? rawContent : (rawContent != null ? String(rawContent) : '')
 
         if (!emitReasoning({ type: 'intent', label: 'Intent Analysis', description: 'Analyzing user request', status: 'completed', output: 'Request understood' })) { safeClose(); return }
         if (!emitReasoning({ type: 'domain_detection', label: 'Domain Detection', description: 'Identifying business domain', status: 'running' })) { safeClose(); return }
@@ -1175,11 +1193,14 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
         if (content) {
           try {
             const parsed = parseAgentResponse(content)
-            if (parsed?.reasoningSteps && parsed.reasoningSteps.length > 0) {
+            if (parsed?.reasoningSteps && Array.isArray(parsed.reasoningSteps) && parsed.reasoningSteps.length > 0) {
               // Emit reasoning steps from the AI response for live reasoning display
               for (const step of parsed.reasoningSteps) {
                 if (controllerClosed) { safeClose(); return }
-                emitReasoning(step)
+                // Validate step structure before emitting
+                if (step && typeof step === 'object' && step.type && step.label) {
+                  emitReasoning(step)
+                }
               }
             }
           } catch { /* non-fatal: emit generic reasoning instead */ }
@@ -1187,6 +1208,7 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
           if (!emitReasoning({ type: 'domain_detection', label: 'Domain Detection', description: 'Identifying business domain', status: 'completed', output: 'Domain detected' })) { safeClose(); return }
           if (!emitReasoning({ type: 'data_strategy', label: 'Data Strategy', description: 'Planning generation', status: 'running' })) { safeClose(); return }
 
+          // Stream content in chunks for progressive display
           const chunkSize = 80
           for (let i = 0; i < content.length; i += chunkSize) {
             if (controllerClosed || controller.desiredSize === null) {
@@ -1198,7 +1220,10 @@ export async function chatCompletionStream(request: ChatRequest): Promise<Readab
               safeClose()
               return
             }
-            await new Promise(r => setTimeout(r, 3))
+            // Small delay for realistic streaming feel (only if more chunks remain)
+            if (i + chunkSize < content.length) {
+              await new Promise(r => setTimeout(r, 3))
+            }
           }
         } else {
           safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', data: 'AI returned an empty response. Please try again.' })}\n\n`))

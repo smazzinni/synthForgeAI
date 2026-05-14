@@ -4,14 +4,18 @@ const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined
 }
 
-export const db = globalForPrisma.prisma ?? new PrismaClient({
+// Force new PrismaClient if schema has changed (added User model)
+// This ensures the client includes all models after schema migration
+const needsNewClient = !globalForPrisma.prisma || !(globalForPrisma.prisma as unknown as Record<string, unknown>).user
+
+export const db = needsNewClient ? new PrismaClient({
   log: ['error'],
   datasources: {
     db: {
       url: process.env.DATABASE_URL || 'file:./db/custom.db'
     }
   }
-})
+}) : globalForPrisma.prisma
 
 if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = db
 

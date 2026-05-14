@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { scoreDataQuality, detectPII, generateFakeValue } from '@/lib/ai'
+import { getAuthenticatedUser, AuthError, verifyDatabaseAccess } from '@/lib/auth'
 
 // ─── Types ─────────────────────────────────────────────
 interface QualityIssue {
@@ -39,18 +40,31 @@ interface QualityReport {
 // ─── Important column patterns ─────────────────────────
 const IMPORTANT_COLUMNS = ['id', 'name', 'email', 'username', 'first_name', 'last_name', 'phone', 'status', 'created_at', 'updated_at']
 
-// POST /api/quality - Run data quality checks
+// POST /api/quality - Run data quality checks (tenant-scoped)
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json() as {
+    const user = await getAuthenticatedUser(request)
+
+    let body: Record<string, unknown>
+    try {
+      body = await request.json()
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+    }
+
+    const { databaseId, autoFix = false } = body as {
       databaseId?: string
       autoFix?: boolean
     }
 
-    const { databaseId, autoFix = false } = body
-
-    if (!databaseId) {
+    if (!databaseId || typeof databaseId !== 'string') {
       return NextResponse.json({ error: 'databaseId required' }, { status: 400 })
+    }
+
+    // Verify database belongs to user
+    const dbAccess = await verifyDatabaseAccess(databaseId, user.userId)
+    if (!dbAccess) {
+      return NextResponse.json({ error: 'Database not found or access denied' }, { status: 403 })
     }
 
     const database = await db.database.findUnique({ where: { id: databaseId } })
@@ -198,7 +212,6 @@ export async function POST(request: NextRequest) {
       }
 
       // ─── 6. Constraint violation checks ───────────────
-      // Check for negative values in columns that should be positive
       const positiveCols = ['age', 'price', 'quantity', 'stock', 'balance', 'salary', 'amount', 'budget', 'capacity']
       for (const col of positiveCols) {
         if (rows.length === 0 || !(col in rows[0])) continue
@@ -217,7 +230,6 @@ export async function POST(request: NextRequest) {
       }
 
       // ─── 7. Data anomaly detection ─────────────────────
-      // Check for identical values in columns that should vary
       const variableCols = ['name', 'email', 'first_name', 'last_name']
       for (const col of variableCols) {
         if (rows.length <= 1 || !(col in rows[0])) continue
@@ -236,13 +248,11 @@ export async function POST(request: NextRequest) {
       }
 
       // ─── Compute table score ───────────────────────────
-      // Use scoreDataQuality for the base score
       let baseScore = 100
       try {
         const qualityResult = scoreDataQuality({ [tableName]: rows })
         baseScore = qualityResult.overall
       } catch {
-        // Manual scoring fallback
         const criticalCount = tableIssues.filter(i => i.severity === 'critical').length
         const warningCount = tableIssues.filter(i => i.severity === 'warning').length
         baseScore = Math.max(0, 100 - criticalCount * 15 - warningCount * 5)
@@ -265,7 +275,6 @@ export async function POST(request: NextRequest) {
       for (const [tableName, rows] of Object.entries(dataJson)) {
         if (!Array.isArray(rows)) continue
 
-        // Fix 1: Replace nulls in important columns with generated values
         for (const row of rows) {
           for (const col of IMPORTANT_COLUMNS) {
             if (col in row && (row[col] === null || row[col] === undefined || row[col] === '')) {
@@ -282,7 +291,6 @@ export async function POST(request: NextRequest) {
           }
         }
 
-        // Fix 2: Fix duplicate IDs
         if (rows.length > 0 && 'id' in rows[0]) {
           const seenIds = new Set<unknown>()
           for (const row of rows) {
@@ -302,7 +310,6 @@ export async function POST(request: NextRequest) {
           }
         }
 
-        // Fix 3: Remove orphan FK references (set to null or valid reference)
         for (const row of rows) {
           for (const col of Object.keys(row)) {
             if (col.endsWith('_id') && col !== 'id') {
@@ -312,7 +319,6 @@ export async function POST(request: NextRequest) {
                 const refIds = new Set(refTable.map((r: Record<string, unknown>) => r.id))
                 if (row[col] !== null && row[col] !== undefined && !refIds.has(row[col])) {
                   const before = row[col]
-                  // Pick a random valid reference
                   const validRef = refTable[Math.floor(Math.random() * refTable.length)] as Record<string, unknown>
                   row[col] = validRef.id
                   modified = true
@@ -329,7 +335,6 @@ export async function POST(request: NextRequest) {
         }
       }
 
-      // Save fixed data back to database
       if (modified) {
         try {
           await db.database.update({
@@ -367,6 +372,9 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ report })
   } catch (error) {
+    if (error instanceof AuthError) {
+      return NextResponse.json({ error: error.message }, { status: error.statusCode })
+    }
     console.error('[Quality API] Error:', error)
     return NextResponse.json({
       error: error instanceof Error ? error.message : 'Quality check failed'

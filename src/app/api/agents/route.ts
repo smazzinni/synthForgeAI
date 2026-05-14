@@ -90,14 +90,23 @@ export async function GET(request: NextRequest) {
 // POST /api/agents - Send heartbeat, update agent status, or route tasks
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json() as {
-      action: 'heartbeat' | 'route' | 'reset' | 'ping'
+    let body: Record<string, unknown>
+    try {
+      body = await request.json()
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+    }
+
+    const { action, agentId, skillId, priority } = body as {
+      action?: 'heartbeat' | 'route' | 'reset' | 'ping'
       agentId?: string
       skillId?: string
       priority?: number
     }
 
-    const { action, agentId, skillId, priority } = body
+    if (!action || typeof action !== 'string') {
+      return NextResponse.json({ error: 'action required' }, { status: 400 })
+    }
 
     if (action === 'heartbeat' && agentId) {
       heartbeatMonitor.processHeartbeat(agentId)

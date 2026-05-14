@@ -127,11 +127,12 @@ export function useRealtimeEvents(options: UseRealtimeEventsOptions = {}) {
             if (line.startsWith(':')) continue
             if (!line.startsWith('data: ')) continue
 
-            const jsonStr = line.slice(6).trim()
-            if (!jsonStr) continue
+            const jsonStr = line.slice(6)
+            const trimmedStr = typeof jsonStr === 'string' ? jsonStr.trim() : ''
+            if (!trimmedStr) continue
 
             try {
-              const event: RealtimeEvent = JSON.parse(jsonStr)
+              const event: RealtimeEvent = JSON.parse(trimmedStr)
               setLastEvent(event)
               setEventCount(prev => prev + 1)
 
