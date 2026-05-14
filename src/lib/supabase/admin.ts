@@ -1,9 +1,9 @@
-import { createClient } from '@supabase/supabase-js'
+import { createClient, SupabaseClient } from '@supabase/supabase-js'
 import type { Database } from './types'
 
-let adminClient: ReturnType<typeof createClient<Database>> | null = null
+let adminClient: SupabaseClient<Database> | null = null
 
-export function getSupabaseAdmin() {
+export function getSupabaseAdmin(): SupabaseClient<Database> | null {
   if (adminClient) return adminClient
 
   const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
@@ -11,7 +11,7 @@ export function getSupabaseAdmin() {
 
   if (!url || !serviceKey) {
     console.warn('[Supabase Admin] Missing env vars - admin client not initialized')
-    return null as unknown as ReturnType<typeof createClient<Database>>
+    return null
   }
 
   adminClient = createClient<Database>(url, serviceKey, {

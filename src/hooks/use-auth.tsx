@@ -33,62 +33,93 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const supabase = getSupabaseBrowserClient()
+
     if (!supabase) {
-      // No Supabase client available - run in dev/demo mode
+      // No Supabase client available - run in dev/demo mode (no auth)
       setLoading(false)
       return
     }
 
+    let mounted = true
+
+    // Get initial session
     supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session)
-      setUser(session?.user ?? null)
-      setLoading(false)
+      if (mounted) {
+        setSession(session)
+        setUser(session?.user ?? null)
+        setLoading(false)
+      }
     }).catch(() => {
-      setLoading(false)
+      if (mounted) setLoading(false)
     })
 
+    // Listen for auth state changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setSession(session)
-      setUser(session?.user ?? null)
-      setLoading(false)
+      if (mounted) {
+        setSession(session)
+        setUser(session?.user ?? null)
+        setLoading(false)
+      }
     })
 
-    return () => subscription.unsubscribe()
+    return () => {
+      mounted = false
+      subscription.unsubscribe()
+    }
   }, [])
 
   const signIn = useCallback(async (email: string, password: string) => {
     const supabase = getSupabaseBrowserClient()
     if (!supabase) return { data: null, error: new Error('Auth not configured') }
-    return supabase.auth.signInWithPassword({ email, password })
+    try {
+      const result = await supabase.auth.signInWithPassword({ email, password })
+      return result
+    } catch (err) {
+      return { data: null, error: err }
+    }
   }, [])
 
   const signUp = useCallback(async (email: string, password: string, fullName: string) => {
     const supabase = getSupabaseBrowserClient()
     if (!supabase) return { data: null, error: new Error('Auth not configured') }
-    return supabase.auth.signUp({
-      email,
-      password,
-      options: { data: { full_name: fullName } },
-    })
+    try {
+      const result = await supabase.auth.signUp({
+        email,
+        password,
+        options: { data: { full_name: fullName } },
+      })
+      return result
+    } catch (err) {
+      return { data: null, error: err }
+    }
   }, [])
 
   const signOut = useCallback(async () => {
     const supabase = getSupabaseBrowserClient()
     if (supabase) {
       const { error } = await supabase.auth.signOut()
-      if (!error) window.location.href = '/login'
+      if (!error && typeof window !== 'undefined') {
+        window.location.href = '/login'
+      }
       return { error }
     }
-    window.location.href = '/login'
+    if (typeof window !== 'undefined') {
+      window.location.href = '/login'
+    }
     return { error: null }
   }, [])
 
   const resetPassword = useCallback(async (email: string) => {
     const supabase = getSupabaseBrowserClient()
     if (!supabase) return { data: null, error: new Error('Auth not configured') }
-    return supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: `${window.location.origin}/auth/callback`,
-    })
+    try {
+      const result = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/auth/callback`,
+      })
+      return result
+    } catch (err) {
+      return { data: null, error: err }
+    }
   }, [])
 
   return (

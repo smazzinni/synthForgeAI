@@ -10,12 +10,13 @@ export function isAuthEnabled(): boolean {
 
 // ─── Server-side admin client (full access, use carefully) ──────
 let _adminClient: SupabaseClient | null = null
-export function getSupabaseAdmin(): SupabaseClient {
+export function getSupabaseAdmin(): SupabaseClient | null {
   if (!_adminClient) {
-    const url = process.env.SUPABASE_URL
+    const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
     const key = process.env.SUPABASE_SERVICE_KEY
     if (!url || !key) {
-      throw new Error('[Supabase] Missing SUPABASE_URL or SUPABASE_SERVICE_KEY env vars')
+      console.warn('[Supabase] Missing SUPABASE_URL or SUPABASE_SERVICE_KEY env vars')
+      return null
     }
     _adminClient = createClient(url, key, {
       auth: { autoRefreshToken: false, persistSession: false }
@@ -26,12 +27,13 @@ export function getSupabaseAdmin(): SupabaseClient {
 
 // ─── Client-side public client (limited access via anon key) ────
 let _publicClient: SupabaseClient | null = null
-export function getSupabaseClient(): SupabaseClient {
+export function getSupabaseClient(): SupabaseClient | null {
   if (!_publicClient) {
     const url = process.env.NEXT_PUBLIC_SUPABASE_URL
     const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
     if (!url || !key) {
-      throw new Error('[Supabase] Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY env vars')
+      console.warn('[Supabase] Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY env vars')
+      return null
     }
     _publicClient = createClient(url, key)
   }
@@ -41,8 +43,12 @@ export function getSupabaseClient(): SupabaseClient {
 // ─── Server-side client with cookie-based auth ──────────────────
 export async function getSupabaseServerClient(_request?: NextRequest) {
   const cookieStore = await cookies()
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL!
-  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+
+  if (!url || !key) {
+    throw new Error('[Supabase] Missing env vars for server client')
+  }
 
   return createServerClient(url, key, {
     cookies: {
@@ -100,9 +106,10 @@ export async function getUserFromRequest(request: NextRequest): Promise<UserInfo
     if (!accessToken) return null
 
     // Verify token with Supabase
-    const supabase = getSupabaseAdmin()
-    const { data: { user }, error } = await supabase.auth.getUser(accessToken)
+    const admin = getSupabaseAdmin()
+    if (!admin) return null
 
+    const { data: { user }, error } = await admin.auth.getUser(accessToken)
     if (error || !user) return null
 
     return {

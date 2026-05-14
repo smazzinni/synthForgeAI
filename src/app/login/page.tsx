@@ -1,6 +1,6 @@
 'use client'
 
-import { Suspense, useState } from 'react'
+import { Suspense, useState, useEffect } from 'react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { useAuth } from '@/hooks/use-auth'
@@ -14,12 +14,19 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 function LoginForm() {
   const router = useRouter()
   const searchParams = useSearchParams()
-  const { signIn } = useAuth()
+  const { signIn, user, loading: authLoading } = useAuth()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const redirect = searchParams.get('redirect') || '/dashboard'
+
+  // If user is already authenticated, redirect them
+  useEffect(() => {
+    if (!authLoading && user) {
+      router.replace(redirect)
+    }
+  }, [user, authLoading, router, redirect])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -27,18 +34,49 @@ function LoginForm() {
     setError(null)
 
     try {
-      const { error } = await signIn(email, password)
+      const { error } = await signIn(email, password) as { error: Error | null }
       if (error) {
-        setError(error instanceof Error ? error.message : String(error))
+        // Map common Supabase error messages
+        const message = error.message || String(error)
+        if (message.includes('Invalid login credentials')) {
+          setError('Invalid email or password. Please try again.')
+        } else if (message.includes('Email not confirmed')) {
+          setError('Please check your email and confirm your account before signing in.')
+        } else if (message.includes('Too many requests')) {
+          setError('Too many login attempts. Please wait a moment and try again.')
+        } else {
+          setError(message)
+        }
+        setLoading(false)
       } else {
-        router.push(redirect)
-        router.refresh()
+        // Don't set loading false - the useEffect will redirect
+        // Give a small delay for the auth state to update
+        setTimeout(() => {
+          router.push(redirect)
+        }, 500)
       }
     } catch {
       setError('An unexpected error occurred. Please try again.')
-    } finally {
       setLoading(false)
     }
+  }
+
+  // Show loading while checking auth state
+  if (authLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <Loader2 className="h-8 w-8 animate-spin text-amber-600" />
+      </div>
+    )
+  }
+
+  // Don't render the form if already authenticated (redirect will happen)
+  if (user) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <Loader2 className="h-8 w-8 animate-spin text-amber-600" />
+      </div>
+    )
   }
 
   return (
@@ -73,6 +111,7 @@ function LoginForm() {
                 onChange={(e) => setEmail(e.target.value)}
                 required
                 disabled={loading}
+                autoComplete="email"
               />
             </div>
             <div className="space-y-2">
@@ -90,6 +129,7 @@ function LoginForm() {
                 onChange={(e) => setPassword(e.target.value)}
                 required
                 disabled={loading}
+                autoComplete="current-password"
               />
             </div>
             <Button

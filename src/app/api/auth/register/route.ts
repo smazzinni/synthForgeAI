@@ -3,7 +3,8 @@ import { getSupabaseAdmin } from '@/lib/supabase/admin'
 
 export async function POST(request: NextRequest) {
   try {
-    const { email, password, full_name } = await request.json()
+    const body = await request.json()
+    const { email, password, full_name } = body
 
     if (!email || !password) {
       return NextResponse.json({ error: 'Email and password are required' }, { status: 400 })
@@ -14,6 +15,10 @@ export async function POST(request: NextRequest) {
     }
 
     const admin = getSupabaseAdmin()
+    if (!admin) {
+      return NextResponse.json({ error: 'Auth service not configured' }, { status: 503 })
+    }
+
     const { data, error } = await admin.auth.admin.createUser({
       email,
       password,
@@ -29,7 +34,8 @@ export async function POST(request: NextRequest) {
       user: data.user,
       message: 'User created successfully',
     })
-  } catch {
+  } catch (err) {
+    console.error('[Auth Register] Error:', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

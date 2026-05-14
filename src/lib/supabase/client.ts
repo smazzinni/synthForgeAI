@@ -1,11 +1,11 @@
 'use client'
 
-import { createClient } from '@supabase/supabase-js'
+import { createClient, SupabaseClient } from '@supabase/supabase-js'
 import type { Database } from './types'
 
-let supabaseClient: ReturnType<typeof createClient<Database>> | null = null
+let supabaseClient: SupabaseClient<Database> | null = null
 
-export function getSupabaseBrowserClient() {
+export function getSupabaseBrowserClient(): SupabaseClient<Database> | null {
   if (supabaseClient) return supabaseClient
 
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL
@@ -13,8 +13,7 @@ export function getSupabaseBrowserClient() {
 
   if (!url || !key) {
     console.warn('[Supabase] Missing env vars - client not initialized')
-    // Return a dummy client that won't crash but will fail gracefully
-    return null as unknown as ReturnType<typeof createClient<Database>>
+    return null
   }
 
   supabaseClient = createClient<Database>(url, key, {

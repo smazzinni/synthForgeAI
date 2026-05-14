@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { useAuth } from '@/hooks/use-auth'
@@ -13,13 +13,20 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 
 export default function SignUpPage() {
   const router = useRouter()
-  const { signUp } = useAuth()
+  const { signUp, user, loading: authLoading } = useAuth()
   const [fullName, setFullName] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState(false)
+
+  // If user is already authenticated, redirect to dashboard
+  useEffect(() => {
+    if (!authLoading && user) {
+      router.replace('/dashboard')
+    }
+  }, [user, authLoading, router])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -33,22 +40,54 @@ export default function SignUpPage() {
     }
 
     try {
-      const { error } = await signUp(email, password, fullName)
+      const { error } = await signUp(email, password, fullName) as { error: Error | null }
       if (error) {
-        setError(error.message)
+        const message = error.message || String(error)
+        if (message.includes('already registered')) {
+          setError('An account with this email already exists. Please sign in instead.')
+        } else if (message.includes('Password should be')) {
+          setError('Password does not meet the security requirements.')
+        } else {
+          setError(message)
+        }
+        setLoading(false)
       } else {
         setSuccess(true)
+        setLoading(false)
       }
     } catch {
       setError('An unexpected error occurred. Please try again.')
-    } finally {
       setLoading(false)
     }
+  }
+
+  // Show loading while checking auth state
+  if (authLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <Loader2 className="h-8 w-8 animate-spin text-amber-600" />
+      </div>
+    )
+  }
+
+  // Don't render the form if already authenticated
+  if (user) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <Loader2 className="h-8 w-8 animate-spin text-amber-600" />
+      </div>
+    )
   }
 
   if (success) {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-br from-amber-50 via-background to-red-50 dark:from-amber-950/20 dark:via-background dark:to-red-950/20 p-4">
+        <Link href="/" className="flex items-center gap-2 mb-8">
+          <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center">
+            <Zap className="h-5 w-5 text-white" />
+          </div>
+          <span className="text-2xl font-bold">SynthForge<span className="text-amber-600">AI</span></span>
+        </Link>
         <Card className="w-full max-w-md">
           <CardContent className="pt-6 text-center">
             <CheckCircle2 className="h-12 w-12 text-emerald-500 mx-auto mb-4" />
@@ -109,6 +148,7 @@ export default function SignUpPage() {
                 onChange={(e) => setEmail(e.target.value)}
                 required
                 disabled={loading}
+                autoComplete="email"
               />
             </div>
             <div className="space-y-2">
@@ -122,6 +162,7 @@ export default function SignUpPage() {
                 required
                 disabled={loading}
                 minLength={6}
+                autoComplete="new-password"
               />
             </div>
             <Button

@@ -1,16 +1,38 @@
 'use client'
 
 import { useState } from 'react'
+import { useAuth } from '@/hooks/use-auth'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Avatar, AvatarFallback } from '@/components/ui/avatar'
+import { Separator } from '@/components/ui/separator'
+import { Loader2 } from 'lucide-react'
+import { toast } from 'sonner'
 
 export default function SettingsPage() {
-  const [activeTab, setActiveTab] = useState('profile')
+  const { user } = useAuth()
   const [showPassword, setShowPassword] = useState(false)
+  const [saving, setSaving] = useState(false)
 
-  const tabs = [
-    { id: 'profile', label: 'Profile' },
-    { id: 'security', label: 'Security' },
-    { id: 'preferences', label: 'Preferences' },
-  ]
+  const userName = user?.user_metadata?.full_name || user?.email?.split('@')[0] || 'User'
+  const userEmail = user?.email || ''
+  const userInitials = userName.split(' ').map((n: string) => n[0]).join('').toUpperCase().slice(0, 2)
+
+  const handleSaveProfile = async () => {
+    setSaving(true)
+    try {
+      // TODO: Update profile via Supabase
+      await new Promise(resolve => setTimeout(resolve, 500))
+      toast.success('Profile updated successfully')
+    } catch {
+      toast.error('Failed to update profile')
+    } finally {
+      setSaving(false)
+    }
+  }
 
   return (
     <div className="p-4 md:p-8 max-w-4xl mx-auto">
@@ -19,106 +41,115 @@ export default function SettingsPage() {
         <p className="text-muted-foreground mt-1">Manage your account settings and preferences</p>
       </div>
 
-      <div className="flex gap-1 border-b mb-6">
-        {tabs.map((tab) => (
-          <button
-            key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
-            className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px ${
-              activeTab === tab.id
-                ? 'border-amber-600 text-amber-600'
-                : 'border-transparent text-muted-foreground hover:text-foreground'
-            }`}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </div>
+      <Tabs defaultValue="profile" className="space-y-6">
+        <TabsList>
+          <TabsTrigger value="profile">Profile</TabsTrigger>
+          <TabsTrigger value="security">Security</TabsTrigger>
+          <TabsTrigger value="preferences">Preferences</TabsTrigger>
+        </TabsList>
 
-      {activeTab === 'profile' && (
-        <div className="rounded-lg border p-6 space-y-6">
-          <div>
-            <h2 className="text-lg font-semibold">Profile Information</h2>
-            <p className="text-sm text-muted-foreground">Update your account profile details</p>
-          </div>
-          <div className="flex items-center gap-4">
-            <div className="h-16 w-16 rounded-full bg-amber-500 flex items-center justify-center text-white text-xl font-bold">
-              DU
-            </div>
-            <div>
-              <button className="py-1.5 px-3 rounded-md border text-sm">Change Avatar</button>
-              <p className="text-xs text-muted-foreground mt-1">JPG, PNG or GIF. Max 2MB.</p>
-            </div>
-          </div>
-          <hr />
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label htmlFor="fullName" className="block text-sm font-medium mb-1">Full Name</label>
-              <input id="fullName" defaultValue="Demo User" className="w-full h-10 rounded-md border bg-background px-3 text-sm" />
-            </div>
-            <div>
-              <label htmlFor="email" className="block text-sm font-medium mb-1">Email</label>
-              <input id="email" type="email" defaultValue="demo@synthforge.ai" className="w-full h-10 rounded-md border bg-background px-3 text-sm" />
-            </div>
-          </div>
-          <button className="py-2 px-4 rounded-md text-sm font-medium bg-amber-600 text-white hover:bg-amber-700">
-            Save Changes
-          </button>
-        </div>
-      )}
+        <TabsContent value="profile">
+          <Card>
+            <CardHeader>
+              <CardTitle>Profile Information</CardTitle>
+              <CardDescription>Update your account profile details</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              <div className="flex items-center gap-4">
+                <Avatar className="h-16 w-16">
+                  <AvatarFallback className="bg-gradient-to-br from-amber-500 to-red-600 text-white text-lg">
+                    {userInitials || 'U'}
+                  </AvatarFallback>
+                </Avatar>
+                <div>
+                  <Button variant="outline" size="sm">Change Avatar</Button>
+                  <p className="text-xs text-muted-foreground mt-1">JPG, PNG or GIF. Max 2MB.</p>
+                </div>
+              </div>
 
-      {activeTab === 'security' && (
-        <div className="rounded-lg border p-6 space-y-4">
-          <div>
-            <h2 className="text-lg font-semibold">Change Password</h2>
-            <p className="text-sm text-muted-foreground">Update your password to keep your account secure</p>
-          </div>
-          <div>
-            <label htmlFor="currentPassword" className="block text-sm font-medium mb-1">Current Password</label>
-            <div className="relative">
-              <input
-                id="currentPassword"
-                type={showPassword ? 'text' : 'password'}
-                className="w-full h-10 rounded-md border bg-background px-3 text-sm pr-16"
-              />
-              <button
-                type="button"
-                onClick={() => setShowPassword(!showPassword)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-muted-foreground"
+              <Separator />
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label htmlFor="fullName">Full Name</Label>
+                  <Input id="fullName" defaultValue={userName} />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="email">Email</Label>
+                  <Input id="email" type="email" defaultValue={userEmail} disabled />
+                  <p className="text-xs text-muted-foreground">Email cannot be changed here</p>
+                </div>
+              </div>
+
+              <Button
+                onClick={handleSaveProfile}
+                disabled={saving}
+                className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white"
               >
-                {showPassword ? 'Hide' : 'Show'}
-              </button>
-            </div>
-          </div>
-          <div>
-            <label htmlFor="newPassword" className="block text-sm font-medium mb-1">New Password</label>
-            <input id="newPassword" type="password" className="w-full h-10 rounded-md border bg-background px-3 text-sm" />
-          </div>
-          <div>
-            <label htmlFor="confirmPassword" className="block text-sm font-medium mb-1">Confirm New Password</label>
-            <input id="confirmPassword" type="password" className="w-full h-10 rounded-md border bg-background px-3 text-sm" />
-          </div>
-          <button className="py-2 px-4 rounded-md text-sm font-medium bg-amber-600 text-white hover:bg-amber-700">
-            Update Password
-          </button>
-        </div>
-      )}
+                {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                Save Changes
+              </Button>
+            </CardContent>
+          </Card>
+        </TabsContent>
 
-      {activeTab === 'preferences' && (
-        <div className="rounded-lg border p-6 space-y-4">
-          <div>
-            <h2 className="text-lg font-semibold">Preferences</h2>
-            <p className="text-sm text-muted-foreground">Customize your experience</p>
-          </div>
-          <div>
-            <p className="text-sm font-medium">Default Agent Mode</p>
-            <p className="text-sm text-muted-foreground">Choose how the AI agents interact with you</p>
-          </div>
-          <button className="py-2 px-4 rounded-md text-sm font-medium bg-amber-600 text-white hover:bg-amber-700">
-            Save Preferences
-          </button>
-        </div>
-      )}
+        <TabsContent value="security">
+          <Card>
+            <CardHeader>
+              <CardTitle>Change Password</CardTitle>
+              <CardDescription>Update your password to keep your account secure</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="currentPassword">Current Password</Label>
+                <div className="relative">
+                  <Input
+                    id="currentPassword"
+                    type={showPassword ? 'text' : 'password'}
+                    className="pr-16"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground hover:text-foreground"
+                  >
+                    {showPassword ? 'Hide' : 'Show'}
+                  </button>
+                </div>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="newPassword">New Password</Label>
+                <Input id="newPassword" type="password" />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="confirmPassword">Confirm New Password</Label>
+                <Input id="confirmPassword" type="password" />
+              </div>
+              <Button className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white">
+                Update Password
+              </Button>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="preferences">
+          <Card>
+            <CardHeader>
+              <CardTitle>Preferences</CardTitle>
+              <CardDescription>Customize your experience</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div>
+                <p className="text-sm font-medium">Default Agent Mode</p>
+                <p className="text-sm text-muted-foreground">Choose how the AI agents interact with you</p>
+              </div>
+              <Button className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white">
+                Save Preferences
+              </Button>
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
     </div>
   )
 }

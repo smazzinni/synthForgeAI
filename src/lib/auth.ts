@@ -1,8 +1,7 @@
 import { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
-import { getUserFromRequest, isAuthEnabled } from '@/lib/supabase'
+import { isAuthEnabled } from '@/lib/supabase'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
-import { mockUser, mockWorkspaces, mockProjects } from '@/lib/mock-data'
+import { mockUser } from '@/lib/mock-data'
 
 export interface AuthenticatedUser {
   userId: string
@@ -22,82 +21,68 @@ export async function getAuthenticatedUser(request: NextRequest): Promise<Authen
     return getDevUser()
   }
 
-  const userInfo = await getUserFromRequest(request)
+  // Extract user info from request (headers, cookies, or Bearer token)
+  const supabaseId = request.headers.get('x-user-id')
+  const bearerToken = request.headers.get('authorization')?.replace('Bearer ', '')
+  const email = request.headers.get('x-user-email')
 
-  if (!userInfo) {
+  // Try to get user from Supabase admin using token or ID
+  let userId = supabaseId
+  let userEmail = email || ''
+
+  if (bearerToken) {
+    try {
+      const admin = getSupabaseAdmin()
+      if (admin) {
+        const { data: { user } } = await admin.auth.getUser(bearerToken)
+        if (user) {
+          userId = user.id
+          userEmail = user.email || userEmail
+        }
+      }
+    } catch {
+      // Token verification failed
+    }
+  }
+
+  if (!userId && !userEmail) {
     throw new AuthError('Authentication required', 401)
   }
 
-  // Try Prisma first if available
-  if (db) {
-    // If we already have the local userId from headers, use it
-    if (userInfo.userId && userInfo.userId !== '') {
-      const localUser = await db.user.findUnique({ where: { id: userInfo.userId } })
-      if (localUser) {
-        return {
-          userId: localUser.id,
-          tenantId: localUser.tenantId,
-          email: localUser.email,
-          supabaseId: localUser.supabaseId,
-          name: localUser.name,
-          role: localUser.role,
-        }
-      }
-    }
-
-    // Look up local user by Supabase ID
-    if (userInfo.supabaseId) {
-      const localUser = await db.user.findUnique({ where: { supabaseId: userInfo.supabaseId } })
-      if (localUser) {
-        return {
-          userId: localUser.id,
-          tenantId: localUser.tenantId,
-          email: localUser.email,
-          supabaseId: localUser.supabaseId,
-          name: localUser.name,
-          role: localUser.role,
-        }
-      }
-    }
-
-    // Look up by email as last resort
-    if (userInfo.email) {
-      const localUser = await db.user.findUnique({ where: { email: userInfo.email } })
-      if (localUser) {
-        return {
-          userId: localUser.id,
-          tenantId: localUser.tenantId,
-          email: localUser.email,
-          supabaseId: localUser.supabaseId,
-          name: localUser.name,
-          role: localUser.role,
-        }
-      }
-    }
-  }
-
   // Try Supabase profiles table
-  if (userInfo.supabaseId || userInfo.email) {
-    try {
-      const admin = getSupabaseAdmin()
-      const query = userInfo.supabaseId
-        ? admin.from('profiles').select('*').eq('id', userInfo.supabaseId).single()
-        : admin.from('profiles').select('*').eq('email', userInfo.email).single()
+  try {
+    const admin = getSupabaseAdmin()
+    if (admin) {
+      const query = userId
+        ? admin.from('profiles').select('*').eq('id', userId).single()
+        : admin.from('profiles').select('*').eq('email', userEmail).single()
 
       const { data: profile } = await query
       if (profile) {
         return {
           userId: profile.id,
-          tenantId: 'default',
-          email: profile.email,
+          tenantId: profile.organization_id || 'default',
+          email: profile.email || userEmail,
           supabaseId: profile.id,
           name: profile.full_name || 'User',
           role: profile.role || 'member',
         }
       }
-    } catch {
-      // Supabase profile lookup failed
+
+      // If no profile exists, create a basic one from auth user info
+      if (userId) {
+        return {
+          userId,
+          tenantId: 'default',
+          email: userEmail,
+          supabaseId: userId,
+          name: userEmail.split('@')[0],
+          role: 'member',
+        }
+      }
     }
+  } catch {
+    // Supabase profile lookup failed
   }
 
   throw new AuthError('User not found. Please register first.', 401)
@@ -130,20 +115,13 @@ export class AuthError extends Error {
 export async function verifyWorkspaceAccess(workspaceId: string, _userId: string): Promise<boolean> {
   if (!isAuthEnabled()) return true
 
-  if (db) {
-    const workspace = await db.workspace.findFirst({
-      where: { id: workspaceId },
-    })
-    return !!workspace
-  }
-
-  // Supabase check
   try {
     const admin = getSupabaseAdmin()
+    if (!admin) return true
     const { data } = await admin.from('workspaces').select('id').eq('id', workspaceId).single()
     return !!data
   } catch {
-    return true // Allow in dev mode
+    return true
   }
 }
 
@@ -151,15 +129,9 @@ export async function verifyWorkspaceAccess(workspaceId: string, _userId: string
 export async function verifyProjectAccess(projectId: string, _userId: string): Promise<boolean> {
   if (!isAuthEnabled()) return true
 
-  if (db) {
-    const project = await db.project.findFirst({
-      where: { id: projectId },
-    })
-    return !!project
-  }
-
   try {
     const admin = getSupabaseAdmin()
+    if (!admin) return true
     const { data } = await admin.from('projects').select('id').eq('id', projectId).single()
     return !!data
   } catch {
@@ -171,15 +143,9 @@ export async function verifyProjectAccess(projectId: string, _userId: string): P
 export async function verifyDatabaseAccess(databaseId: string, _userId: string): Promise<boolean> {
   if (!isAuthEnabled()) return true
 
-  if (db) {
-    const database = await db.database.findFirst({
-      where: { id: databaseId },
-    })
-    return !!database
-  }
-
   try {
     const admin = getSupabaseAdmin()
+    if (!admin) return true
     const { data } = await admin.from('synthetic_databases').select('id').eq('id', databaseId).single()
     return !!data
   } catch {
@@ -191,15 +157,9 @@ export async function verifyDatabaseAccess(databaseId: string, _userId: string):
 export async function verifyConversationAccess(conversationId: string, _userId: string): Promise<boolean> {
   if (!isAuthEnabled()) return true
 
-  if (db) {
-    const conversation = await db.conversation.findFirst({
-      where: { id: conversationId },
-    })
-    return !!conversation
-  }
-
   try {
     const admin = getSupabaseAdmin()
+    if (!admin) return true
     const { data } = await admin.from('conversations').select('id').eq('id', conversationId).single()
     return !!data
   } catch {
