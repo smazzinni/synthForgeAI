@@ -13,7 +13,6 @@ import {
   FlaskConical,
   Plus,
   ArrowRight,
-  FolderOpen,
   Key,
   Loader2,
   Zap,
@@ -117,11 +116,11 @@ export default function DashboardPage() {
             <CardContent className="pt-6">
               <div className="flex items-center gap-4">
                 <div className="h-12 w-12 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center">
-                  <FolderOpen className="h-6 w-6 text-white" />
+                  <Database className="h-6 w-6 text-white" />
                 </div>
                 <div className="flex-1">
-                  <p className="font-semibold">My Projects</p>
-                  <p className="text-sm text-muted-foreground">Manage your projects</p>
+                  <p className="font-semibold">My Databases</p>
+                  <p className="text-sm text-muted-foreground">View your databases</p>
                 </div>
                 <ArrowRight className="h-5 w-5 text-muted-foreground group-hover:text-foreground transition-colors" />
               </div>

@@ -19,7 +19,7 @@ import {
   Zap,
   LayoutDashboard,
   FlaskConical,
-  FolderOpen,
+  Database,
   Settings,
   Key,
   Moon,
@@ -33,7 +33,7 @@ import { useState } from 'react'
 const sidebarLinks = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/dashboard/studio', label: 'AI Studio', icon: FlaskConical },
-  { href: '/dashboard/workspaces', label: 'My Projects', icon: FolderOpen },
+  { href: '/dashboard/workspaces', label: 'My Databases', icon: Database },
   { href: '/dashboard/api-keys', label: 'API Keys', icon: Key },
   { href: '/dashboard/settings', label: 'Settings', icon: Settings },
 ]
@@ -88,12 +88,12 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
         <div className="flex items-center gap-3">
           <Avatar className="h-8 w-8">
             <AvatarFallback className="bg-gradient-to-br from-amber-500 to-red-600 text-white text-xs">
-              {user?.email?.charAt(0).toUpperCase() || 'D'}
+              {user?.email?.charAt(0).toUpperCase() || 'U'}
             </AvatarFallback>
           </Avatar>
           <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium truncate">{user?.user_metadata?.full_name || 'Demo User'}</p>
-            <p className="text-xs text-muted-foreground truncate">{user?.email || 'demo@synthforge.ai'}</p>
+            <p className="text-sm font-medium truncate">{user?.user_metadata?.full_name || user?.email?.split('@')[0] || 'User'}</p>
+            <p className="text-xs text-muted-foreground truncate">{user?.email || ''}</p>
           </div>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>

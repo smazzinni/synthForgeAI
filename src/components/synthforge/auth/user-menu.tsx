@@ -17,7 +17,6 @@ export interface UserInfo {
   email: string
   name: string
   role: string
-  tenantId: string
   avatarUrl?: string
 }
 

@@ -1,7 +1,5 @@
 import { getSupabaseServerClient } from '@/lib/supabase/server'
-import { getSupabaseAdmin } from '@/lib/supabase/admin'
 import { redirect } from 'next/navigation'
-import type { Tables } from '@/lib/supabase/types'
 
 export interface AuthUser {
   id: string
@@ -9,14 +7,6 @@ export interface AuthUser {
   full_name: string | null
   avatar_url: string | null
   role: string
-}
-
-export interface AuthOrg {
-  id: string
-  name: string
-  slug: string
-  role: string
-  plan: string
 }
 
 export async function getCurrentUser(): Promise<AuthUser | null> {
@@ -48,30 +38,6 @@ export async function requireAuth(): Promise<AuthUser> {
   const user = await getCurrentUser()
   if (!user) redirect('/login')
   return user
-}
-
-export async function getUserOrganizations(userId: string): Promise<AuthOrg[]> {
-  try {
-    const admin = getSupabaseAdmin()
-    const { data: memberships } = await admin
-      .from('organization_members')
-      .select('role, organizations(id, name, slug, plan)')
-      .eq('user_id', userId)
-
-    if (!memberships) return []
-
-    return memberships
-      .filter((m): m is typeof m & { organizations: NonNullable<typeof m.organizations> } => !!m.organizations)
-      .map((m) => ({
-        id: m.organizations.id,
-        name: m.organizations.name,
-        slug: m.organizations.slug,
-        role: m.role,
-        plan: m.organizations.plan,
-      }))
-  } catch {
-    return []
-  }
 }
 
 export function isAuthEnabled(): boolean {

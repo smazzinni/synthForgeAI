@@ -73,7 +73,6 @@ export interface UserInfo {
   userId?: string
   supabaseId?: string
   email?: string
-  tenantId?: string
 }
 
 export async function getUserFromRequest(request: NextRequest): Promise<UserInfo | null> {
@@ -84,14 +83,12 @@ export async function getUserFromRequest(request: NextRequest): Promise<UserInfo
     const headerUserId = request.headers.get('x-user-id')
     const headerSupabaseId = request.headers.get('x-supabase-id')
     const headerEmail = request.headers.get('x-user-email')
-    const headerTenantId = request.headers.get('x-tenant-id')
 
     if (headerUserId) {
       return {
         userId: headerUserId,
         supabaseId: headerSupabaseId || undefined,
         email: headerEmail || undefined,
-        tenantId: headerTenantId || undefined,
       }
     }
 
@@ -127,7 +124,6 @@ export interface AuthenticatedUser {
   userId: string
   supabaseId: string
   email: string
-  tenantId: string
   name: string
   role: string
 }

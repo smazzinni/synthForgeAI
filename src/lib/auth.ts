@@ -5,7 +5,6 @@ import { mockUser } from '@/lib/mock-data'
 
 export interface AuthenticatedUser {
   userId: string
-  tenantId: string
   email: string
   supabaseId: string
   name: string
@@ -61,7 +60,6 @@ export async function getAuthenticatedUser(request: NextRequest): Promise<Authen
       if (profile) {
         return {
           userId: profile.id,
-          tenantId: profile.organization_id || 'default',
           email: profile.email || userEmail,
           supabaseId: profile.id,
           name: profile.full_name || 'User',
@@ -73,7 +71,6 @@ export async function getAuthenticatedUser(request: NextRequest): Promise<Authen
       if (userId) {
         return {
           userId,
-          tenantId: 'default',
           email: userEmail,
           supabaseId: userId,
           name: userEmail.split('@')[0],
@@ -92,7 +89,6 @@ export async function getAuthenticatedUser(request: NextRequest): Promise<Authen
 function getDevUser(): AuthenticatedUser {
   return {
     userId: mockUser.id,
-    tenantId: 'demo-tenant',
     email: mockUser.email,
     supabaseId: 'dev-supabase-id',
     name: mockUser.full_name || 'Demo User',
@@ -111,57 +107,30 @@ export class AuthError extends Error {
   }
 }
 
-// ─── Verify workspace belongs to user ──────────────────────────
-export async function verifyWorkspaceAccess(workspaceId: string, _userId: string): Promise<boolean> {
+// ─── Verify database belongs to user ──────────────────────────
+export async function verifyDatabaseAccess(databaseId: string, userId: string): Promise<boolean> {
   if (!isAuthEnabled()) return true
 
   try {
     const admin = getSupabaseAdmin()
     if (!admin) return true
-    const { data } = await admin.from('workspaces').select('id').eq('id', workspaceId).single()
-    return !!data
+    const { data } = await admin.from('synthetic_databases').select('id, user_id').eq('id', databaseId).single()
+    // For individual user mode: check if the database belongs to the user
+    return !!data && (!data.user_id || data.user_id === userId)
   } catch {
     return true
   }
 }
 
-// ─── Verify project belongs to user via workspace ──────────────
-export async function verifyProjectAccess(projectId: string, _userId: string): Promise<boolean> {
+// ─── Verify conversation belongs to user ───────────────────────
+export async function verifyConversationAccess(conversationId: string, userId: string): Promise<boolean> {
   if (!isAuthEnabled()) return true
 
   try {
     const admin = getSupabaseAdmin()
     if (!admin) return true
-    const { data } = await admin.from('projects').select('id').eq('id', projectId).single()
-    return !!data
-  } catch {
-    return true
-  }
-}
-
-// ─── Verify database belongs to user via project -> workspace ──
-export async function verifyDatabaseAccess(databaseId: string, _userId: string): Promise<boolean> {
-  if (!isAuthEnabled()) return true
-
-  try {
-    const admin = getSupabaseAdmin()
-    if (!admin) return true
-    const { data } = await admin.from('synthetic_databases').select('id').eq('id', databaseId).single()
-    return !!data
-  } catch {
-    return true
-  }
-}
-
-// ─── Verify conversation belongs to user via workspace ─────────
-export async function verifyConversationAccess(conversationId: string, _userId: string): Promise<boolean> {
-  if (!isAuthEnabled()) return true
-
-  try {
-    const admin = getSupabaseAdmin()
-    if (!admin) return true
-    const { data } = await admin.from('conversations').select('id').eq('id', conversationId).single()
-    return !!data
+    const { data } = await admin.from('conversations').select('id, user_id').eq('id', conversationId).single()
+    return !!data && (!data.user_id || data.user_id === userId)
   } catch {
     return true
   }

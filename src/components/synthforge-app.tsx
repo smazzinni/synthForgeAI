@@ -174,8 +174,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
             id: data.user.id,
             email: data.user.email,
             name: data.user.name,
-            role: data.user.role,
-            tenantId: data.user.tenantId,
+            role: data.user.role || 'member',
             avatarUrl: data.user.avatarUrl,
           })
         }
@@ -202,8 +201,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
           id: data.user.id,
           email: data.user.email,
           name: data.user.name,
-          role: data.user.role,
-          tenantId: data.user.tenantId,
+          role: data.user.role || 'member',
         })
         // The SSR browser client handles cookies automatically
         setAuthView(null)
@@ -234,8 +232,7 @@ export default function SynthForgeApp({ initialDatabaseId }: { initialDatabaseId
           id: data.user.id,
           email: data.user.email,
           name: data.user.name,
-          role: data.user.role,
-          tenantId: data.user.tenantId,
+          role: data.user.role || 'member',
         })
         setAuthView(null)
         setView('dashboard')

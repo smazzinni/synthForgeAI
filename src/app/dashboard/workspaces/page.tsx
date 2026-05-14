@@ -5,7 +5,8 @@ import Link from 'next/link'
 import { useAuth } from '@/hooks/use-auth'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { FolderOpen, Plus, Loader2, ArrowRight } from 'lucide-react'
+import { Badge } from '@/components/ui/badge'
+import { Database, Plus, Loader2, ArrowRight } from 'lucide-react'
 
 interface DatabaseItem {
   id: string
@@ -14,9 +15,10 @@ interface DatabaseItem {
   status: string
   row_count: number
   quality_score: number | null
+  schema_json?: { name: string; columns: { name: string; type: string }[] }[]
 }
 
-export default function WorkspacesPage() {
+export default function MyDatabasesPage() {
   const { user } = useAuth()
   const [databases, setDatabases] = useState<DatabaseItem[]>([])
   const [loading, setLoading] = useState(true)
@@ -40,8 +42,8 @@ export default function WorkspacesPage() {
     <div className="p-4 md:p-8 max-w-7xl mx-auto">
       <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-8">
         <div>
-          <h1 className="text-2xl md:text-3xl font-bold">My Projects</h1>
-          <p className="text-muted-foreground mt-1">Manage your databases and projects</p>
+          <h1 className="text-2xl md:text-3xl font-bold">My Databases</h1>
+          <p className="text-muted-foreground mt-1">View and manage all your synthetic databases</p>
         </div>
         <Button asChild className="mt-4 md:mt-0 bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white">
           <Link href="/dashboard/studio">
@@ -58,8 +60,8 @@ export default function WorkspacesPage() {
       ) : databases.length === 0 ? (
         <Card>
           <CardContent className="py-12 text-center">
-            <FolderOpen className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
-            <h3 className="text-lg font-semibold mb-2">No projects yet</h3>
+            <Database className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
+            <h3 className="text-lg font-semibold mb-2">No databases yet</h3>
             <p className="text-muted-foreground mb-4">Create your first synthetic database using AI Studio</p>
             <Button asChild className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white">
               <Link href="/dashboard/studio">
@@ -74,15 +76,34 @@ export default function WorkspacesPage() {
           {databases.map((db) => (
             <Card key={db.id} className="hover:shadow-md transition-shadow group">
               <CardContent className="pt-6">
-                <div className="flex items-center gap-4">
-                  <div className="h-10 w-10 rounded-lg bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center text-white">
-                    <FolderOpen className="h-5 w-5" />
+                <div className="flex items-start gap-4">
+                  <div className="h-10 w-10 rounded-lg bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center text-white shrink-0">
+                    <Database className="h-5 w-5" />
                   </div>
                   <div className="flex-1 min-w-0">
                     <p className="font-medium truncate">{db.name}</p>
                     <p className="text-sm text-muted-foreground">
                       {db.db_type} &middot; {(db.row_count || 0).toLocaleString()} rows
                     </p>
+                    <div className="flex items-center gap-2 mt-2">
+                      <Badge
+                        variant={db.status === 'ready' ? 'default' : db.status === 'generating' ? 'secondary' : 'outline'}
+                        className={
+                          db.status === 'ready'
+                            ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
+                            : db.status === 'generating'
+                            ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
+                            : ''
+                        }
+                      >
+                        {db.status}
+                      </Badge>
+                      {db.quality_score && (
+                        <span className="text-xs text-muted-foreground">
+                          {Math.round(db.quality_score * 100)}% quality
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <Button variant="ghost" size="sm" asChild>
                     <Link href={`/dashboard/studio/${db.id}`}>

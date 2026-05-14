@@ -37,110 +37,10 @@ export interface Database {
           updated_at?: string
         }
       }
-      organizations: {
-        Row: {
-          id: string
-          name: string
-          slug: string
-          description: string | null
-          logo_url: string | null
-          plan: string
-          settings: Json
-          created_at: string
-          updated_at: string
-        }
-        Insert: {
-          id?: string
-          name: string
-          slug: string
-          description?: string | null
-          logo_url?: string | null
-          plan?: string
-          settings?: Json
-        }
-        Update: {
-          name?: string
-          slug?: string
-          description?: string | null
-          logo_url?: string | null
-          plan?: string
-          settings?: Json
-          updated_at?: string
-        }
-      }
-      organization_members: {
-        Row: {
-          id: string
-          organization_id: string
-          user_id: string
-          role: string
-          joined_at: string
-        }
-        Insert: {
-          id?: string
-          organization_id: string
-          user_id: string
-          role?: string
-        }
-        Update: {
-          role?: string
-        }
-      }
-      workspaces: {
-        Row: {
-          id: string
-          organization_id: string
-          name: string
-          slug: string
-          description: string | null
-          settings: Json
-          created_at: string
-          updated_at: string
-        }
-        Insert: {
-          id?: string
-          organization_id: string
-          name: string
-          slug: string
-          description?: string | null
-          settings?: Json
-        }
-        Update: {
-          name?: string
-          slug?: string
-          description?: string | null
-          settings?: Json
-          updated_at?: string
-        }
-      }
-      projects: {
-        Row: {
-          id: string
-          workspace_id: string
-          name: string
-          description: string | null
-          settings: Json
-          created_at: string
-          updated_at: string
-        }
-        Insert: {
-          id?: string
-          workspace_id: string
-          name: string
-          description?: string | null
-          settings?: Json
-        }
-        Update: {
-          name?: string
-          description?: string | null
-          settings?: Json
-          updated_at?: string
-        }
-      }
       synthetic_databases: {
         Row: {
           id: string
-          project_id: string | null
+          user_id: string | null
           name: string
           db_type: string
           schema_json: Json
@@ -153,7 +53,7 @@ export interface Database {
         }
         Insert: {
           id?: string
-          project_id?: string | null
+          user_id?: string | null
           name: string
           db_type?: string
           schema_json?: Json
@@ -176,8 +76,8 @@ export interface Database {
       conversations: {
         Row: {
           id: string
+          user_id: string | null
           database_id: string | null
-          workspace_id: string
           title: string
           agent_mode: string
           status: string
@@ -186,8 +86,8 @@ export interface Database {
         }
         Insert: {
           id?: string
+          user_id?: string | null
           database_id?: string | null
-          workspace_id: string
           title?: string
           agent_mode?: string
           status?: string
@@ -262,7 +162,7 @@ export interface Database {
       api_keys: {
         Row: {
           id: string
-          organization_id: string
+          user_id: string | null
           name: string
           key_hash: string
           key_prefix: string
@@ -273,7 +173,7 @@ export interface Database {
         }
         Insert: {
           id?: string
-          organization_id: string
+          user_id?: string | null
           name: string
           key_hash: string
           key_prefix: string
@@ -285,7 +185,6 @@ export interface Database {
     Views: Record<string, never>
     Functions: Record<string, never>
     Enums: {
-      organization_role: 'owner' | 'admin' | 'member' | 'viewer'
       database_status: 'draft' | 'generating' | 'ready' | 'error'
       conversation_status: 'active' | 'archived' | 'error'
     }
