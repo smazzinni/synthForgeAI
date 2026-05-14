@@ -21,73 +21,39 @@ When users describe their data needs:
 3. Suggest data generation strategies
 4. Ensure privacy compliance and data quality
 
-Be concise, technical, and helpful. If they ask you to generate data, describe the schema you'd create and provide sample data in a structured format.
+Be concise, technical, and helpful. If they ask you to generate data, describe the schema you'd create and provide sample data in a structured JSON format like:
+{
+  "tables": {
+    "table_name": [
+      {"column1": "value1", "column2": "value2"},
+      ...
+    ]
+  }
+}
 
 Current agent: Orchestrator`
 
-    // Create a streaming response
-    const encoder = new TextEncoder()
-    const stream = new ReadableStream({
-      async start(controller) {
-        try {
-          const completion = await zai.chat.completions.create({
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: message },
-            ],
-            temperature: 0.7,
-            max_tokens: 2000,
-            stream: true,
-          })
-
-          // Check if completion is a stream
-          if (Symbol.asyncIterator in completion) {
-            for await (const chunk of completion as AsyncIterable<{ choices: { delta: { content?: string } }[] }>) {
-              const content = chunk.choices?.[0]?.delta?.content
-              if (content) {
-                controller.enqueue(
-                  encoder.encode(`data: ${JSON.stringify({ content, agent: 'Orchestrator' })}\n\n`)
-                )
-              }
-            }
-          } else {
-            // Non-streaming response
-            const response = completion as { choices: { message: { content: string } }[] }
-            const content = response.choices?.[0]?.message?.content || 'I apologize, I could not generate a response.'
-            controller.enqueue(
-              encoder.encode(`data: ${JSON.stringify({ content, agent: 'Orchestrator' })}\n\n`)
-            )
-          }
-
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-          controller.close()
-        } catch (error) {
-          console.error('[Chat API] Error:', error)
-          controller.enqueue(
-            encoder.encode(
-              `data: ${JSON.stringify({
-                content: 'I apologize, but I encountered an error processing your request. Please try again.',
-                agent: 'System',
-              })}\n\n`
-            )
-          )
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-          controller.close()
-        }
-      },
+    // Use non-streaming response for stability
+    const completion = await zai.chat.completions.create({
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: message },
+      ],
+      temperature: 0.7,
+      max_tokens: 2000,
+      stream: false,
     })
 
-    return new Response(stream, {
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        Connection: 'keep-alive',
-      },
+    const content = completion.choices?.[0]?.message?.content || 'I apologize, I could not generate a response.'
+
+    return NextResponse.json({
+      content,
+      agent: 'Orchestrator',
     })
   } catch (error) {
-    console.error('[Chat API] Outer error:', error)
+    console.error('[Chat API] Error:', error)
     return NextResponse.json(
-      { error: 'Internal server error' },
+      { error: 'Internal server error', content: 'I apologize, but I encountered an error processing your request. Please try again.' },
       { status: 500 }
     )
   }

@@ -1,6 +1,6 @@
 'use client'
 
-import { Suspense, useState, useEffect } from 'react'
+import { Suspense, useState, useEffect, useRef } from 'react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { useAuth } from '@/hooks/use-auth'
@@ -19,14 +19,18 @@ function LoginForm() {
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const hasRedirected = useRef(false)
   const redirect = searchParams.get('redirect') || '/dashboard'
 
-  // If user is already authenticated, redirect them
+  // If user is already authenticated, redirect once
   useEffect(() => {
-    if (!authLoading && user) {
-      router.replace(redirect)
+    if (!authLoading && user && !hasRedirected.current) {
+      hasRedirected.current = true
+      // Use window.location for a hard redirect to avoid
+      // client-side navigation conflicts
+      window.location.href = redirect
     }
-  }, [user, authLoading, router, redirect])
+  }, [user, authLoading, redirect])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -36,7 +40,6 @@ function LoginForm() {
     try {
       const { error } = await signIn(email, password) as { error: Error | null }
       if (error) {
-        // Map common Supabase error messages
         const message = error.message || String(error)
         if (message.includes('Invalid login credentials')) {
           setError('Invalid email or password. Please try again.')
@@ -49,11 +52,14 @@ function LoginForm() {
         }
         setLoading(false)
       } else {
-        // Don't set loading false - the useEffect will redirect
-        // Give a small delay for the auth state to update
+        // Auth state will update, the useEffect will handle redirect
+        // But also do a hard redirect after a short delay as a fallback
         setTimeout(() => {
-          router.push(redirect)
-        }, 500)
+          if (!hasRedirected.current) {
+            hasRedirected.current = true
+            window.location.href = redirect
+          }
+        }, 1000)
       }
     } catch {
       setError('An unexpected error occurred. Please try again.')

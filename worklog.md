@@ -37,3 +37,31 @@ Stage Summary:
 - Dashboard: Shows real user data from API
 - Auth flow: Working correctly with Supabase
 - Pending: Supabase tables need to be created (SQL file provided)
+---
+Task ID: 1
+Agent: Main Agent
+Task: Fix ERR_TOO_MANY_REDIRECTS, API spam, multi-tenant rollback, and dashboard bugs
+
+Work Log:
+- Analyzed redirect loop: Middleware redirected /dashboard → /login (server-side) while client-side auth on login page redirected /login → /dashboard, creating infinite loop
+- Fixed middleware.ts: Removed ALL redirect logic, only refreshes Supabase session cookies without redirecting. Client-side auth handles all redirects.
+- Fixed dashboard layout: Added hasRedirected ref to prevent multiple redirects, uses window.location.href for hard redirect
+- Fixed login page: Added hasRedirected ref, uses window.location.href instead of router.push/replace
+- Fixed signup page: Uses window.location.href instead of router.replace
+- Fixed API spam: Added hasFetched ref in dashboard page to prevent re-fetching databases
+- Removed multi-tenant features: Updated sidebar (Workspaces → My Databases), created /dashboard/databases page, workspaces redirects to databases, stubbed use-organization.tsx
+- Added DELETE support to /api/databases route
+- Fixed chat API: Changed from streaming to non-streaming response for stability
+- Fixed studio page: Updated to handle non-streaming chat API response, added download JSON, copy to clipboard with toast
+- Fixed SchemaTable interface syntax error (extra closing brace)
+- Added horizontal scroll support in data table (whitespace-nowrap on th/td)
+
+Stage Summary:
+- ✅ ERR_TOO_MANY_REDIRECTS fixed - /dashboard returns 200 (no redirect)
+- ✅ API spam fixed - hasFetched ref prevents duplicate fetches
+- ✅ Multi-tenant rollback complete - sidebar, databases page, organizations stubbed
+- ✅ Login API verified working with mazzinni1@gmail.com / Admin@123
+- ✅ Databases API verified working (returns empty array for new user)
+- ✅ Chat API verified working with z-ai-web-dev-sdk
+- ✅ All dashboard routes return 200
+- ✅ Build successful with no errors

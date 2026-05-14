@@ -24,9 +24,9 @@ export default function SignUpPage() {
   // If user is already authenticated, redirect to dashboard
   useEffect(() => {
     if (!authLoading && user) {
-      router.replace('/dashboard')
+      window.location.href = '/dashboard'
     }
-  }, [user, authLoading, router])
+  }, [user, authLoading])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()

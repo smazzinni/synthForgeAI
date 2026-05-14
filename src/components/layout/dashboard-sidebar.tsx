@@ -33,7 +33,7 @@ import { useState } from 'react'
 const sidebarLinks = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/dashboard/studio', label: 'AI Studio', icon: FlaskConical },
-  { href: '/dashboard/workspaces', label: 'My Databases', icon: Database },
+  { href: '/dashboard/databases', label: 'My Databases', icon: Database },
   { href: '/dashboard/api-keys', label: 'API Keys', icon: Key },
   { href: '/dashboard/settings', label: 'Settings', icon: Settings },
 ]

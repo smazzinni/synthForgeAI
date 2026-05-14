@@ -8,8 +8,8 @@ export async function middleware(request: NextRequest) {
   }
 
   const { pathname } = request.nextUrl
-  const isAuthPage = pathname.startsWith('/login') || pathname.startsWith('/signup') || pathname.startsWith('/forgot-password')
-  const isDashboardPage = pathname.startsWith('/dashboard')
+
+  // Skip middleware for API routes, auth callback, and static assets
   const isApiRoute = pathname.startsWith('/api/')
   const isAuthCallback = pathname.startsWith('/auth/callback')
   const isPublicAsset = pathname.startsWith('/_next/') || pathname.startsWith('/favicon') || pathname.endsWith('.ico') || pathname.endsWith('.png') || pathname.endsWith('.svg')
@@ -18,7 +18,12 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next()
   }
 
-  // Don't protect non-dashboard, non-auth pages (landing, about, etc.)
+  // Only refresh session cookies for dashboard and auth pages
+  // Do NOT redirect - let client-side auth handle redirects
+  // This prevents the redirect loop between middleware and client-side auth
+  const isAuthPage = pathname.startsWith('/login') || pathname.startsWith('/signup') || pathname.startsWith('/forgot-password')
+  const isDashboardPage = pathname.startsWith('/dashboard')
+
   if (!isAuthPage && !isDashboardPage) {
     return NextResponse.next()
   }
@@ -32,7 +37,6 @@ export async function middleware(request: NextRequest) {
     const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
 
     if (!supabaseUrl || !supabaseAnonKey) {
-      console.warn('[Middleware] Missing Supabase env vars, skipping auth check')
       return supabaseResponse
     }
 
@@ -56,49 +60,11 @@ export async function middleware(request: NextRequest) {
       },
     })
 
-    // Get the authenticated user
-    const { data: { user }, error } = await supabase.auth.getUser()
-
-    if (error) {
-      console.warn('[Middleware] Auth error:', error.message)
-    }
-
-    // If authenticated and trying to access auth pages, redirect to dashboard
-    if (user && isAuthPage) {
-      const redirectUrl = request.nextUrl.clone()
-      redirectUrl.pathname = '/dashboard'
-      redirectUrl.search = ''
-      const redirectResponse = NextResponse.redirect(redirectUrl)
-      // Copy all cookies from supabaseResponse to the redirect response
-      try {
-        supabaseResponse.cookies.getAll().forEach((cookie) => {
-          redirectResponse.cookies.set(cookie.name, cookie.value)
-        })
-      } catch (err) {
-        console.error('[Middleware] Error copying cookies to redirect:', err)
-      }
-      return redirectResponse
-    }
-
-    // If not authenticated and trying to access protected pages, redirect to login
-    if (!user && isDashboardPage) {
-      const redirectUrl = request.nextUrl.clone()
-      redirectUrl.pathname = '/login'
-      redirectUrl.search = `redirect=${encodeURIComponent(pathname)}`
-      const redirectResponse = NextResponse.redirect(redirectUrl)
-      // Copy all cookies from supabaseResponse to the redirect response
-      try {
-        supabaseResponse.cookies.getAll().forEach((cookie) => {
-          redirectResponse.cookies.set(cookie.name, cookie.value)
-        })
-      } catch (err) {
-        console.error('[Middleware] Error copying cookies to redirect:', err)
-      }
-      return redirectResponse
-    }
+    // Just refresh the session - don't redirect
+    // Client-side auth (AuthProvider + DashboardLayout) handles redirects
+    await supabase.auth.getUser()
   } catch (err) {
     console.error('[Middleware] Unexpected error:', err)
-    // On error, just pass through - don't block the request
   }
 
   return supabaseResponse

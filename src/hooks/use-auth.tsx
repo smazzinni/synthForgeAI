@@ -1,6 +1,6 @@
 'use client'
 
-import { createContext, useContext, useEffect, useState, useCallback, type ReactNode } from 'react'
+import { createContext, useContext, useEffect, useState, useCallback, useRef, type ReactNode } from 'react'
 import type { User, Session } from '@supabase/supabase-js'
 import { getSupabaseBrowserClient } from '@/lib/supabase/client'
 
@@ -30,17 +30,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
   const [session, setSession] = useState<Session | null>(null)
   const [loading, setLoading] = useState(true)
+  const supabaseRef = useRef<ReturnType<typeof getSupabaseBrowserClient> | null>(null)
 
   useEffect(() => {
     const supabase = getSupabaseBrowserClient()
 
     if (!supabase) {
       // No Supabase client available - run in dev/demo mode (no auth)
-      // Use microtask to defer setState and avoid cascading render warning
       queueMicrotask(() => setLoading(false))
       return
     }
 
+    supabaseRef.current = supabase
     let mounted = true
 
     // Get initial session
@@ -70,7 +71,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const signIn = useCallback(async (email: string, password: string) => {
-    const supabase = getSupabaseBrowserClient()
+    const supabase = supabaseRef.current || getSupabaseBrowserClient()
     if (!supabase) return { data: null, error: new Error('Auth not configured') }
     try {
       const result = await supabase.auth.signInWithPassword({ email, password })
@@ -81,7 +82,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const signUp = useCallback(async (email: string, password: string, fullName: string) => {
-    const supabase = getSupabaseBrowserClient()
+    const supabase = supabaseRef.current || getSupabaseBrowserClient()
     if (!supabase) return { data: null, error: new Error('Auth not configured') }
     try {
       const result = await supabase.auth.signUp({
@@ -96,7 +97,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const signOut = useCallback(async () => {
-    const supabase = getSupabaseBrowserClient()
+    const supabase = supabaseRef.current || getSupabaseBrowserClient()
     if (supabase) {
       const { error } = await supabase.auth.signOut()
       if (!error && typeof window !== 'undefined') {
@@ -111,7 +112,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const resetPassword = useCallback(async (email: string) => {
-    const supabase = getSupabaseBrowserClient()
+    const supabase = supabaseRef.current || getSupabaseBrowserClient()
     if (!supabase) return { data: null, error: new Error('Auth not configured') }
     try {
       const result = await supabase.auth.resetPasswordForEmail(email, {

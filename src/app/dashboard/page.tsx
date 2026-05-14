@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import Link from 'next/link'
 import { useAuth } from '@/hooks/use-auth'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -33,21 +33,25 @@ export default function DashboardPage() {
   const { user } = useAuth()
   const [databases, setDatabases] = useState<DatabaseItem[]>([])
   const [loading, setLoading] = useState(true)
+  const hasFetched = useRef(false)
+
+  const loadData = useCallback(async () => {
+    if (hasFetched.current) return
+    hasFetched.current = true
+    try {
+      const res = await fetch('/api/databases')
+      const data = await res.json()
+      setDatabases(data.databases || [])
+    } catch {
+      setDatabases([])
+    } finally {
+      setLoading(false)
+    }
+  }, [])
 
   useEffect(() => {
-    async function loadData() {
-      try {
-        const res = await fetch('/api/databases')
-        const data = await res.json()
-        setDatabases(data.databases || [])
-      } catch {
-        setDatabases([])
-      } finally {
-        setLoading(false)
-      }
-    }
     loadData()
-  }, [])
+  }, [loadData])
 
   const stats = [
     { label: 'Total Databases', value: databases.length, icon: Database, color: 'text-amber-600', bgColor: 'bg-amber-100 dark:bg-amber-900/30' },
@@ -111,7 +115,7 @@ export default function DashboardPage() {
             </CardContent>
           </Card>
         </Link>
-        <Link href="/dashboard/workspaces" className="block">
+        <Link href="/dashboard/databases" className="block">
           <Card className="hover:shadow-md transition-shadow cursor-pointer group">
             <CardContent className="pt-6">
               <div className="flex items-center gap-4">

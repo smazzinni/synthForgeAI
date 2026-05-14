@@ -21,6 +21,7 @@ import {
   CheckCircle2,
   AlertCircle,
 } from 'lucide-react'
+import { toast } from 'sonner'
 
 interface Message {
   id: string
@@ -138,83 +139,25 @@ export default function StudioPage() {
 
       if (!response.ok) throw new Error('Failed to get response')
 
-      const reader = response.body?.getReader()
-      const decoder = new TextDecoder()
-      let assistantContent = ''
+      const data = await response.json()
 
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: '',
-        agentName: 'Orchestrator',
+        content: data.content || 'No response generated.',
+        agentName: data.agent || 'Orchestrator',
         timestamp: new Date(),
       }
 
       setChatState((prev) => ({
         ...prev,
         messages: [...prev.messages, assistantMessage],
+        loading: false,
+        currentAgent: null,
       }))
 
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-
-          const chunk = decoder.decode(value, { stream: true })
-          const lines = chunk.split('\n')
-
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6).trim()
-              if (data === '[DONE]') continue
-
-              try {
-                const parsed = JSON.parse(data)
-                if (parsed.content) {
-                  assistantContent += parsed.content
-                  setChatState((prev) => ({
-                    ...prev,
-                    messages: prev.messages.map((m) =>
-                      m.id === assistantMessage.id
-                        ? { ...m, content: assistantContent }
-                        : m
-                    ),
-                  }))
-                  // Try to extract schema/data from streaming content
-                  tryParseResponse(assistantContent)
-                }
-                if (parsed.agent) {
-                  setChatState((prev) => ({
-                    ...prev,
-                    currentAgent: parsed.agent,
-                    messages: prev.messages.map((m) =>
-                      m.id === assistantMessage.id
-                        ? { ...m, agentName: parsed.agent }
-                        : m
-                    ),
-                  }))
-                }
-              } catch {
-                // Not JSON, treat as plain text
-                assistantContent += data
-                setChatState((prev) => ({
-                  ...prev,
-                  messages: prev.messages.map((m) =>
-                    m.id === assistantMessage.id
-                      ? { ...m, content: assistantContent }
-                      : m
-                  ),
-                }))
-              }
-            }
-          }
-        }
-      }
-
-      // Final parse attempt after stream completes
-      if (assistantContent) {
-        tryParseResponse(assistantContent)
-      }
+      // Try to extract schema/data from the response
+      tryParseResponse(assistantMessage.content)
     } catch {
       // Error - show error message in chat
       const errorMessage: Message = {
@@ -226,10 +169,10 @@ export default function StudioPage() {
       }
       setChatState((prev) => ({
         ...prev,
-        messages: [...prev.messages.filter((m) => m.role !== 'assistant' || m.content), errorMessage],
+        messages: [...prev.messages, errorMessage],
+        loading: false,
+        currentAgent: null,
       }))
-    } finally {
-      setChatState((prev) => ({ ...prev, loading: false, currentAgent: null }))
     }
   }, [input, chatState.loading, tryParseResponse])
 
@@ -242,6 +185,17 @@ export default function StudioPage() {
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text)
+    toast.success('Copied to clipboard')
+  }
+
+  const downloadJSON = (data: unknown, filename: string) => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
   }
 
   return (
@@ -401,7 +355,7 @@ export default function StudioPage() {
                           <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => copyToClipboard(JSON.stringify(rows, null, 2))}>
                             <Copy className="h-3.5 w-3.5" />
                           </Button>
-                          <Button variant="ghost" size="icon" className="h-7 w-7">
+                          <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => downloadJSON(rows, `${tableName}.json`)}>
                             <Download className="h-3.5 w-3.5" />
                           </Button>
                         </div>
@@ -413,7 +367,7 @@ export default function StudioPage() {
                           <thead>
                             <tr className="border-b">
                               {Object.keys(rows[0] || {}).map((key) => (
-                                <th key={key} className="text-left py-2 px-3 font-medium text-muted-foreground">
+                                <th key={key} className="text-left py-2 px-3 font-medium text-muted-foreground whitespace-nowrap">
                                   {key}
                                 </th>
                               ))}
@@ -423,7 +377,7 @@ export default function StudioPage() {
                             {rows.map((row, i) => (
                               <tr key={i} className="border-b last:border-0 hover:bg-muted/50">
                                 {Object.values(row as Record<string, unknown>).map((val, j) => (
-                                  <td key={j} className="py-2 px-3 font-mono text-xs">
+                                  <td key={j} className="py-2 px-3 font-mono text-xs whitespace-nowrap">
                                     {String(val ?? '')}
                                   </td>
                                 ))}
@@ -451,7 +405,7 @@ export default function StudioPage() {
                     <div className="text-center py-8 text-muted-foreground">
                       <CheckCircle2 className="h-10 w-10 mx-auto mb-3 text-emerald-500" />
                       <p className="font-medium">Data Generated Successfully</p>
-                      <p className="text-sm mt-1">Run a quality check from the main Studio for detailed analysis.</p>
+                      <p className="text-sm mt-1">Quality analysis will be available once the data pipeline completes.</p>
                     </div>
                   </CardContent>
                 </Card>

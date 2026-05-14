@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuth } from '@/hooks/use-auth'
 import { DashboardSidebar } from '@/components/layout/dashboard-sidebar'
@@ -14,16 +14,19 @@ export default function DashboardLayout({
   const { user, loading } = useAuth()
   const router = useRouter()
   const authEnabled = process.env.NEXT_PUBLIC_AUTH_ENABLED === 'true'
+  const hasRedirected = useRef(false)
 
   useEffect(() => {
-    // Only redirect if auth is enabled, loading is done, and no user
-    if (authEnabled && !loading && !user) {
-      // Use router.push for client-side navigation to avoid hard redirect
-      // which can cause redirect loops with middleware
-      router.push('/login')
+    // Only redirect once, and only after loading is complete
+    if (authEnabled && !loading && !user && !hasRedirected.current) {
+      hasRedirected.current = true
+      // Use window.location for a hard redirect to avoid client-side
+      // navigation conflicts with auth state changes
+      window.location.href = '/login'
     }
-  }, [authEnabled, loading, user, router])
+  }, [authEnabled, loading, user])
 
+  // Show loading while checking auth state
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
