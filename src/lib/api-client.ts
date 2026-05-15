@@ -19,15 +19,32 @@ const responseCache = new Map<string, { data: unknown; timestamp: number }>()
 const DEFAULT_CACHE_TTL = 3000 // 3 seconds
 
 // Periodic cleanup to prevent memory leaks
+// Use a stored reference so we can clear it if needed
+let cleanupTimer: ReturnType<typeof setInterval> | null = null
+
 if (typeof window !== 'undefined') {
-  setInterval(() => {
+  cleanupTimer = setInterval(() => {
     const now = Date.now()
     for (const [key, entry] of responseCache.entries()) {
       if (now - entry.timestamp > 30000) { // Clean entries older than 30s
         responseCache.delete(key)
       }
     }
+    // Also clean up any orphaned inflight requests
+    for (const key of inflightRequests.keys()) {
+      inflightRequests.delete(key)
+    }
   }, 30000)
+}
+
+// Cleanup function for hot module reloading
+export function cleanupApiClient() {
+  if (cleanupTimer) {
+    clearInterval(cleanupTimer)
+    cleanupTimer = null
+  }
+  responseCache.clear()
+  inflightRequests.clear()
 }
 
 export interface ApiClientOptions {

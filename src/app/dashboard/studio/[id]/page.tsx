@@ -1,6 +1,6 @@
 'use client'
 
-import { use, useEffect, useState, useRef } from 'react'
+import { use, useEffect, useState } from 'react'
 import StudioPage from '../page'
 import { Loader2 } from 'lucide-react'
 import { apiGet } from '@/lib/api-client'
@@ -17,12 +17,9 @@ export default function StudioDatabasePage({ params }: { params: Promise<{ id: s
   const [schema, setSchema] = useState<SchemaTable[]>([])
   const [data, setData] = useState<Record<string, unknown[]>>({})
   const [error, setError] = useState<string | null>(null)
-  const hasFetched = useRef(false)
 
   useEffect(() => {
     async function loadDatabase() {
-      if (hasFetched.current) return
-      hasFetched.current = true
 
       try {
         // Use deduplicated API client

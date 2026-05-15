@@ -3,34 +3,43 @@ import { getSupabaseAdmin } from '@/lib/supabase/admin'
 
 // Lightweight user info endpoint — uses admin client with cookie-based token extraction
 // instead of the heavy SSR client approach that creates a new server instance per request.
+function extractAccessToken(request: NextRequest): string | null {
+  // Try multiple cookie name patterns that Supabase uses
+  const authCookies = request.cookies.getAll().filter(c =>
+    c.name.includes('auth-token') ||
+    c.name.startsWith('sb-') ||
+    c.name.includes('-auth-token')
+  )
+
+  for (const cookie of authCookies) {
+    try {
+      const cookieValue = decodeURIComponent(cookie.value)
+      // Try parsing as JSON first (newer Supabase format)
+      try {
+        const parsed = JSON.parse(cookieValue)
+        if (parsed?.access_token) return parsed.access_token
+      } catch {
+        // Not JSON - might be the access token directly
+        if (cookieValue.startsWith('eyJ')) return cookieValue
+      }
+    } catch {
+      continue
+    }
+  }
+  return null
+}
+
 export async function GET(request: NextRequest) {
   try {
-    // Try to get the auth token from cookies
-    const authCookie = request.cookies.getAll().find(c =>
-      c.name.includes('auth-token')
-    )
+    const accessToken = extractAccessToken(request)
 
-    if (!authCookie) {
+    if (!accessToken) {
       return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
     }
 
     const admin = getSupabaseAdmin()
     if (!admin) {
       return NextResponse.json({ error: 'Auth service not configured' }, { status: 503 })
-    }
-
-    // Extract the access token from the cookie value
-    let accessToken = ''
-    try {
-      const cookieValue = decodeURIComponent(authCookie.value)
-      const parsed = JSON.parse(cookieValue)
-      accessToken = parsed?.access_token || ''
-    } catch {
-      return NextResponse.json({ error: 'Invalid auth token' }, { status: 401 })
-    }
-
-    if (!accessToken) {
-      return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
     }
 
     // Verify the token with Supabase admin
@@ -56,11 +65,9 @@ export async function GET(request: NextRequest) {
 
 export async function PATCH(request: NextRequest) {
   try {
-    const authCookie = request.cookies.getAll().find(c =>
-      c.name.includes('auth-token')
-    )
+    const accessToken = extractAccessToken(request)
 
-    if (!authCookie) {
+    if (!accessToken) {
       return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
     }
 
@@ -69,21 +76,19 @@ export async function PATCH(request: NextRequest) {
       return NextResponse.json({ error: 'Auth service not configured' }, { status: 503 })
     }
 
-    let accessToken = ''
-    try {
-      const cookieValue = decodeURIComponent(authCookie.value)
-      const parsed = JSON.parse(cookieValue)
-      accessToken = parsed?.access_token || ''
-    } catch {
-      return NextResponse.json({ error: 'Invalid auth token' }, { status: 401 })
-    }
-
     const { data: { user }, error } = await admin.auth.getUser(accessToken)
     if (error || !user) {
       return NextResponse.json({ error: 'Invalid or expired token' }, { status: 401 })
     }
 
     const body = await request.json() as { name?: string; avatarUrl?: string }
+
+    // Update user metadata
+    if (body.name) {
+      await admin.auth.admin.updateUserById(user.id, {
+        user_metadata: { full_name: body.name },
+      })
+    }
 
     return NextResponse.json({
       user: {

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import Link from 'next/link'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -26,12 +26,8 @@ export default function MyDatabasesPage() {
   const [loading, setLoading] = useState(true)
   const [searchQuery, setSearchQuery] = useState('')
   const [deleting, setDeleting] = useState<string | null>(null)
-  const hasFetched = useRef(false)
 
   const loadDatabases = useCallback(async () => {
-    if (hasFetched.current) return
-    hasFetched.current = true
-
     try {
       // Use deduplicated API client - prevents duplicate requests
       const data = await apiGet<{ databases: DatabaseItem[] }>('/api/databases', {

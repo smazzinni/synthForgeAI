@@ -75,8 +75,28 @@ export async function POST(request: NextRequest) {
     }
 
     // Use z-ai-web-dev-sdk for AI chat
-    const ZAI = (await import('z-ai-web-dev-sdk')).default
-    const zai = await ZAI.create()
+    let ZAI: any
+    try {
+      const mod = await import('z-ai-web-dev-sdk')
+      ZAI = mod.default
+    } catch (importErr) {
+      console.error('[Chat API] Failed to import z-ai-web-dev-sdk:', (importErr as Error).message)
+      return NextResponse.json(
+        { error: 'AI service not available', content: 'The AI service is currently unavailable. Please try again later.' },
+        { status: 503 }
+      )
+    }
+
+    let zai
+    try {
+      zai = await ZAI.create()
+    } catch (createErr) {
+      console.error('[Chat API] Failed to create ZAI instance:', (createErr as Error).message)
+      return NextResponse.json(
+        { error: 'AI service initialization failed', content: 'The AI service failed to initialize. Please try again later.' },
+        { status: 503 }
+      )
+    }
 
     const contextInfo = databaseId
       ? `\n\nThe user is currently editing database "${databaseName || databaseId}" (ID: ${databaseId}). Help them modify or extend the existing data.`
@@ -115,17 +135,26 @@ Do NOT include "thinking" tags or internal reasoning in your response.
 
 Current agent: Orchestrator`
 
-    const completion = await zai.chat.completions.create({
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: message },
-      ],
-      temperature: 0.7,
-      max_tokens: 3000,
-      stream: false,
-    })
+    let completion
+    try {
+      completion = await zai.chat.completions.create({
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: message },
+        ],
+        temperature: 0.7,
+        max_tokens: 3000,
+        stream: false,
+      })
+    } catch (aiErr) {
+      console.error('[Chat API] AI completion error:', (aiErr as Error).message)
+      return NextResponse.json(
+        { error: 'AI generation failed', content: 'I encountered an error while generating data. Please try again.' },
+        { status: 500 }
+      )
+    }
 
-    let content = completion.choices?.[0]?.message?.content || 'I apologize, I could not generate a response.'
+    let content = completion?.choices?.[0]?.message?.content || 'I apologize, I could not generate a response.'
 
     // Clean up any <think|thinking> tags from the AI response
     content = content.replace(/<think[\s\S]*?<\/think>/gi, '')
@@ -137,7 +166,7 @@ Current agent: Orchestrator`
       agent: 'Orchestrator',
     })
   } catch (error) {
-    console.error('[Chat API] Error:', error)
+    console.error('[Chat API] Unhandled error:', error)
     return NextResponse.json(
       { error: 'Internal server error', content: 'I apologize, but I encountered an error processing your request. Please try again.' },
       { status: 500 }

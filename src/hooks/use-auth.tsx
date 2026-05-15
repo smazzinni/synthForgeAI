@@ -53,16 +53,41 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     supabaseRef.current = supabase
     let mounted = true
 
-    // Get initial session ONCE
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (mounted) {
-        setSession(session)
-        setUser(session?.user ?? null)
-        setLoading(false)
-        lastAuthUpdate = Date.now()
+    // Handle code exchange from auth callback (email confirmation, password reset, etc.)
+    const handleCodeExchange = async () => {
+      if (typeof window === 'undefined') return
+      const params = new URLSearchParams(window.location.search)
+      const code = params.get('code')
+      if (code) {
+        try {
+          const { error } = await supabase.auth.exchangeCodeForSession(code)
+          if (error) {
+            console.warn('[Auth] Code exchange failed:', error.message)
+          } else {
+            // Clean up the URL by removing the code parameter
+            const url = new URL(window.location.href)
+            url.searchParams.delete('code')
+            window.history.replaceState({}, '', url.pathname)
+          }
+        } catch (err) {
+          console.warn('[Auth] Code exchange error:', err)
+        }
       }
-    }).catch(() => {
-      if (mounted) setLoading(false)
+    }
+
+    // Exchange code first, then get session
+    handleCodeExchange().then(() => {
+      // Get initial session ONCE
+      supabase.auth.getSession().then(({ data: { session } }) => {
+        if (mounted) {
+          setSession(session)
+          setUser(session?.user ?? null)
+          setLoading(false)
+          lastAuthUpdate = Date.now()
+        }
+      }).catch(() => {
+        if (mounted) setLoading(false)
+      })
     })
 
     // Listen for auth state changes
@@ -82,7 +107,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           return
         }
         // Just update the session silently without triggering loading state
-        // Only update if the user hasn't changed
         setSession(session)
         lastAuthUpdate = Date.now()
         return

@@ -47,6 +47,8 @@ export default function DashboardLayout({
     )
   }
 
+  // If auth is disabled (dev mode), show dashboard without auth check
+  // This allows the app to work even if Supabase keys are misconfigured
   return (
     <div className="flex min-h-screen">
       <DashboardSidebar />

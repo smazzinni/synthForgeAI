@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import Link from 'next/link'
 import { useAuth } from '@/hooks/use-auth'
 import { apiGet, invalidateCache } from '@/lib/api-client'
@@ -34,12 +34,8 @@ export default function DashboardPage() {
   const { user } = useAuth()
   const [databases, setDatabases] = useState<DatabaseItem[]>([])
   const [loading, setLoading] = useState(true)
-  const hasFetched = useRef(false)
 
   const loadData = useCallback(async () => {
-    if (hasFetched.current) return
-    hasFetched.current = true
-
     try {
       // Use deduplicated API client - prevents duplicate requests
       const data = await apiGet<{ databases: DatabaseItem[] }>('/api/databases', {

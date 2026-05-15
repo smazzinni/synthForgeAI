@@ -61,14 +61,32 @@ function checkRateLimit(clientId: string, endpoint: string): boolean {
 // Lightweight user extraction from cookies
 function getUserIdFromCookies(request: NextRequest): string | null {
   try {
-    const authCookie = request.cookies.getAll().find(c =>
-      c.name.includes('auth-token')
+    // Try multiple cookie name patterns that Supabase uses
+    const authCookies = request.cookies.getAll().filter(c =>
+      c.name.includes('auth-token') ||
+      c.name.startsWith('sb-') ||
+      c.name.includes('-auth-token')
     )
-    if (!authCookie) return null
 
-    const cookieValue = decodeURIComponent(authCookie.value)
-    const parsed = JSON.parse(cookieValue)
-    return parsed?.user?.id || null
+    for (const cookie of authCookies) {
+      try {
+        const cookieValue = decodeURIComponent(cookie.value)
+        // Try parsing as JSON first (newer Supabase format)
+        try {
+          const parsed = JSON.parse(cookieValue)
+          if (parsed?.user?.id) return parsed.user.id
+          if (parsed?.access_token) {
+            // We have an access token but need to decode it to get user ID
+            // For now, just return null - the admin client will handle this
+          }
+        } catch {
+          // Not JSON
+        }
+      } catch {
+        continue
+      }
+    }
+    return null
   } catch {
     return null
   }
