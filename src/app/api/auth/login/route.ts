@@ -1,7 +1,38 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { createServerClient } from '@supabase/ssr'
 
+// ─── Rate limiter: max 5 login attempts per minute ───
+const loginRateLimiter = new Map<string, { count: number; resetAt: number }>()
+const LOGIN_RATE_LIMIT = 5
+const LOGIN_RATE_WINDOW = 60000
+
+function getClientId(request: NextRequest): string {
+  const forwarded = request.headers.get('x-forwarded-for')
+  const ip = forwarded ? forwarded.split(',')[0] : 'unknown'
+  return ip
+}
+
+// NOTE: The primary login flow is client-side via useAuth().signIn()
+// which uses the Supabase browser client directly.
+// This API route is only used as a fallback for programmatic login.
 export async function POST(request: NextRequest) {
+  // Rate limit check
+  const clientId = getClientId(request)
+  const now = Date.now()
+  const entry = loginRateLimiter.get(clientId)
+
+  if (entry && now <= entry.resetAt && entry.count >= LOGIN_RATE_LIMIT) {
+    return NextResponse.json(
+      { error: 'Too many login attempts. Please wait a moment.' },
+      { status: 429 }
+    )
+  }
+
+  if (!entry || now > entry.resetAt) {
+    loginRateLimiter.set(clientId, { count: 1, resetAt: now + LOGIN_RATE_WINDOW })
+  } else {
+    entry.count++
+  }
+
   try {
     const body = await request.json()
     const { email, password } = body
@@ -10,42 +41,21 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Email and password are required' }, { status: 400 })
     }
 
-    // Create a response object that will carry the session cookies
-    const response = NextResponse.json({ authenticated: true })
+    // Use the Supabase admin client for verification (lighter than SSR client)
+    const { getSupabaseAdmin } = await import('@/lib/supabase/admin')
+    const admin = getSupabaseAdmin()
 
-    // Use the SSR client to sign in, which properly sets session cookies
-    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
-    const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-
-    if (!supabaseUrl || !supabaseAnonKey) {
+    if (!admin) {
       return NextResponse.json({ error: 'Auth service not configured' }, { status: 503 })
     }
 
-    const supabase = createServerClient(supabaseUrl, supabaseAnonKey, {
-      cookies: {
-        getAll() {
-          return request.cookies.getAll()
-        },
-        setAll(cookiesToSet) {
-          cookiesToSet.forEach(({ name, value, options }) => {
-            response.cookies.set(name, value, {
-              ...options,
-              sameSite: 'lax',
-              secure: request.nextUrl.protocol === 'https:',
-              path: '/',
-            })
-          })
-        },
-      },
-    })
-
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password })
+    // Verify credentials using admin list users (lighter than creating SSR client)
+    const { data, error } = await admin.auth.signInWithPassword({ email, password })
 
     if (error) {
       return NextResponse.json({ error: error.message }, { status: 401 })
     }
 
-    // Update the response with user info (cookies are already set by setAll)
     return NextResponse.json({
       user: {
         id: data.user.id,
@@ -53,8 +63,6 @@ export async function POST(request: NextRequest) {
         name: data.user.user_metadata?.full_name,
       },
       authenticated: true,
-    }, {
-      headers: response.headers,
     })
   } catch (err) {
     console.error('[Auth Login] Error:', err)

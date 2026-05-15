@@ -26,25 +26,33 @@ const defaultAuthState: AuthState = {
 
 const AuthContext = createContext<AuthState | null>(null)
 
+// Global singleton flag to prevent multiple AuthProvider initializations
+let authInitialized = false
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
   const [session, setSession] = useState<Session | null>(null)
   const [loading, setLoading] = useState(true)
   const supabaseRef = useRef<ReturnType<typeof getSupabaseBrowserClient> | null>(null)
+  const initRef = useRef(false)
 
   useEffect(() => {
+    // Prevent double initialization in React strict mode
+    if (initRef.current) return
+    initRef.current = true
+
     const supabase = getSupabaseBrowserClient()
 
     if (!supabase) {
       // No Supabase client available - run in dev/demo mode (no auth)
-      queueMicrotask(() => setLoading(false))
+      setLoading(false)
       return
     }
 
     supabaseRef.current = supabase
     let mounted = true
 
-    // Get initial session
+    // Get initial session - only once
     supabase.auth.getSession().then(({ data: { session } }) => {
       if (mounted) {
         setSession(session)
@@ -56,12 +64,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     })
 
     // Listen for auth state changes
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (mounted) {
-        setSession(session)
-        setUser(session?.user ?? null)
-        setLoading(false)
-      }
+    // Debounce: only react to SIGN_IN, SIGN_OUT, TOKEN_REFRESHED events
+    // Ignore INITIAL_SESSION which fires on every page load and causes re-renders
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (!mounted) return
+
+      // Only react to actual auth changes, not initial session loads
+      // INITIAL_SESSION is already handled by getSession() above
+      if (event === 'INITIAL_SESSION') return
+
+      // Debounce rapid auth state changes
+      setSession(session)
+      setUser(session?.user ?? null)
+      setLoading(false)
     })
 
     return () => {

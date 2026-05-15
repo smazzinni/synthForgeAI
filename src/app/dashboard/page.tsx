@@ -29,19 +29,36 @@ interface DatabaseItem {
   created_at?: string
 }
 
+// Module-level cache to prevent re-fetching across remounts
+let cachedDatabases: DatabaseItem[] | null = null
+let cacheTimestamp = 0
+const CACHE_TTL = 5000 // 5 seconds
+
 export default function DashboardPage() {
   const { user } = useAuth()
-  const [databases, setDatabases] = useState<DatabaseItem[]>([])
-  const [loading, setLoading] = useState(true)
-  const hasFetched = useRef(false)
+  const [databases, setDatabases] = useState<DatabaseItem[]>(cachedDatabases || [])
+  const [loading, setLoading] = useState(!cachedDatabases)
+  const hasFetched = useRef(!!cachedDatabases)
 
   const loadData = useCallback(async () => {
+    // Check module-level cache first
+    if (cachedDatabases && Date.now() - cacheTimestamp < CACHE_TTL) {
+      setDatabases(cachedDatabases)
+      setLoading(false)
+      return
+    }
+
     if (hasFetched.current) return
     hasFetched.current = true
+
     try {
       const res = await fetch('/api/databases')
       const data = await res.json()
-      setDatabases(data.databases || [])
+      const dbList = data.databases || []
+      setDatabases(dbList)
+      // Update module-level cache
+      cachedDatabases = dbList
+      cacheTimestamp = Date.now()
     } catch {
       setDatabases([])
     } finally {
@@ -56,7 +73,7 @@ export default function DashboardPage() {
   const stats = [
     { label: 'Total Databases', value: databases.length, icon: Database, color: 'text-amber-600', bgColor: 'bg-amber-100 dark:bg-amber-900/30' },
     { label: 'Total Rows', value: databases.reduce((sum, db) => sum + (db.row_count || 0), 0).toLocaleString(), icon: BarChart3, color: 'text-emerald-600', bgColor: 'bg-emerald-100 dark:bg-emerald-900/30' },
-    { label: 'Avg Quality', value: databases.length > 0 ? `${Math.round(databases.filter(db => db.quality_score).reduce((sum, db) => sum + (db.quality_score || 0), 0) / Math.max(databases.filter(db => db.quality_score).length, 1) * 100)}%` : 'N/A', icon: Zap, color: 'text-sky-600', bgColor: 'bg-sky-100 dark:bg-sky-900/30' },
+    { label: 'Avg Quality', value: databases.length > 0 ? `${Math.round(databases.filter(db => db.quality_score).reduce((sum, db) => sum + (db.quality_score || 0), 0) / Math.max(databases.filter(db => db.quality_score).length, 1) * 100)}%` : 'N/A', icon: Zap, color: 'text-sky-600', bgColor: 'bg-sky-100 dark:bg-emerald-900/30' },
     { label: 'Ready Databases', value: databases.filter(db => db.status === 'ready').length, icon: MessageSquare, color: 'text-violet-600', bgColor: 'bg-violet-100 dark:bg-violet-900/30' },
   ]
 

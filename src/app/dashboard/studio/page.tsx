@@ -233,6 +233,9 @@ export default function StudioPage({ databaseId, initialName, initialSchema, ini
   }
 
   // Save the generated data as a database in Supabase
+  // Uses two-step process to avoid large JSON payloads crashing the server:
+  // Step 1: Create the database record (small payload)
+  // Step 2: Update with data (sent as separate PATCH request)
   const saveToDatabase = async () => {
     if (!hasGeneratedData) {
       toast.error('No data to save. Generate some data first.')
@@ -248,21 +251,20 @@ export default function StudioPage({ databaseId, initialName, initialSchema, ini
         totalRows += rows.length
       }
 
-      const body = {
+      // Step 1: Create the database record (lightweight)
+      const createBody = {
         name,
         db_type: 'postgresql',
         schema_json: generatedSchema,
-        data_json: generatedData,
         row_count: totalRows,
         quality_score: 0.85,
         status: 'ready',
-        ...(databaseId ? { id: databaseId } : {}),
       }
 
       const res = await fetch('/api/databases', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify(createBody),
       })
 
       if (!res.ok) {
@@ -271,6 +273,25 @@ export default function StudioPage({ databaseId, initialName, initialSchema, ini
       }
 
       const result = await res.json()
+      const dbId = result.database?.id
+
+      // Step 2: Update with generated data (separate request to avoid large payloads)
+      if (dbId && Object.keys(generatedData).length > 0) {
+        try {
+          await fetch('/api/databases', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id: dbId,
+              data_json: generatedData,
+            }),
+          })
+        } catch {
+          // Data update failed, but the record was created
+          console.warn('[Studio] Failed to save data_json, but database record was created')
+        }
+      }
+
       toast.success(databaseId ? 'Database updated successfully!' : 'Database saved successfully!')
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to save database')

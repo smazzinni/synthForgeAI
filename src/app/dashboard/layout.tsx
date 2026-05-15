@@ -1,10 +1,12 @@
 'use client'
 
 import { useEffect, useRef } from 'react'
-import { useRouter } from 'next/navigation'
 import { useAuth } from '@/hooks/use-auth'
 import { DashboardSidebar } from '@/components/layout/dashboard-sidebar'
 import { Loader2 } from 'lucide-react'
+
+// Module-level flag to prevent redirect loops across remounts
+let hasTriggeredRedirect = false
 
 export default function DashboardLayout({
   children,
@@ -12,17 +14,22 @@ export default function DashboardLayout({
   children: React.ReactNode
 }) {
   const { user, loading } = useAuth()
-  const router = useRouter()
   const authEnabled = process.env.NEXT_PUBLIC_AUTH_ENABLED === 'true'
-  const hasRedirected = useRef(false)
+  const localRedirectRef = useRef(false)
 
   useEffect(() => {
-    // Only redirect once, and only after loading is complete
-    if (authEnabled && !loading && !user && !hasRedirected.current) {
-      hasRedirected.current = true
-      // Use window.location for a hard redirect to avoid client-side
-      // navigation conflicts with auth state changes
-      window.location.href = '/login'
+    // Only redirect once, even across remounts
+    if (
+      authEnabled &&
+      !loading &&
+      !user &&
+      !localRedirectRef.current &&
+      !hasTriggeredRedirect
+    ) {
+      localRedirectRef.current = true
+      hasTriggeredRedirect = true
+      // Use replace to avoid adding to browser history
+      window.location.replace('/login')
     }
   }, [authEnabled, loading, user])
 

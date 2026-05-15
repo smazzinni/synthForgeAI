@@ -1,6 +1,44 @@
 import { NextRequest, NextResponse } from 'next/server'
 
+// ─── Rate limiter for chat API: max 10 requests per minute ───
+const chatRateLimiter = new Map<string, { count: number; resetAt: number }>()
+const CHAT_RATE_LIMIT = 10
+const CHAT_RATE_WINDOW = 60000 // 1 minute
+
+function getClientId(request: NextRequest): string {
+  const forwarded = request.headers.get('x-forwarded-for')
+  const ip = forwarded ? forwarded.split(',')[0] : 'unknown'
+  return ip
+}
+
+function checkChatRateLimit(clientId: string): boolean {
+  const key = `chat:${clientId}`
+  const now = Date.now()
+  const entry = chatRateLimiter.get(key)
+
+  if (!entry || now > entry.resetAt) {
+    chatRateLimiter.set(key, { count: 1, resetAt: now + CHAT_RATE_WINDOW })
+    return true
+  }
+
+  if (entry.count >= CHAT_RATE_LIMIT) {
+    return false
+  }
+
+  entry.count++
+  return true
+}
+
 export async function POST(request: NextRequest) {
+  // Rate limit check
+  const clientId = getClientId(request)
+  if (!checkChatRateLimit(clientId)) {
+    return NextResponse.json(
+      { error: 'Too many requests. Please wait a moment before sending another message.' },
+      { status: 429 }
+    )
+  }
+
   try {
     const body = await request.json()
     const { message, databaseId, databaseName } = body

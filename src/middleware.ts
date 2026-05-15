@@ -1,72 +1,21 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { createServerClient } from '@supabase/ssr'
+
+// Lightweight middleware that does NOT create Supabase clients
+// Auth state is handled entirely client-side via the AuthProvider
+// This prevents the middleware from being a bottleneck that causes 502s
 
 export async function middleware(request: NextRequest) {
-  const isAuthEnabled = process.env.NEXT_PUBLIC_AUTH_ENABLED === 'true'
-  if (!isAuthEnabled) {
-    return NextResponse.next()
-  }
-
-  const { pathname } = request.nextUrl
-
-  // Skip middleware for API routes, auth callback, and static assets
-  const isApiRoute = pathname.startsWith('/api/')
-  const isAuthCallback = pathname.startsWith('/auth/callback')
-  const isPublicAsset = pathname.startsWith('/_next/') || pathname.startsWith('/favicon') || pathname.endsWith('.ico') || pathname.endsWith('.png') || pathname.endsWith('.svg')
-
-  if (isPublicAsset || isAuthCallback || isApiRoute) {
-    return NextResponse.next()
-  }
-
-  // Only refresh session cookies for dashboard pages
-  // Auth pages (login, signup, forgot-password) don't need middleware processing
-  // because the client-side AuthProvider already handles redirect logic
-  const isDashboardPage = pathname.startsWith('/dashboard')
-
-  if (!isDashboardPage) {
-    return NextResponse.next()
-  }
-
-  let supabaseResponse = NextResponse.next({
-    request,
-  })
-
-  try {
-    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
-    const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-
-    if (!supabaseUrl || !supabaseAnonKey) {
-      return supabaseResponse
-    }
-
-    const supabase = createServerClient(supabaseUrl, supabaseAnonKey, {
-      cookies: {
-        getAll() {
-          return request.cookies.getAll()
-        },
-        setAll(cookiesToSet) {
-          try {
-            cookiesToSet.forEach(({ name, value }) =>
-              request.cookies.set(name, value)
-            )
-            cookiesToSet.forEach(({ name, value, options }) =>
-              supabaseResponse.cookies.set(name, value, options)
-            )
-          } catch (err) {
-            console.error('[Middleware] Error setting cookies:', err)
-          }
-        },
-      },
-    })
-
-    // Just refresh the session - don't redirect
-    // Client-side auth (AuthProvider + DashboardLayout) handles redirects
-    await supabase.auth.getUser()
-  } catch (err) {
-    console.error('[Middleware] Unexpected error:', err)
-  }
-
-  return supabaseResponse
+  // Just pass through - all auth is handled client-side
+  // The AuthProvider in the root layout handles:
+  //   - Checking session on page load
+  //   - Redirecting to /login if not authenticated
+  //   - Redirecting to /dashboard if already authenticated on login page
+  //
+  // Previous versions created Supabase server clients here which:
+  //   - Made network calls to Supabase on EVERY request
+  //   - Caused request queuing under load
+  //   - Led to 502 Bad Gateway errors
+  return NextResponse.next()
 }
 
 export const config = {

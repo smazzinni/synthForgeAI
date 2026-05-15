@@ -1,8 +1,7 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import Link from 'next/link'
-import { useAuth } from '@/hooks/use-auth'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -22,13 +21,15 @@ interface DatabaseItem {
 }
 
 export default function MyDatabasesPage() {
-  const { user } = useAuth()
   const [databases, setDatabases] = useState<DatabaseItem[]>([])
   const [loading, setLoading] = useState(true)
   const [searchQuery, setSearchQuery] = useState('')
   const [deleting, setDeleting] = useState<string | null>(null)
+  const hasFetched = useRef(false)
 
   const loadDatabases = useCallback(async () => {
+    if (hasFetched.current) return
+    hasFetched.current = true
     try {
       const res = await fetch('/api/databases')
       const data = await res.json()

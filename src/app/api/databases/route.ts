@@ -1,8 +1,67 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
-import { getSupabaseServerClient } from '@/lib/supabase/server'
+
+// ─── In-memory request cache to prevent duplicate API calls ───
+const apiCache = new Map<string, { data: unknown; timestamp: number }>()
+const CACHE_TTL = 3000 // 3 seconds cache
+
+// ─── Rate limiter: max 30 requests per minute per endpoint ───
+const rateLimiter = new Map<string, { count: number; resetAt: number }>()
+const RATE_LIMIT = 30
+const RATE_WINDOW = 60000 // 1 minute
+
+function getClientId(request: NextRequest): string {
+  const forwarded = request.headers.get('x-forwarded-for')
+  const ip = forwarded ? forwarded.split(',')[0] : 'unknown'
+  return ip
+}
+
+function checkRateLimit(clientId: string, endpoint: string): boolean {
+  const key = `${clientId}:${endpoint}`
+  const now = Date.now()
+  const entry = rateLimiter.get(key)
+
+  if (!entry || now > entry.resetAt) {
+    rateLimiter.set(key, { count: 1, resetAt: now + RATE_WINDOW })
+    return true
+  }
+
+  if (entry.count >= RATE_LIMIT) {
+    return false
+  }
+
+  entry.count++
+  return true
+}
+
+// Lightweight user extraction from cookies using admin client
+// (avoids creating a heavy SSR client on every request)
+function getUserIdFromCookies(request: NextRequest): string | null {
+  try {
+    const authCookie = request.cookies.getAll().find(c =>
+      c.name.includes('auth-token')
+    )
+    if (!authCookie) return null
+
+    const cookieValue = decodeURIComponent(authCookie.value)
+    const parsed = JSON.parse(cookieValue)
+    return parsed?.user?.id || null
+  } catch {
+    return null
+  }
+}
 
 export async function GET(request: NextRequest) {
+  const clientId = getClientId(request)
+
+  // Rate limit check
+  if (!checkRateLimit(clientId, 'databases:get')) {
+    return NextResponse.json(
+      { error: 'Too many requests. Please wait a moment.' },
+      { status: 429 }
+    )
+  }
+
   try {
     const admin = getSupabaseAdmin()
     if (!admin) {
@@ -13,23 +72,26 @@ export async function GET(request: NextRequest) {
     const { searchParams } = new URL(request.url)
     const id = searchParams.get('id')
 
-    // Get the authenticated user to filter databases
-    let userId: string | null = null
-    try {
-      const supabase = await getSupabaseServerClient()
-      const { data: { user } } = await supabase.auth.getUser()
-      userId = user?.id || null
-    } catch { /* continue without user filter */ }
+    // Check cache for list queries (not individual ID queries)
+    if (!id) {
+      const userId = getUserIdFromCookies(request)
+      const cacheKey = `databases:list:${userId || 'anon'}`
+      const cached = apiCache.get(cacheKey)
+      if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+        return NextResponse.json(cached.data)
+      }
+    }
+
+    // Get user ID from cookies (lightweight)
+    const userId = getUserIdFromCookies(request)
 
     // If requesting a specific database by ID
     if (id) {
-      let query = admin
+      const { data, error } = await admin
         .from('synthetic_databases')
         .select('*')
         .eq('id', id)
         .single()
-
-      const { data, error } = await query
 
       if (error) {
         console.warn('[Databases API] Query error:', error.message)
@@ -46,7 +108,6 @@ export async function GET(request: NextRequest) {
       .order('created_at', { ascending: false })
       .limit(50)
 
-    // Filter by user_id if available (individual user mode)
     if (userId) {
       query = query.eq('user_id', userId)
     }
@@ -58,7 +119,13 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ databases: [] })
     }
 
-    return NextResponse.json({ databases: data || [] })
+    const responseData = { databases: data || [] }
+
+    // Cache the result
+    const cacheKey = `databases:list:${userId || 'anon'}`
+    apiCache.set(cacheKey, { data: responseData, timestamp: Date.now() })
+
+    return NextResponse.json(responseData)
   } catch (err) {
     console.error('[Databases API] Error:', err)
     return NextResponse.json({ databases: [] })
@@ -66,6 +133,16 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
+  const clientId = getClientId(request)
+
+  // Rate limit check
+  if (!checkRateLimit(clientId, 'databases:post')) {
+    return NextResponse.json(
+      { error: 'Too many requests. Please wait a moment.' },
+      { status: 429 }
+    )
+  }
+
   try {
     const body = await request.json()
     const { name, db_type = 'postgresql', schema_json = [], data_json = {}, row_count = 0, quality_score = null, status = 'draft' } = body
@@ -82,13 +159,8 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Database service not configured' }, { status: 503 })
     }
 
-    // Get the authenticated user
-    let userId: string | null = null
-    try {
-      const supabase = await getSupabaseServerClient()
-      const { data: { user } } = await supabase.auth.getUser()
-      userId = user?.id || null
-    } catch { /* continue without user */ }
+    // Get user ID from cookies (lightweight)
+    const userId = getUserIdFromCookies(request)
 
     const insertData: Record<string, unknown> = {
       name,
@@ -112,6 +184,13 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: error.message }, { status: 500 })
     }
 
+    // Invalidate all list caches after mutation
+    for (const key of apiCache.keys()) {
+      if (key.startsWith('databases:list:')) {
+        apiCache.delete(key)
+      }
+    }
+
     return NextResponse.json({ database: data })
   } catch (err) {
     console.error('[Databases API] Error:', err)
@@ -119,7 +198,74 @@ export async function POST(request: NextRequest) {
   }
 }
 
+export async function PATCH(request: NextRequest) {
+  const clientId = getClientId(request)
+
+  if (!checkRateLimit(clientId, 'databases:patch')) {
+    return NextResponse.json(
+      { error: 'Too many requests. Please wait a moment.' },
+      { status: 429 }
+    )
+  }
+
+  try {
+    const body = await request.json()
+    const { id, data_json, schema_json, row_count, quality_score, status, name } = body
+
+    if (!id) {
+      return NextResponse.json({ error: 'Database ID is required' }, { status: 400 })
+    }
+
+    const admin = getSupabaseAdmin()
+    if (!admin) {
+      return NextResponse.json({ error: 'Database service not configured' }, { status: 503 })
+    }
+
+    const updateData: Record<string, unknown> = {}
+    if (data_json !== undefined) updateData.data_json = data_json
+    if (schema_json !== undefined) updateData.schema_json = schema_json
+    if (row_count !== undefined) updateData.row_count = row_count
+    if (quality_score !== undefined) updateData.quality_score = quality_score
+    if (status !== undefined) updateData.status = status
+    if (name !== undefined) updateData.name = name
+
+    const { data, error } = await admin
+      .from('synthetic_databases')
+      .update(updateData)
+      .eq('id', id)
+      .select()
+      .single()
+
+    if (error) {
+      console.error('[Databases API] Patch error:', error.message)
+      return NextResponse.json({ error: error.message }, { status: 500 })
+    }
+
+    // Invalidate caches
+    for (const key of apiCache.keys()) {
+      if (key.startsWith('databases:list:')) {
+        apiCache.delete(key)
+      }
+    }
+
+    return NextResponse.json({ database: data })
+  } catch (err) {
+    console.error('[Databases API] Patch error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  }
+}
+
 export async function DELETE(request: NextRequest) {
+  const clientId = getClientId(request)
+
+  // Rate limit check
+  if (!checkRateLimit(clientId, 'databases:delete')) {
+    return NextResponse.json(
+      { error: 'Too many requests. Please wait a moment.' },
+      { status: 429 }
+    )
+  }
+
   try {
     const { searchParams } = new URL(request.url)
     const id = searchParams.get('id')
@@ -141,6 +287,13 @@ export async function DELETE(request: NextRequest) {
     if (error) {
       console.error('[Databases API] Delete error:', error.message)
       return NextResponse.json({ error: error.message }, { status: 500 })
+    }
+
+    // Invalidate all list caches after mutation
+    for (const key of apiCache.keys()) {
+      if (key.startsWith('databases:list:')) {
+        apiCache.delete(key)
+      }
     }
 
     return NextResponse.json({ success: true })
