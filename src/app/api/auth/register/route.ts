@@ -1,7 +1,34 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getSupabaseAdmin } from '@/lib/supabase/admin'
+
+// Rate limiter for registration
+const registerRateLimiter = new Map<string, { count: number; resetAt: number }>()
+const REGISTER_RATE_LIMIT = 3
+const REGISTER_RATE_WINDOW = 60000
+
+function getClientId(request: NextRequest): string {
+  const forwarded = request.headers.get('x-forwarded-for')
+  return forwarded ? forwarded.split(',')[0] : 'unknown'
+}
 
 export async function POST(request: NextRequest) {
+  // Rate limit check
+  const clientId = getClientId(request)
+  const now = Date.now()
+  const entry = registerRateLimiter.get(clientId)
+
+  if (entry && now <= entry.resetAt && entry.count >= REGISTER_RATE_LIMIT) {
+    return NextResponse.json(
+      { error: 'Too many registration attempts. Please wait a moment.' },
+      { status: 429 }
+    )
+  }
+
+  if (!entry || now > entry.resetAt) {
+    registerRateLimiter.set(clientId, { count: 1, resetAt: now + REGISTER_RATE_WINDOW })
+  } else {
+    entry.count++
+  }
+
   try {
     const body = await request.json()
     const { email, password, full_name } = body
@@ -14,7 +41,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Password must be at least 6 characters' }, { status: 400 })
     }
 
+    const { getSupabaseAdmin } = await import('@/lib/supabase/admin')
     const admin = getSupabaseAdmin()
+
     if (!admin) {
       return NextResponse.json({ error: 'Auth service not configured' }, { status: 503 })
     }

@@ -1,12 +1,8 @@
 import { NextResponse } from 'next/server'
-import { getSupabaseServerClient } from '@/lib/supabase/server'
 
+// Lightweight logout — just return success.
+// The client-side AuthProvider handles the actual signOut via the browser Supabase client.
+// This avoids creating heavy Supabase SSR server clients on every logout request.
 export async function POST() {
-  try {
-    const supabase = await getSupabaseServerClient()
-    await supabase.auth.signOut()
-  } catch {
-    // Continue even if server signOut fails
-  }
   return NextResponse.json({ message: 'Logged out successfully' })
 }

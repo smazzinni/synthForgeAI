@@ -5,9 +5,6 @@ import { useAuth } from '@/hooks/use-auth'
 import { DashboardSidebar } from '@/components/layout/dashboard-sidebar'
 import { Loader2 } from 'lucide-react'
 
-// Module-level flag to prevent redirect loops across remounts
-let hasTriggeredRedirect = false
-
 export default function DashboardLayout({
   children,
 }: {
@@ -15,24 +12,18 @@ export default function DashboardLayout({
 }) {
   const { user, loading } = useAuth()
   const authEnabled = process.env.NEXT_PUBLIC_AUTH_ENABLED === 'true'
-  const localRedirectRef = useRef(false)
+  const redirectRef = useRef(false)
 
   useEffect(() => {
-    // Only redirect once, even across remounts
-    if (
-      authEnabled &&
-      !loading &&
-      !user &&
-      !localRedirectRef.current &&
-      !hasTriggeredRedirect
-    ) {
-      localRedirectRef.current = true
-      hasTriggeredRedirect = true
+    // Only redirect once per mount
+    if (authEnabled && !loading && !user && !redirectRef.current) {
+      redirectRef.current = true
+      // Use replace to avoid adding to history
       window.location.replace('/login')
     }
   }, [authEnabled, loading, user])
 
-  // Show loading while checking auth state (but only briefly)
+  // Show loading while checking auth state
   if (loading && authEnabled) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
