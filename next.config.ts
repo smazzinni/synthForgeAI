@@ -5,7 +5,6 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: true,
   },
   reactStrictMode: false,
-  // output: 'standalone', // Disabled - use `next start` for production
   allowedDevOrigins: ['.space-z.ai', '.space-chatglm.site', 'localhost', '127.0.0.1'],
   async headers() {
     return [
@@ -30,10 +29,12 @@ const nextConfig: NextConfig = {
       },
     ]
   },
-  // Remove sharp from serverExternalPackages to avoid SIGBUS
-  // serverExternalPackages: ['sharp'],
   images: {
     unoptimized: true,
+  },
+  // Experimental: improve server stability
+  experimental: {
+    serverMinification: true,
   },
 };
 
