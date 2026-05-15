@@ -22,7 +22,7 @@ import {
   CheckCircle2,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { useAuth } from '@/hooks/use-auth'
+import { apiPost, apiPatch, invalidateCache } from '@/lib/api-client'
 
 interface Message {
   id: string
@@ -52,7 +52,6 @@ interface StudioPageProps {
 }
 
 export default function StudioPage({ databaseId, initialName, initialSchema, initialData }: StudioPageProps) {
-  const { user } = useAuth()
   const [chatState, setChatState] = useState<ChatState>({
     messages: [
       {
@@ -74,6 +73,7 @@ export default function StudioPage({ databaseId, initialName, initialSchema, ini
   const [saving, setSaving] = useState(false)
   const [databaseName, setDatabaseName] = useState(initialName || '')
   const scrollRef = useRef<HTMLDivElement>(null)
+  const abortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -92,7 +92,7 @@ export default function StudioPage({ databaseId, initialName, initialSchema, ini
         try {
           parsed = JSON.parse(jsonStr)
         } catch {
-          // Code block wasn't valid JSON, try the whole content
+          // Code block wasn't valid JSON
         }
       }
 
@@ -147,6 +147,11 @@ export default function StudioPage({ databaseId, initialName, initialSchema, ini
   const sendMessage = useCallback(async () => {
     if (!input.trim() || chatState.loading) return
 
+    // Cancel any existing request
+    if (abortRef.current) {
+      abortRef.current.abort()
+    }
+
     const userMessage: Message = {
       id: Date.now().toString(),
       role: 'user',
@@ -163,18 +168,15 @@ export default function StudioPage({ databaseId, initialName, initialSchema, ini
     setInput('')
 
     try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      // Use deduplicated API client with longer timeout for AI calls
+      const data = await apiPost<{ content: string; agent: string }>(
+        '/api/chat',
+        {
           message: userMessage.content,
           ...(databaseId ? { databaseId, databaseName } : {}),
-        }),
-      })
-
-      if (!response.ok) throw new Error('Failed to get response')
-
-      const data = await response.json()
+        },
+        { timeout: 60000 } // 60s timeout for AI
+      )
 
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
@@ -193,7 +195,10 @@ export default function StudioPage({ databaseId, initialName, initialSchema, ini
 
       // Try to extract schema/data from the response
       tryParseResponse(assistantMessage.content)
-    } catch {
+    } catch (err) {
+      // Don't show error for aborted requests
+      if ((err as Error).name === 'AbortError') return
+
       const errorMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
@@ -233,9 +238,7 @@ export default function StudioPage({ databaseId, initialName, initialSchema, ini
   }
 
   // Save the generated data as a database in Supabase
-  // Uses two-step process to avoid large JSON payloads crashing the server:
-  // Step 1: Create the database record (small payload)
-  // Step 2: Update with data (sent as separate PATCH request)
+  // Uses two-step process to avoid large JSON payloads crashing the server
   const saveToDatabase = async () => {
     if (!hasGeneratedData) {
       toast.error('No data to save. Generate some data first.')
@@ -251,48 +254,48 @@ export default function StudioPage({ databaseId, initialName, initialSchema, ini
         totalRows += rows.length
       }
 
-      // Step 1: Create the database record (lightweight)
-      const createBody = {
-        name,
-        db_type: 'postgresql',
-        schema_json: generatedSchema,
-        row_count: totalRows,
-        quality_score: 0.85,
-        status: 'ready',
-      }
+      if (databaseId) {
+        // Update existing database
+        await apiPatch('/api/databases', {
+          id: databaseId,
+          name,
+          schema_json: generatedSchema,
+          data_json: generatedData,
+          row_count: totalRows,
+          quality_score: 0.85,
+          status: 'ready',
+        })
+        toast.success('Database updated successfully!')
+      } else {
+        // Step 1: Create the database record (lightweight)
+        const result = await apiPost<{ database?: { id: string } }>('/api/databases', {
+          name,
+          db_type: 'postgresql',
+          schema_json: generatedSchema,
+          row_count: totalRows,
+          quality_score: 0.85,
+          status: 'ready',
+        })
 
-      const res = await fetch('/api/databases', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(createBody),
-      })
+        const dbId = result.database?.id
 
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}))
-        throw new Error(errData.error || 'Failed to save database')
-      }
-
-      const result = await res.json()
-      const dbId = result.database?.id
-
-      // Step 2: Update with generated data (separate request to avoid large payloads)
-      if (dbId && Object.keys(generatedData).length > 0) {
-        try {
-          await fetch('/api/databases', {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
+        // Step 2: Update with generated data (separate request to avoid large payloads)
+        if (dbId && Object.keys(generatedData).length > 0) {
+          try {
+            await apiPatch('/api/databases', {
               id: dbId,
               data_json: generatedData,
-            }),
-          })
-        } catch {
-          // Data update failed, but the record was created
-          console.warn('[Studio] Failed to save data_json, but database record was created')
+            })
+          } catch {
+            console.warn('[Studio] Failed to save data_json, but database record was created')
+          }
         }
+
+        toast.success('Database saved successfully!')
       }
 
-      toast.success(databaseId ? 'Database updated successfully!' : 'Database saved successfully!')
+      // Invalidate caches so other pages show the updated data
+      invalidateCache('/api/databases')
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to save database')
     } finally {

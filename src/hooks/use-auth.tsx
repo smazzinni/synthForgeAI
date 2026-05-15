@@ -26,8 +26,9 @@ const defaultAuthState: AuthState = {
 
 const AuthContext = createContext<AuthState | null>(null)
 
-// Global singleton flag to prevent multiple AuthProvider initializations
-let authInitialized = false
+// Debounce timer for auth state changes
+let lastAuthUpdate = 0
+const AUTH_UPDATE_COOLDOWN = 2000 // 2 seconds - ignore rapid duplicate updates
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
@@ -37,14 +38,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const initRef = useRef(false)
 
   useEffect(() => {
-    // Prevent double initialization in React strict mode
+    // Prevent double initialization
     if (initRef.current) return
     initRef.current = true
 
     const supabase = getSupabaseBrowserClient()
 
     if (!supabase) {
-      // No Supabase client available - run in dev/demo mode (no auth)
+      // No Supabase client - run without auth
       setLoading(false)
       return
     }
@@ -52,31 +53,46 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     supabaseRef.current = supabase
     let mounted = true
 
-    // Get initial session - only once
+    // Get initial session ONCE
     supabase.auth.getSession().then(({ data: { session } }) => {
       if (mounted) {
         setSession(session)
         setUser(session?.user ?? null)
         setLoading(false)
+        lastAuthUpdate = Date.now()
       }
     }).catch(() => {
       if (mounted) setLoading(false)
     })
 
     // Listen for auth state changes
-    // Debounce: only react to SIGN_IN, SIGN_OUT, TOKEN_REFRESHED events
-    // Ignore INITIAL_SESSION which fires on every page load and causes re-renders
+    // IMPORTANT: Debounce to prevent re-render cascades from TOKEN_REFRESHED
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
       if (!mounted) return
 
-      // Only react to actual auth changes, not initial session loads
       // INITIAL_SESSION is already handled by getSession() above
       if (event === 'INITIAL_SESSION') return
 
-      // Debounce rapid auth state changes
+      // Debounce TOKEN_REFRESHED events - these fire every few minutes and
+      // cause unnecessary re-renders that trigger child useEffect hooks
+      if (event === 'TOKEN_REFRESHED') {
+        const now = Date.now()
+        if (now - lastAuthUpdate < AUTH_UPDATE_COOLDOWN) {
+          // Skip this update - too soon after the last one
+          return
+        }
+        // Just update the session silently without triggering loading state
+        // Only update if the user hasn't changed
+        setSession(session)
+        lastAuthUpdate = Date.now()
+        return
+      }
+
+      // SIGN_IN and SIGN_OUT events should always trigger updates
       setSession(session)
       setUser(session?.user ?? null)
       setLoading(false)
+      lastAuthUpdate = Date.now()
     })
 
     return () => {

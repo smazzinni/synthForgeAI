@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import Link from 'next/link'
 import { useAuth } from '@/hooks/use-auth'
+import { apiGet, invalidateCache } from '@/lib/api-client'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -29,36 +30,23 @@ interface DatabaseItem {
   created_at?: string
 }
 
-// Module-level cache to prevent re-fetching across remounts
-let cachedDatabases: DatabaseItem[] | null = null
-let cacheTimestamp = 0
-const CACHE_TTL = 5000 // 5 seconds
-
 export default function DashboardPage() {
   const { user } = useAuth()
-  const [databases, setDatabases] = useState<DatabaseItem[]>(cachedDatabases || [])
-  const [loading, setLoading] = useState(!cachedDatabases)
-  const hasFetched = useRef(!!cachedDatabases)
+  const [databases, setDatabases] = useState<DatabaseItem[]>([])
+  const [loading, setLoading] = useState(true)
+  const hasFetched = useRef(false)
 
   const loadData = useCallback(async () => {
-    // Check module-level cache first
-    if (cachedDatabases && Date.now() - cacheTimestamp < CACHE_TTL) {
-      setDatabases(cachedDatabases)
-      setLoading(false)
-      return
-    }
-
     if (hasFetched.current) return
     hasFetched.current = true
 
     try {
-      const res = await fetch('/api/databases')
-      const data = await res.json()
-      const dbList = data.databases || []
-      setDatabases(dbList)
-      // Update module-level cache
-      cachedDatabases = dbList
-      cacheTimestamp = Date.now()
+      // Use deduplicated API client - prevents duplicate requests
+      const data = await apiGet<{ databases: DatabaseItem[] }>('/api/databases', {
+        cacheTtl: 5000,
+        timeout: 10000,
+      })
+      setDatabases(data.databases || [])
     } catch {
       setDatabases([])
     } finally {
@@ -210,7 +198,7 @@ export default function DashboardPage() {
                   </div>
                   <CardDescription>
                     {db.db_type} &middot; {(db.row_count || 0).toLocaleString()} rows
-                    {db.quality_score ? ` \u00B7 ${Math.round(db.quality_score * 100)}% quality` : ''}
+                    {db.quality_score ? ` · ${Math.round(db.quality_score * 100)}% quality` : ''}
                   </CardDescription>
                 </CardHeader>
                 <CardContent>

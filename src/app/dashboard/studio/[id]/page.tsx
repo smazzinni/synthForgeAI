@@ -1,8 +1,9 @@
 'use client'
 
-import { use, useEffect, useState } from 'react'
+import { use, useEffect, useState, useRef } from 'react'
 import StudioPage from '../page'
 import { Loader2 } from 'lucide-react'
+import { apiGet } from '@/lib/api-client'
 
 interface SchemaTable {
   name: string
@@ -16,13 +17,20 @@ export default function StudioDatabasePage({ params }: { params: Promise<{ id: s
   const [schema, setSchema] = useState<SchemaTable[]>([])
   const [data, setData] = useState<Record<string, unknown[]>>({})
   const [error, setError] = useState<string | null>(null)
+  const hasFetched = useRef(false)
 
   useEffect(() => {
     async function loadDatabase() {
+      if (hasFetched.current) return
+      hasFetched.current = true
+
       try {
-        const res = await fetch(`/api/databases?id=${id}`)
-        if (!res.ok) throw new Error('Failed to load database')
-        const result = await res.json()
+        // Use deduplicated API client
+        const result = await apiGet<{ database: Record<string, unknown> | null }>(
+          `/api/databases?id=${id}`,
+          { cacheTtl: 5000, timeout: 10000 }
+        )
+
         const db = result.database
         if (!db) {
           setError('Database not found')
@@ -30,9 +38,9 @@ export default function StudioDatabasePage({ params }: { params: Promise<{ id: s
           return
         }
 
-        setDbName(db.name || '')
+        setDbName((db.name as string) || '')
 
-        // Convert schema_json to SchemaTable[] format if it's stored as the table-column format
+        // Convert schema_json to SchemaTable[] format
         if (Array.isArray(db.schema_json)) {
           const schemaTables: SchemaTable[] = db.schema_json.map((t: { name: string; columns: { name: string; type: string }[] }) => ({
             name: t.name,

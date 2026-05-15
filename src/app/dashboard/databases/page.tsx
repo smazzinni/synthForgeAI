@@ -8,6 +8,7 @@ import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Database, Plus, Loader2, ArrowRight, Search, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
+import { apiGet, apiDelete, invalidateCache } from '@/lib/api-client'
 
 interface DatabaseItem {
   id: string
@@ -30,9 +31,13 @@ export default function MyDatabasesPage() {
   const loadDatabases = useCallback(async () => {
     if (hasFetched.current) return
     hasFetched.current = true
+
     try {
-      const res = await fetch('/api/databases')
-      const data = await res.json()
+      // Use deduplicated API client - prevents duplicate requests
+      const data = await apiGet<{ databases: DatabaseItem[] }>('/api/databases', {
+        cacheTtl: 5000,
+        timeout: 10000,
+      })
       setDatabases(data.databases || [])
     } catch {
       setDatabases([])
@@ -49,13 +54,10 @@ export default function MyDatabasesPage() {
     if (!confirm(`Are you sure you want to delete "${name}"? This action cannot be undone.`)) return
     setDeleting(id)
     try {
-      const res = await fetch(`/api/databases?id=${id}`, { method: 'DELETE' })
-      if (res.ok) {
-        setDatabases(prev => prev.filter(db => db.id !== id))
-        toast.success(`Database "${name}" deleted`)
-      } else {
-        toast.error('Failed to delete database')
-      }
+      await apiDelete(`/api/databases?id=${id}`)
+      setDatabases(prev => prev.filter(db => db.id !== id))
+      invalidateCache('/api/databases')
+      toast.success(`Database "${name}" deleted`)
     } catch {
       toast.error('Failed to delete database')
     } finally {

@@ -28,13 +28,12 @@ export default function DashboardLayout({
     ) {
       localRedirectRef.current = true
       hasTriggeredRedirect = true
-      // Use replace to avoid adding to browser history
       window.location.replace('/login')
     }
   }, [authEnabled, loading, user])
 
-  // Show loading while checking auth state
-  if (loading) {
+  // Show loading while checking auth state (but only briefly)
+  if (loading && authEnabled) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
         <div className="flex flex-col items-center gap-3">

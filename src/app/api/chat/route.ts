@@ -1,9 +1,25 @@
 import { NextRequest, NextResponse } from 'next/server'
 
-// ─── Rate limiter for chat API: max 10 requests per minute ───
+// ─── Rate limiter with automatic cleanup ───
 const chatRateLimiter = new Map<string, { count: number; resetAt: number }>()
 const CHAT_RATE_LIMIT = 10
-const CHAT_RATE_WINDOW = 60000 // 1 minute
+const CHAT_RATE_WINDOW = 60000
+
+// Periodic cleanup
+let lastCleanup = Date.now()
+const CLEANUP_INTERVAL = 120000
+
+function cleanup() {
+  const now = Date.now()
+  if (now - lastCleanup < CLEANUP_INTERVAL) return
+  lastCleanup = now
+
+  for (const [key, entry] of chatRateLimiter.entries()) {
+    if (now > entry.resetAt) {
+      chatRateLimiter.delete(key)
+    }
+  }
+}
 
 function getClientId(request: NextRequest): string {
   const forwarded = request.headers.get('x-forwarded-for')
@@ -30,6 +46,8 @@ function checkChatRateLimit(clientId: string): boolean {
 }
 
 export async function POST(request: NextRequest) {
+  cleanup() // Periodic memory cleanup
+
   // Rate limit check
   const clientId = getClientId(request)
   if (!checkChatRateLimit(clientId)) {
@@ -40,7 +58,16 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const body = await request.json()
+    // Limit request body size
+    const text = await request.text()
+    if (text.length > 10000) { // 10KB limit for chat messages
+      return NextResponse.json(
+        { error: 'Message too long. Please keep messages under 10,000 characters.' },
+        { status: 413 }
+      )
+    }
+
+    const body = JSON.parse(text)
     const { message, databaseId, databaseName } = body
 
     if (!message || typeof message !== 'string') {

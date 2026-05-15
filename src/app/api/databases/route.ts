@@ -1,14 +1,38 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
 
-// ─── In-memory request cache to prevent duplicate API calls ───
+// ─── In-memory request cache with automatic cleanup ───
 const apiCache = new Map<string, { data: unknown; timestamp: number }>()
 const CACHE_TTL = 3000 // 3 seconds cache
 
-// ─── Rate limiter: max 30 requests per minute per endpoint ───
+// ─── Rate limiter with automatic cleanup ───
 const rateLimiter = new Map<string, { count: number; resetAt: number }>()
 const RATE_LIMIT = 30
 const RATE_WINDOW = 60000 // 1 minute
+
+// ─── Periodic cleanup of stale entries (prevent memory leaks) ───
+let lastCleanup = Date.now()
+const CLEANUP_INTERVAL = 120000 // 2 minutes
+
+function cleanup() {
+  const now = Date.now()
+  if (now - lastCleanup < CLEANUP_INTERVAL) return
+  lastCleanup = now
+
+  // Clean up expired rate limiter entries
+  for (const [key, entry] of rateLimiter.entries()) {
+    if (now > entry.resetAt) {
+      rateLimiter.delete(key)
+    }
+  }
+
+  // Clean up expired cache entries
+  for (const [key, entry] of apiCache.entries()) {
+    if (now - entry.timestamp > 30000) { // Remove entries older than 30s
+      apiCache.delete(key)
+    }
+  }
+}
 
 function getClientId(request: NextRequest): string {
   const forwarded = request.headers.get('x-forwarded-for')
@@ -34,8 +58,7 @@ function checkRateLimit(clientId: string, endpoint: string): boolean {
   return true
 }
 
-// Lightweight user extraction from cookies using admin client
-// (avoids creating a heavy SSR client on every request)
+// Lightweight user extraction from cookies
 function getUserIdFromCookies(request: NextRequest): string | null {
   try {
     const authCookie = request.cookies.getAll().find(c =>
@@ -52,6 +75,8 @@ function getUserIdFromCookies(request: NextRequest): string | null {
 }
 
 export async function GET(request: NextRequest) {
+  cleanup() // Periodic memory cleanup
+
   const clientId = getClientId(request)
 
   // Rate limit check
@@ -68,7 +93,6 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ databases: [] })
     }
 
-    // Check if a specific database ID was requested
     const { searchParams } = new URL(request.url)
     const id = searchParams.get('id')
 
@@ -82,7 +106,6 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    // Get user ID from cookies (lightweight)
     const userId = getUserIdFromCookies(request)
 
     // If requesting a specific database by ID
@@ -133,9 +156,10 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
+  cleanup() // Periodic memory cleanup
+
   const clientId = getClientId(request)
 
-  // Rate limit check
   if (!checkRateLimit(clientId, 'databases:post')) {
     return NextResponse.json(
       { error: 'Too many requests. Please wait a moment.' },
@@ -144,7 +168,16 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const body = await request.json()
+    // Limit request body size to prevent OOM
+    const text = await request.text()
+    if (text.length > 5 * 1024 * 1024) { // 5MB limit
+      return NextResponse.json(
+        { error: 'Request body too large. Maximum size is 5MB.' },
+        { status: 413 }
+      )
+    }
+
+    const body = JSON.parse(text)
     const { name, db_type = 'postgresql', schema_json = [], data_json = {}, row_count = 0, quality_score = null, status = 'draft' } = body
 
     if (!name) {
@@ -159,7 +192,6 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Database service not configured' }, { status: 503 })
     }
 
-    // Get user ID from cookies (lightweight)
     const userId = getUserIdFromCookies(request)
 
     const insertData: Record<string, unknown> = {
@@ -199,6 +231,8 @@ export async function POST(request: NextRequest) {
 }
 
 export async function PATCH(request: NextRequest) {
+  cleanup()
+
   const clientId = getClientId(request)
 
   if (!checkRateLimit(clientId, 'databases:patch')) {
@@ -209,7 +243,16 @@ export async function PATCH(request: NextRequest) {
   }
 
   try {
-    const body = await request.json()
+    // Limit request body size
+    const text = await request.text()
+    if (text.length > 5 * 1024 * 1024) { // 5MB limit
+      return NextResponse.json(
+        { error: 'Request body too large. Maximum size is 5MB.' },
+        { status: 413 }
+      )
+    }
+
+    const body = JSON.parse(text)
     const { id, data_json, schema_json, row_count, quality_score, status, name } = body
 
     if (!id) {
@@ -256,9 +299,10 @@ export async function PATCH(request: NextRequest) {
 }
 
 export async function DELETE(request: NextRequest) {
+  cleanup()
+
   const clientId = getClientId(request)
 
-  // Rate limit check
   if (!checkRateLimit(clientId, 'databases:delete')) {
     return NextResponse.json(
       { error: 'Too many requests. Please wait a moment.' },
