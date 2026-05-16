@@ -20,9 +20,7 @@ export default function StudioDatabasePage({ params }: { params: Promise<{ id: s
 
   useEffect(() => {
     async function loadDatabase() {
-
       try {
-        // Use deduplicated API client
         const result = await apiGet<{ database: Record<string, unknown> | null }>(
           `/api/databases?id=${id}`,
           { cacheTtl: 5000, timeout: 10000 }
@@ -37,7 +35,6 @@ export default function StudioDatabasePage({ params }: { params: Promise<{ id: s
 
         setDbName((db.name as string) || '')
 
-        // Convert schema_json to SchemaTable[] format
         if (Array.isArray(db.schema_json)) {
           const schemaTables: SchemaTable[] = db.schema_json.map((t: { name: string; columns: { name: string; type: string }[] }) => ({
             name: t.name,
@@ -46,7 +43,6 @@ export default function StudioDatabasePage({ params }: { params: Promise<{ id: s
           setSchema(schemaTables)
         }
 
-        // Convert data_json to Record<string, unknown[]> format
         if (db.data_json && typeof db.data_json === 'object') {
           const dataMap: Record<string, unknown[]> = {}
           for (const [key, val] of Object.entries(db.data_json as Record<string, unknown>)) {
@@ -69,16 +65,24 @@ export default function StudioDatabasePage({ params }: { params: Promise<{ id: s
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-screen">
-        <Loader2 className="h-8 w-8 animate-spin text-amber-600" />
+      <div className="flex items-center justify-center h-screen bg-background">
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="h-8 w-8 animate-spin text-amber-600" />
+          <p className="text-sm text-muted-foreground">Loading database...</p>
+        </div>
       </div>
     )
   }
 
   if (error) {
     return (
-      <div className="flex items-center justify-center h-screen">
-        <p className="text-muted-foreground">{error}</p>
+      <div className="flex items-center justify-center h-screen bg-background">
+        <div className="text-center">
+          <p className="text-muted-foreground mb-2">{error}</p>
+          <a href="/dashboard/studio" className="text-amber-600 hover:underline text-sm">
+            Create a new database instead
+          </a>
+        </div>
       </div>
     )
   }

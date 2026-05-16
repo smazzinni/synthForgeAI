@@ -1,9 +1,10 @@
 'use client'
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useAuth } from '@/hooks/use-auth'
 import { DashboardSidebar } from '@/components/layout/dashboard-sidebar'
-import { Loader2 } from 'lucide-react'
+import { Loader2, PanelLeft, PanelLeftClose } from 'lucide-react'
+import { Button } from '@/components/ui/button'
 
 export default function DashboardLayout({
   children,
@@ -13,17 +14,15 @@ export default function DashboardLayout({
   const { user, loading } = useAuth()
   const authEnabled = process.env.NEXT_PUBLIC_AUTH_ENABLED === 'true'
   const redirectRef = useRef(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
 
   useEffect(() => {
-    // Only redirect once per mount
     if (authEnabled && !loading && !user && !redirectRef.current) {
       redirectRef.current = true
-      // Use replace to avoid adding to history
       window.location.replace('/login')
     }
   }, [authEnabled, loading, user])
 
-  // Show loading while checking auth state
   if (loading && authEnabled) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
@@ -35,7 +34,6 @@ export default function DashboardLayout({
     )
   }
 
-  // If auth is enabled and no user, show loading while redirect happens
   if (authEnabled && !user) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
@@ -47,14 +45,35 @@ export default function DashboardLayout({
     )
   }
 
-  // If auth is disabled (dev mode), show dashboard without auth check
-  // This allows the app to work even if Supabase keys are misconfigured
   return (
-    <div className="flex min-h-screen">
-      <DashboardSidebar />
-      <main className="flex-1 overflow-auto">
-        {children}
-      </main>
+    <div className="flex min-h-screen bg-background">
+      {/* Sidebar with collapse support */}
+      <div className={`transition-all duration-300 ease-in-out ${sidebarCollapsed ? 'w-0 overflow-hidden' : 'w-64'}`}>
+        <DashboardSidebar />
+      </div>
+
+      {/* Main content */}
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* Top bar with sidebar toggle */}
+        <div className="h-11 border-b flex items-center px-3 gap-2 bg-card shrink-0">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+          >
+            {sidebarCollapsed ? (
+              <PanelLeft className="h-4 w-4" />
+            ) : (
+              <PanelLeftClose className="h-4 w-4" />
+            )}
+          </Button>
+          <div className="flex-1" />
+        </div>
+        <main className="flex-1 overflow-auto">
+          {children}
+        </main>
+      </div>
     </div>
   )
 }

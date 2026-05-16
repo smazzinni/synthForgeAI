@@ -9,20 +9,11 @@ const nextConfig: NextConfig = {
   async headers() {
     return [
       {
-        // Add Connection: close to ALL responses to prevent keep-alive resource leaks
-        // This is critical for server stability in containerized environments
-        source: '/(.*)',
-        headers: [
-          { key: 'Connection', value: 'close' },
-        ],
-      },
-      {
         source: '/api/:path*',
         headers: [
           { key: 'Access-Control-Allow-Origin', value: '*' },
           { key: 'Access-Control-Allow-Methods', value: 'GET, POST, PATCH, DELETE, OPTIONS' },
           { key: 'Access-Control-Allow-Headers', value: 'Content-Type, Authorization' },
-          { key: 'Connection', value: 'close' },
         ],
       },
     ]

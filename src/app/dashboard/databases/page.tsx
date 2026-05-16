@@ -29,7 +29,6 @@ export default function MyDatabasesPage() {
 
   const loadDatabases = useCallback(async () => {
     try {
-      // Use deduplicated API client - prevents duplicate requests
       const data = await apiGet<{ databases: DatabaseItem[] }>('/api/databases', {
         cacheTtl: 5000,
         timeout: 10000,
@@ -68,10 +67,10 @@ export default function MyDatabasesPage() {
 
   return (
     <div className="p-4 md:p-8 max-w-7xl mx-auto">
-      <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-8">
+      <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-6">
         <div>
           <h1 className="text-2xl md:text-3xl font-bold">My Databases</h1>
-          <p className="text-muted-foreground mt-1">View and manage all your synthetic databases</p>
+          <p className="text-muted-foreground mt-1 text-sm">View and manage all your synthetic databases</p>
         </div>
         <Button asChild className="mt-4 md:mt-0 bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white">
           <Link href="/dashboard/studio">
@@ -82,7 +81,7 @@ export default function MyDatabasesPage() {
       </div>
 
       {databases.length > 0 && (
-        <div className="relative mb-6">
+        <div className="relative mb-4">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <Input
             placeholder="Search databases..."
@@ -99,10 +98,10 @@ export default function MyDatabasesPage() {
         </div>
       ) : databases.length === 0 ? (
         <Card>
-          <CardContent className="py-12 text-center">
-            <Database className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
-            <h3 className="text-lg font-semibold mb-2">No databases yet</h3>
-            <p className="text-muted-foreground mb-4">Create your first synthetic database using AI Studio</p>
+          <CardContent className="py-10 text-center">
+            <Database className="h-12 w-12 text-muted-foreground/30 mx-auto mb-3" />
+            <h3 className="text-lg font-semibold mb-1">No databases yet</h3>
+            <p className="text-sm text-muted-foreground mb-4">Create your first synthetic database using AI Studio</p>
             <Button asChild className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white">
               <Link href="/dashboard/studio">
                 <Plus className="mr-2 h-4 w-4" />
@@ -113,60 +112,60 @@ export default function MyDatabasesPage() {
         </Card>
       ) : filteredDatabases.length === 0 ? (
         <Card>
-          <CardContent className="py-12 text-center">
-            <Search className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
-            <h3 className="text-lg font-semibold mb-2">No results found</h3>
-            <p className="text-muted-foreground">Try adjusting your search query</p>
+          <CardContent className="py-10 text-center">
+            <Search className="h-12 w-12 text-muted-foreground/30 mx-auto mb-3" />
+            <h3 className="text-lg font-semibold mb-1">No results found</h3>
+            <p className="text-sm text-muted-foreground">Try adjusting your search query</p>
           </CardContent>
         </Card>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
           {filteredDatabases.map((db) => (
             <Card key={db.id} className="hover:shadow-md transition-shadow group">
-              <CardContent className="pt-6">
-                <div className="flex items-start gap-4">
-                  <div className="h-10 w-10 rounded-lg bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center text-white shrink-0">
-                    <Database className="h-5 w-5" />
+              <CardContent className="pt-5">
+                <div className="flex items-start gap-3">
+                  <div className="h-9 w-9 rounded-lg bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center text-white shrink-0">
+                    <Database className="h-4 w-4" />
                   </div>
                   <div className="flex-1 min-w-0">
-                    <p className="font-medium truncate">{db.name}</p>
-                    <p className="text-sm text-muted-foreground">
+                    <p className="font-medium text-sm truncate">{db.name}</p>
+                    <p className="text-xs text-muted-foreground">
                       {db.db_type} &middot; {(db.row_count || 0).toLocaleString()} rows
                     </p>
-                    <div className="flex items-center gap-2 mt-2">
+                    <div className="flex items-center gap-1.5 mt-1.5">
                       <Badge
                         variant={db.status === 'ready' ? 'default' : db.status === 'generating' ? 'secondary' : 'outline'}
                         className={
                           db.status === 'ready'
-                            ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
+                            ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 text-[9px]'
                             : db.status === 'generating'
-                            ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
-                            : ''
+                            ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 text-[9px]'
+                            : 'text-[9px]'
                         }
                       >
                         {db.status}
                       </Badge>
                       {db.quality_score && (
-                        <span className="text-xs text-muted-foreground">
+                        <span className="text-[10px] text-muted-foreground">
                           {Math.round(db.quality_score * 100)}% quality
                         </span>
                       )}
                     </div>
                   </div>
-                  <div className="flex flex-col gap-1">
-                    <Button variant="ghost" size="sm" asChild>
+                  <div className="flex flex-col gap-0.5">
+                    <Button variant="ghost" size="sm" asChild className="h-6 text-[10px]">
                       <Link href={`/dashboard/studio/${db.id}`}>
-                        Open <ArrowRight className="ml-1 h-3 w-3" />
+                        Open <ArrowRight className="ml-0.5 h-2.5 w-2.5" />
                       </Link>
                     </Button>
                     <Button
                       variant="ghost"
                       size="sm"
-                      className="text-destructive hover:text-destructive"
+                      className="h-6 text-[10px] text-destructive hover:text-destructive"
                       onClick={() => handleDelete(db.id, db.name)}
                       disabled={deleting === db.id}
                     >
-                      {deleting === db.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
+                      {deleting === db.id ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : <Trash2 className="h-2.5 w-2.5" />}
                     </Button>
                   </div>
                 </div>

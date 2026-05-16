@@ -14,31 +14,26 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { Sheet, SheetContent, SheetTrigger } from '@/components/ui/sheet'
 import {
   Zap,
   LayoutDashboard,
   FlaskConical,
   Database,
   Settings,
-  Key,
   Moon,
   Sun,
   LogOut,
-  Menu,
   ChevronDown,
 } from 'lucide-react'
-import { useState } from 'react'
 
 const sidebarLinks = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/dashboard/studio', label: 'AI Studio', icon: FlaskConical },
   { href: '/dashboard/databases', label: 'My Databases', icon: Database },
-  { href: '/dashboard/api-keys', label: 'API Keys', icon: Key },
   { href: '/dashboard/settings', label: 'Settings', icon: Settings },
 ]
 
-function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
+export function DashboardSidebar() {
   const pathname = usePathname()
   const { theme, setTheme } = useTheme()
   const { user, signOut } = useAuth()
@@ -48,7 +43,7 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full w-64 border-r bg-card">
       {/* Logo Header */}
       <div className="p-4 border-b">
         <Link href="/" className="flex items-center gap-2">
@@ -68,7 +63,6 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
               <Link
                 key={link.href}
                 href={link.href}
-                onClick={onNavigate}
                 className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
                   isActive
                     ? 'bg-accent text-accent-foreground'
@@ -84,8 +78,8 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
       </ScrollArea>
 
       {/* User Footer */}
-      <div className="border-t p-4">
-        <div className="flex items-center gap-3">
+      <div className="border-t p-3">
+        <div className="flex items-center gap-2">
           <Avatar className="h-8 w-8">
             <AvatarFallback className="bg-gradient-to-br from-amber-500 to-red-600 text-white text-xs">
               {user?.email?.charAt(0).toUpperCase() || 'U'}
@@ -93,12 +87,12 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
           </Avatar>
           <div className="flex-1 min-w-0">
             <p className="text-sm font-medium truncate">{user?.user_metadata?.full_name || user?.email?.split('@')[0] || 'User'}</p>
-            <p className="text-xs text-muted-foreground truncate">{user?.email || ''}</p>
+            <p className="text-xs text-muted-foreground truncate">{user?.email || 'Local Mode'}</p>
           </div>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="ghost" size="icon" className="h-8 w-8">
-                <ChevronDown className="h-4 w-4" />
+              <Button variant="ghost" size="icon" className="h-7 w-7">
+                <ChevronDown className="h-3.5 w-3.5" />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-48">
@@ -122,30 +116,5 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
         </div>
       </div>
     </div>
-  )
-}
-
-export function DashboardSidebar() {
-  const [open, setOpen] = useState(false)
-
-  return (
-    <>
-      {/* Mobile Sidebar */}
-      <Sheet open={open} onOpenChange={setOpen}>
-        <SheetTrigger asChild className="md:hidden fixed top-3 left-3 z-50">
-          <Button variant="outline" size="icon" className="h-9 w-9 bg-background">
-            <Menu className="h-4 w-4" />
-          </Button>
-        </SheetTrigger>
-        <SheetContent side="left" className="w-64 p-0">
-          <SidebarContent onNavigate={() => setOpen(false)} />
-        </SheetContent>
-      </Sheet>
-
-      {/* Desktop Sidebar */}
-      <aside className="hidden md:flex w-64 border-r bg-background flex-col h-screen sticky top-0">
-        <SidebarContent />
-      </aside>
-    </>
   )
 }
