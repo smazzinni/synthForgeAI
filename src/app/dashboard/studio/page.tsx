@@ -8,6 +8,20 @@ import { Badge } from '@/components/ui/badge'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import {
   Send,
   Loader2,
   Bot,
@@ -23,9 +37,35 @@ import {
   Trash2,
   Copy,
   Download,
+  Play,
+  History,
+  Star,
+  StarOff,
+  Plus,
+  FileJson,
+  FileSpreadsheet,
+  FileText,
+  X,
+  ZoomIn,
+  ZoomOut,
+  Move,
+  AlertTriangle,
+  CheckCircle2,
+  Shield,
+  Wand2,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { apiPost, apiPatch, apiDelete, invalidateCache } from '@/lib/api-client'
+import { apiPost, apiPatch, apiDelete, apiGet, invalidateCache } from '@/lib/api-client'
+import {
+  parseAgentStatus,
+  parseInteractiveOptions,
+  cleanDisplayText,
+  isDestructiveSQL,
+  getAgentByName,
+  type AgentStatus,
+  type InteractiveOptions,
+  type OptionChoice,
+} from '@/lib/ai-agents'
 
 // ─── Types ───
 interface Message {
@@ -34,8 +74,11 @@ interface Message {
   content: string
   reasoningContent?: string
   agentName?: string
+  agentStatus?: AgentStatus | null
+  interactiveOptions?: InteractiveOptions | null
   timestamp: Date
   isStreaming?: boolean
+  tables?: Record<string, unknown[]> | null
 }
 
 interface SchemaTable {
@@ -48,6 +91,77 @@ interface StudioPageProps {
   initialName?: string
   initialSchema?: SchemaTable[]
   initialData?: Record<string, unknown[]>
+  initialMessages?: Message[]
+  conversationId?: string
+}
+
+// ─── Export helpers (client-side) ───
+function exportAsCSV(data: Record<string, unknown>[], filename: string) {
+  if (!data.length) return
+  const columns = Object.keys(data[0])
+  const csvRows = [
+    columns.map(c => `"${c}"`).join(','),
+    ...data.map(row =>
+      columns.map(col => {
+        const val = row[col]
+        if (val === null || val === undefined) return ''
+        if (typeof val === 'object') return `"${JSON.stringify(val).replace(/"/g, '""')}"`
+        return `"${String(val).replace(/"/g, '""')}"`
+      }).join(',')
+    ),
+  ]
+  const blob = new Blob([csvRows.join('\n')], { type: 'text/csv' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+function exportAsJSON(data: unknown, filename: string) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+function exportAsSQL(schema: SchemaTable[], data: Record<string, unknown[]>, filename: string) {
+  let sql = `-- SynthForge AI Export\n-- Generated: ${new Date().toISOString()}\n\n`
+  for (const table of schema) {
+    const rows = data[table.name] as Record<string, unknown>[] | undefined
+    sql += `CREATE TABLE ${table.name} (\n`
+    const colDefs = table.columns.map(col => {
+      let def = `  ${col.name} ${col.type.toUpperCase()}`
+      if (col.name === 'id') def += ' PRIMARY KEY'
+      return def
+    })
+    sql += colDefs.join(',\n') + '\n);\n\n'
+    if (rows && rows.length > 0) {
+      const columns = Object.keys(rows[0])
+      for (const row of rows) {
+        const values = columns.map(col => {
+          const val = row[col]
+          if (val === null || val === undefined) return 'NULL'
+          if (typeof val === 'number') return String(val)
+          if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE'
+          return `'${String(val).replace(/'/g, "''")}'`
+        })
+        sql += `INSERT INTO ${table.name} (${columns.join(', ')}) VALUES (${values.join(', ')});\n`
+      }
+      sql += '\n'
+    }
+  }
+  const blob = new Blob([sql], { type: 'application/sql' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
 }
 
 // ─── Parse AI response to extract text and JSON data ───
@@ -92,9 +206,10 @@ function parseAIResponse(content: string): {
     }
   }
 
-  // Clean up any remaining think/thinking tags
+  // Clean up tags and agent status / options blocks
   displayText = displayText.replace(/<think[\s\S]*?<\/think>/gi, '')
   displayText = displayText.replace(/<thinking[\s\S]*?<\/thinking>/gi, '')
+  displayText = cleanDisplayText(displayText)
   displayText = displayText.trim()
 
   return { displayText, tables, databaseName }
@@ -121,11 +236,62 @@ function extractSchema(tables: Record<string, unknown[]>): SchemaTable[] {
   return schema
 }
 
+// ─── Agent icon helper ───
+function AgentIcon({ agentName, size = 'sm' }: { agentName?: string; size?: 'sm' | 'md' }) {
+  const agent = getAgentByName(agentName || '')
+  const sizeClass = size === 'sm' ? 'h-5 w-5' : 'h-6 w-6'
+  const iconSize = size === 'sm' ? 'h-2.5 w-2.5' : 'h-3 w-3'
+
+  if (agent?.id === 'schema_architect') {
+    return (
+      <div className={`${sizeClass} rounded-full bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center shrink-0`}>
+        <GitBranch className={`${iconSize} text-white`} />
+      </div>
+    )
+  }
+  if (agent?.id === 'data_generator') {
+    return (
+      <div className={`${sizeClass} rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shrink-0`}>
+        <Database className={`${iconSize} text-white`} />
+      </div>
+    )
+  }
+  if (agent?.id === 'quality_analyst') {
+    return (
+      <div className={`${sizeClass} rounded-full bg-gradient-to-br from-sky-500 to-blue-600 flex items-center justify-center shrink-0`}>
+        <CheckCircle2 className={`${iconSize} text-white`} />
+      </div>
+    )
+  }
+  if (agent?.id === 'privacy_officer') {
+    return (
+      <div className={`${sizeClass} rounded-full bg-gradient-to-br from-rose-500 to-pink-600 flex items-center justify-center shrink-0`}>
+        <Shield className={`${iconSize} text-white`} />
+      </div>
+    )
+  }
+  // Default: Orchestrator
+  return (
+    <div className={`${sizeClass} rounded-full bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center shrink-0`}>
+      <Sparkles className={`${iconSize} text-white`} />
+    </div>
+  )
+}
+
 // ─── Main Studio Page Component ───
-function StudioPageInner({ databaseId, initialName, initialSchema, initialData }: StudioPageProps) {
+function StudioPageInner({
+  databaseId,
+  initialName,
+  initialSchema,
+  initialData,
+  initialMessages,
+  conversationId: initialConversationId,
+}: StudioPageProps) {
   const router = useRouter()
   const searchParams = useSearchParams()
-  const [messages, setMessages] = useState<Message[]>([
+
+  // ─── State ───
+  const [messages, setMessages] = useState<Message[]>(initialMessages && initialMessages.length > 0 ? initialMessages : [
     {
       id: '1',
       role: 'assistant',
@@ -148,37 +314,52 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
   const [selectedTable, setSelectedTable] = useState<string>('')
   const [visibleRows, setVisibleRows] = useState(20)
   const [initialQuerySent, setInitialQuerySent] = useState(false)
+  const [conversationId, setConversationId] = useState(initialConversationId || '')
+
+  // SQL workspace state
+  const [sqlEditor, setSqlEditor] = useState('')
+  const [sqlResults, setSqlResults] = useState<{ rows: Record<string, unknown>[]; columns: string[]; executionTime: number } | null>(null)
+  const [sqlExecuting, setSqlExecuting] = useState(false)
+  const [queryHistory, setQueryHistory] = useState<string[]>([])
+  const [savedQueries, setSavedQueries] = useState<Array<{ name: string; sql: string }>>([])
+  const [sqlConfirmOpen, setSqlConfirmOpen] = useState(false)
+  const [sqlConfirmQuery, setSqlConfirmQuery] = useState('')
+
+  // Explorer state
+  const [favoriteTables, setFavoriteTables] = useState<Set<string>>(new Set())
+  const [explorerZoom, setExplorerZoom] = useState(1)
+  const [explorerPan, setExplorerPan] = useState({ x: 0, y: 0 })
+  const [isPanning, setIsPanning] = useState(false)
+  const [panStart, setPanStart] = useState({ x: 0, y: 0 })
+
+  // Chat panel resize
+  const [chatWidth, setChatWidth] = useState(340)
+  const [isResizing, setIsResizing] = useState(false)
 
   const chatEndRef = useRef<HTMLDivElement>(null)
   const chatContainerRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
   const messagesRef = useRef<Message[]>(messages)
   const loadingRef = useRef(false)
+  const resizeRef = useRef<HTMLDivElement>(null)
 
-  // Keep messagesRef in sync with messages state
+  // Keep messagesRef in sync
   useEffect(() => {
     messagesRef.current = messages
   }, [messages])
 
   const hasGeneratedData = generatedSchema.length > 0 || Object.keys(generatedData).length > 0
 
-  // Handle initial query from dashboard navigation
+  // Handle initial query from dashboard
   useEffect(() => {
     const q = searchParams.get('q')
     if (q && !initialQuerySent) {
       setInitialQuerySent(true)
       setInput(q)
-      // Small delay to let the component mount
-      setTimeout(() => {
-        const inputEl = document.querySelector<HTMLInputElement>('input[placeholder="Describe the data you need..."]')
-        if (inputEl) {
-          // Trigger send via programmatic input
-        }
-      }, 100)
     }
   }, [searchParams, initialQuerySent])
 
-  // Auto-select first table when data changes
+  // Auto-select first table
   useEffect(() => {
     const tableNames = Object.keys(generatedData)
     if (tableNames.length > 0 && !selectedTable) {
@@ -190,6 +371,52 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, currentReasoning])
+
+  // ─── Resize handler ───
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isResizing) return
+      const newWidth = Math.max(280, Math.min(600, e.clientX))
+      setChatWidth(newWidth)
+    }
+    const handleMouseUp = () => setIsResizing(false)
+
+    if (isResizing) {
+      document.addEventListener('mousemove', handleMouseMove)
+      document.addEventListener('mouseup', handleMouseUp)
+    }
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove)
+      document.removeEventListener('mouseup', handleMouseUp)
+    }
+  }, [isResizing])
+
+  // ─── Save conversation to backend ───
+  const saveConversation = useCallback(async (userMsg: string, assistantMsg: string, agentName?: string) => {
+    try {
+      const msgs = [
+        { role: 'user', content: userMsg },
+        { role: 'assistant', content: assistantMsg, agentName },
+      ]
+      if (conversationId) {
+        await apiPost('/api/conversations', {
+          id: conversationId,
+          messages: msgs,
+        })
+      } else {
+        const result = await apiPost<{ conversationId: string }>('/api/conversations', {
+          databaseId,
+          title: databaseName || 'New Conversation',
+          messages: msgs,
+        })
+        if (result.conversationId) {
+          setConversationId(result.conversationId)
+        }
+      }
+    } catch (err) {
+      console.warn('[Studio] Failed to save conversation:', err)
+    }
+  }, [conversationId, databaseId, databaseName])
 
   // ─── Send message with DeepSeek streaming ───
   const sendMessage = useCallback(async (messageText?: string) => {
@@ -229,7 +456,6 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
     abortRef.current = controller
 
     try {
-      // Build history from previous messages using ref to avoid stale closure
       const history = messagesRef.current
         .filter(m => m.role === 'user' || m.role === 'assistant')
         .map(m => ({ role: m.role, content: m.content }))
@@ -240,6 +466,9 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
         body: JSON.stringify({
           message: userMessage.content,
           ...(databaseId ? { databaseId, databaseName } : {}),
+          ...(conversationId ? { conversationId } : {}),
+          currentSchema: generatedSchema,
+          currentData: hasGeneratedData ? generatedData : undefined,
           history,
         }),
         signal: controller.signal,
@@ -256,6 +485,9 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
       let buffer = ''
       let fullContent = ''
       let fullReasoning = ''
+      let lastAgentName = 'Orchestrator'
+      let lastAgentStatus: AgentStatus | null = null
+      let lastInteractiveOptions: InteractiveOptions | null = null
 
       while (true) {
         const { done, value } = await reader.read()
@@ -283,9 +515,29 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
               ))
             } else if (parsed.type === 'content') {
               fullContent += parsed.content
+
+              // Parse for agent status updates
+              const agentStatus = parseAgentStatus(fullContent)
+              if (agentStatus) {
+                lastAgentStatus = agentStatus
+                lastAgentName = agentStatus.agent
+              }
+
+              // Parse for interactive options
+              const options = parseInteractiveOptions(fullContent)
+              if (options) {
+                lastInteractiveOptions = options
+              }
+
               setMessages(prev => prev.map(m =>
                 m.id === assistantId
-                  ? { ...m, content: fullContent }
+                  ? {
+                    ...m,
+                    content: fullContent,
+                    agentName: lastAgentName,
+                    agentStatus: lastAgentStatus,
+                    interactiveOptions: lastInteractiveOptions,
+                  }
                   : m
               ))
             } else if (parsed.type === 'done' || parsed.type === 'finish') {
@@ -319,12 +571,10 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
           setGeneratedSchema(schema)
           setGeneratedData(tables)
           if (parsedName) setDatabaseName(parsedName)
-
-          // Auto-save the data immediately
           autoSaveData(tables, schema, parsedName)
         }
 
-        // Update the message with cleaned display text (no JSON)
+        // Update the message with cleaned display text
         if (displayText && displayText !== fullContent) {
           setMessages(prev => prev.map(m =>
             m.id === assistantId
@@ -332,6 +582,9 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
               : m
           ))
         }
+
+        // Save conversation
+        saveConversation(userMessage.content, displayText || fullContent, lastAgentName)
       }
 
       setLoading(false)
@@ -355,7 +608,7 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
       loadingRef.current = false
       setReasoningVisible(false)
     }
-  }, [input, databaseId, databaseName])
+  }, [input, databaseId, databaseName, conversationId, generatedSchema, generatedData, hasGeneratedData, saveConversation])
 
   // Auto-send query from dashboard
   useEffect(() => {
@@ -450,6 +703,22 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
     }
   }
 
+  // ─── New chat ───
+  const startNewChat = () => {
+    setMessages([
+      {
+        id: Date.now().toString(),
+        role: 'assistant',
+        content: hasGeneratedData
+          ? `You're still working on **"${databaseName}"**. What would you like to do next?`
+          : 'Welcome to **SynthForge AI Studio**! Describe the database you need.',
+        agentName: 'Orchestrator',
+        timestamp: new Date(),
+      },
+    ])
+    setConversationId('')
+  }
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
@@ -462,18 +731,62 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
     toast.success('Copied to clipboard')
   }
 
-  const downloadJSON = (data: unknown, filename: string) => {
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = filename
-    a.click()
-    URL.revokeObjectURL(url)
+  // ─── SQL Execution ───
+  const executeSQL = async (sql: string, skipConfirm = false) => {
+    if (!sql.trim()) return
+
+    if (!skipConfirm && isDestructiveSQL(sql)) {
+      setSqlConfirmQuery(sql)
+      setSqlConfirmOpen(true)
+      return
+    }
+
+    setSqlExecuting(true)
+    setSqlResults(null)
+
+    // Add to history
+    setQueryHistory(prev => [sql, ...prev.filter(q => q !== sql)].slice(0, 10))
+
+    try {
+      const result = await apiPost<{
+        rows?: Record<string, unknown>[]
+        columns?: string[]
+        error?: string
+        executionTime?: number
+        rowCount?: number
+      }>('/api/sql/execute', {
+        sql,
+        databaseId,
+      })
+
+      if (result.error) {
+        toast.error(result.error)
+        setSqlResults({ rows: [{ error: result.error }], columns: ['error'], executionTime: result.executionTime || 0 })
+      } else if (result.rows) {
+        setSqlResults({
+          rows: result.rows,
+          columns: result.columns || [],
+          executionTime: result.executionTime || 0,
+        })
+        toast.success(`Query returned ${result.rowCount || result.rows.length} rows`)
+      }
+    } catch (err) {
+      toast.error('Failed to execute SQL')
+      setSqlResults({ rows: [{ error: 'Execution failed' }], columns: ['error'], executionTime: 0 })
+    } finally {
+      setSqlExecuting(false)
+    }
+  }
+
+  // ─── AI-assisted SQL generation ───
+  const generateAIQL = () => {
+    const prompt = `Generate a SQL query for the current database schema. Tables: ${generatedSchema.map(t => `${t.name}(${t.columns.map(c => `${c.name}:${c.type}`).join(', ')})`).join(', ')}. What kind of query?`
+    setInput(prompt)
+    setActiveTab('data') // Switch to chat
   }
 
   // ─── Generate SQL from schema ───
-  const generateSQL = (): string => {
+  const generateSchemaSQL = (): string => {
     if (!generatedSchema.length) return '-- No schema generated yet'
     let sql = `-- SynthForge AI Generated Schema\n-- Database: ${databaseName || 'untitled'}\n\n`
 
@@ -490,7 +803,12 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
     return sql
   }
 
-  // ─── Render formatted message content (no raw JSON) ───
+  // ─── Handle option button click ───
+  const handleOptionClick = (choice: OptionChoice) => {
+    sendMessage(choice.value)
+  }
+
+  // ─── Render formatted message content ───
   const renderMessageContent = (message: Message) => {
     if (message.role === 'user') {
       return <span className="whitespace-pre-wrap">{message.content}</span>
@@ -499,7 +817,12 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
     const content = message.content
     if (!content) {
       if (message.isStreaming) {
-        return <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+        return (
+          <div className="flex items-center gap-2">
+            <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+            <span className="text-xs text-muted-foreground">Thinking...</span>
+          </div>
+        )
       }
       return null
     }
@@ -530,10 +853,65 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
   const displayedRows = currentTableData.slice(0, visibleRows)
   const hasMoreRows = currentTableData.length > visibleRows
 
+  // ─── ER Diagram Layout ───
+  const computeERLayout = () => {
+    const tableNames = Object.keys(generatedData)
+    if (tableNames.length === 0) return { nodes: [], edges: [] }
+
+    const nodes: Array<{ name: string; x: number; y: number; schema: SchemaTable; rows: number }> = []
+    const edges: Array<{ from: string; to: string; fromCol: string; toCol: string; type: string }> = []
+
+    // Hierarchical layout
+    const colWidth = 220
+    const rowHeight = 200
+    const cols = Math.ceil(Math.sqrt(tableNames.length))
+
+    tableNames.forEach((name, i) => {
+      const col = i % cols
+      const row = Math.floor(i / cols)
+      const schema = generatedSchema.find(t => t.name === name)
+      const rows = (generatedData[name] as unknown[])?.length || 0
+
+      nodes.push({
+        name,
+        x: 60 + col * (colWidth + 80),
+        y: 60 + row * (rowHeight + 40),
+        schema: schema || { name, columns: [] },
+        rows,
+      })
+
+      // Find FK relationships
+      if (schema) {
+        for (const col of schema.columns) {
+          if (col.name.endsWith('_id') && col.name !== 'id') {
+            const targetTable = col.name.replace('_id', '')
+            if (tableNames.includes(targetTable)) {
+              edges.push({
+                from: name,
+                to: targetTable,
+                fromCol: col.name,
+                toCol: 'id',
+                type: '1:N',
+              })
+            }
+          }
+        }
+      }
+    })
+
+    return { nodes, edges }
+  }
+
+  const erLayout = hasGeneratedData ? computeERLayout() : { nodes: [], edges: [] }
+
+  // SVG dimensions based on layout
+  const svgWidth = Math.max(600, erLayout.nodes.length > 0 ? Math.max(...erLayout.nodes.map(n => n.x)) + 280 : 600)
+  const svgHeight = Math.max(400, erLayout.nodes.length > 0 ? Math.max(...erLayout.nodes.map(n => n.y)) + 250 : 400)
+
   return (
     <div className="flex h-[calc(100vh-44px)] bg-background">
-      {/* ─── Left Panel: AI Chat (1/4 width) ─── */}
-      <div className="flex flex-col w-1/4 min-w-[280px] max-w-[400px] border-r bg-background">
+      {/* ─── Left Panel: AI Chat (resizable) ─── */}
+      <div className="flex flex-col border-r bg-background shrink-0" style={{ width: chatWidth }}>
         {/* Chat Header */}
         <div className="px-3 py-2.5 border-b flex items-center justify-between bg-card shrink-0">
           <div className="flex items-center gap-2">
@@ -546,6 +924,15 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
             </div>
           </div>
           <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-5 w-5 p-0"
+              onClick={startNewChat}
+              title="New Chat"
+            >
+              <Plus className="h-3 w-3" />
+            </Button>
             {loading && (
               <Badge variant="secondary" className="text-[9px] gap-0.5 animate-pulse h-5">
                 <Brain className="h-2.5 w-2.5" />
@@ -560,6 +947,35 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
             )}
           </div>
         </div>
+
+        {/* Agent status bar */}
+        {loading && messages.length > 0 && (() => {
+          const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant')
+          if (lastAssistant?.agentStatus) {
+            const agent = getAgentByName(lastAssistant.agentStatus.agent)
+            return (
+              <div className={`px-3 py-1.5 border-b shrink-0 ${agent?.bgColor || 'bg-amber-50 dark:bg-amber-950/20'}`}>
+                <div className="flex items-center gap-1.5">
+                  <AgentIcon agentName={lastAssistant.agentStatus.agent} size="sm" />
+                  <span className={`text-[10px] font-medium ${agent?.textColor || 'text-amber-700 dark:text-amber-400'}`}>
+                    {lastAssistant.agentStatus.agent}
+                  </span>
+                  <span className="text-[9px] text-muted-foreground">· {lastAssistant.agentStatus.status}</span>
+                  <div className="ml-auto flex items-center gap-1">
+                    <div className="w-16 h-1 bg-muted rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-amber-500 rounded-full transition-all duration-300"
+                        style={{ width: `${lastAssistant.agentStatus.progress}%` }}
+                      />
+                    </div>
+                    <span className="text-[8px] text-muted-foreground">{lastAssistant.agentStatus.progress}%</span>
+                  </div>
+                </div>
+              </div>
+            )
+          }
+          return null
+        })()}
 
         {/* Reasoning indicator */}
         {reasoningVisible && currentReasoning && (
@@ -580,7 +996,7 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
           </div>
         )}
 
-        {/* Chat Messages - Scrollable */}
+        {/* Chat Messages */}
         <div ref={chatContainerRef} className="flex-1 overflow-y-auto px-2.5 py-3 space-y-2.5 scroll-smooth">
           {messages.map((message) => (
             <div
@@ -588,9 +1004,7 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
               className={`flex gap-1.5 ${message.role === 'user' ? 'justify-end' : ''}`}
             >
               {message.role === 'assistant' && (
-                <div className="h-5 w-5 rounded-full bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center shrink-0 mt-0.5">
-                  <Bot className="h-2.5 w-2.5 text-white" />
-                </div>
+                <AgentIcon agentName={message.agentName} size="sm" />
               )}
               <div
                 className={`max-w-[88%] rounded-lg px-2.5 py-2 ${
@@ -600,12 +1014,42 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
                 }`}
               >
                 {message.role === 'assistant' && (
-                  <p className="text-[9px] font-medium text-amber-600 dark:text-amber-400 mb-0.5">
-                    {message.agentName}
-                    {message.isStreaming && ' · typing...'}
+                  <p className="text-[9px] font-medium text-amber-600 dark:text-amber-400 mb-0.5 flex items-center gap-1">
+                    {message.agentName || 'Orchestrator'}
+                    {message.isStreaming && (
+                      <span className="flex items-center gap-0.5">
+                        <span className="inline-block h-1 w-1 rounded-full bg-amber-500 animate-pulse" />
+                        <span className="inline-block h-1 w-1 rounded-full bg-amber-500 animate-pulse [animation-delay:0.2s]" />
+                        <span className="inline-block h-1 w-1 rounded-full bg-amber-500 animate-pulse [animation-delay:0.4s]" />
+                      </span>
+                    )}
                   </p>
                 )}
                 {renderMessageContent(message)}
+
+                {/* Interactive options buttons */}
+                {message.role === 'assistant' && !message.isStreaming && message.interactiveOptions && (
+                  <div className="mt-2 space-y-1.5">
+                    <p className="text-[10px] font-medium text-muted-foreground">
+                      {message.interactiveOptions.question}
+                    </p>
+                    <div className="flex flex-wrap gap-1">
+                      {message.interactiveOptions.choices.map((choice) => (
+                        <button
+                          key={choice.value}
+                          onClick={() => handleOptionClick(choice)}
+                          className={`text-[10px] px-2.5 py-1 rounded-full border transition-colors ${
+                            message.interactiveOptions!.multi
+                              ? 'border-violet-300 bg-violet-50 dark:bg-violet-950/30 text-violet-700 dark:text-violet-400 hover:bg-violet-100 dark:hover:bg-violet-950/50'
+                              : 'border-amber-300 bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-950/50'
+                          }`}
+                        >
+                          {choice.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
               {message.role === 'user' && (
                 <div className="h-5 w-5 rounded-full bg-primary flex items-center justify-center shrink-0 mt-0.5">
@@ -616,9 +1060,7 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
           ))}
           {loading && messages.length > 0 && !messages[messages.length - 1]?.isStreaming && (
             <div className="flex gap-1.5">
-              <div className="h-5 w-5 rounded-full bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center shrink-0">
-                <Bot className="h-2.5 w-2.5 text-white" />
-              </div>
+              <AgentIcon agentName="Orchestrator" size="sm" />
               <div className="bg-muted/70 rounded-lg px-2.5 py-2">
                 <div className="flex items-center gap-1">
                   <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
@@ -653,7 +1095,14 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
         </div>
       </div>
 
-      {/* ─── Right Panel: Data/SQL/Explorer (3/4 width) ─── */}
+      {/* ─── Resize Handle ─── */}
+      <div
+        ref={resizeRef}
+        className="w-1.5 cursor-col-resize bg-border hover:bg-amber-400 transition-colors shrink-0 active:bg-amber-500"
+        onMouseDown={() => setIsResizing(true)}
+      />
+
+      {/* ─── Right Panel: Data/SQL/Explorer ─── */}
       <div className="flex-1 flex flex-col min-w-0">
         {/* Panel Header */}
         <div className="px-3 py-2 border-b flex items-center justify-between bg-card shrink-0">
@@ -675,6 +1124,43 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
           <div className="flex items-center gap-1.5">
             {hasGeneratedData && (
               <>
+                {/* Export Dropdown */}
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="outline" size="sm" className="h-6 text-[10px] gap-1">
+                      <Download className="h-2.5 w-2.5" />
+                      Export
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuItem onClick={() => exportAsSQL(generatedSchema, generatedData, `${databaseName || 'database'}.sql`)}>
+                      <FileText className="mr-2 h-3 w-3" />
+                      SQL Dump (.sql)
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => {
+                      if (selectedTable && currentTableData.length > 0) {
+                        exportAsCSV(currentTableData as Record<string, unknown>[], `${databaseName}_${selectedTable}.csv`)
+                      } else {
+                        // Export all tables as one CSV
+                        const allRows: Record<string, unknown>[] = []
+                        for (const [tableName, rows] of Object.entries(generatedData)) {
+                          for (const row of (rows as Record<string, unknown>[])) {
+                            allRows.push({ _table: tableName, ...row })
+                          }
+                        }
+                        if (allRows.length > 0) exportAsCSV(allRows, `${databaseName || 'database'}.csv`)
+                      }
+                    }}>
+                      <FileSpreadsheet className="mr-2 h-3 w-3" />
+                      CSV (.csv)
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => exportAsJSON(generatedData, `${databaseName || 'database'}.json`)}>
+                      <FileJson className="mr-2 h-3 w-3" />
+                      JSON (.json)
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+
                 <Button
                   variant="outline"
                   size="sm"
@@ -728,12 +1214,12 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
                   <div className="px-2 py-1.5 border-b">
                     <p className="text-[9px] font-semibold text-muted-foreground uppercase tracking-wider">Tables</p>
                   </div>
-                  <div className="flex-1 overflow-y-auto p-1 space-y-0.5">
+                  <div className="flex-1 overflow-y-auto p-1 space-y-0.5 max-h-96">
                     {Object.entries(generatedData).map(([tableName, rows]) => (
                       <button
                         key={tableName}
                         onClick={() => { setSelectedTable(tableName); setVisibleRows(20) }}
-                        className={`w-full text-left px-2 py-1 rounded text-[11px] font-medium transition-colors flex items-center gap-1.5 ${
+                        className={`w-full text-left px-2 py-1 rounded text-[11px] font-medium transition-colors flex items-center gap-1.5 group ${
                           selectedTable === tableName
                             ? 'bg-accent text-accent-foreground'
                             : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
@@ -749,7 +1235,7 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
                   </div>
                 </div>
 
-                {/* Data grid with horizontal + vertical scroll + lazy load */}
+                {/* Data grid */}
                 <div className="flex-1 flex flex-col min-w-0">
                   {selectedTable && currentTableData.length > 0 ? (
                     <>
@@ -765,7 +1251,7 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
                           <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => copyToClipboard(JSON.stringify(currentTableData, null, 2))}>
                             <Copy className="h-2.5 w-2.5" />
                           </Button>
-                          <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => downloadJSON(currentTableData, `${selectedTable}.json`)}>
+                          <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => exportAsJSON(currentTableData, `${selectedTable}.json`)}>
                             <Download className="h-2.5 w-2.5" />
                           </Button>
                         </div>
@@ -817,7 +1303,6 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
                           </tbody>
                         </table>
                       </div>
-                      {/* Lazy load more rows */}
                       {hasMoreRows && (
                         <div className="px-2.5 py-1.5 border-t bg-muted/30 text-center shrink-0">
                           <Button
@@ -844,27 +1329,77 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
             {/* ─── SQL Tab ─── */}
             <TabsContent value="sql" className="flex-1 overflow-hidden m-0">
               <div className="flex flex-col h-full">
-                <div className="flex-1 overflow-auto p-3">
-                  <pre className="text-[11px] font-mono bg-muted/50 rounded-lg p-3 whitespace-pre-wrap leading-relaxed border">
-                    {generateSQL()}
-                  </pre>
+                {/* SQL Editor */}
+                <div className="flex-1 flex flex-col min-h-0">
+                  <div className="px-3 py-1.5 border-b flex items-center justify-between shrink-0 bg-muted/30">
+                    <span className="text-[10px] font-medium text-muted-foreground">SQL Editor</span>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-5 text-[9px] gap-0.5 px-1.5"
+                        onClick={generateAIQL}
+                        title="Ask AI to generate SQL"
+                      >
+                        <Wand2 className="h-2.5 w-2.5" />
+                        AI Generate
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-5 text-[9px] gap-0.5 px-1.5"
+                        onClick={() => setSqlEditor(generateSchemaSQL())}
+                      >
+                        <Code2 className="h-2.5 w-2.5" />
+                        Schema
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="flex-1 relative">
+                    <textarea
+                      value={sqlEditor}
+                      onChange={(e) => setSqlEditor(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                          e.preventDefault()
+                          executeSQL(sqlEditor)
+                        }
+                      }}
+                      placeholder="-- Write SQL here... (Ctrl+Enter to execute)&#10;SELECT * FROM users LIMIT 10;"
+                      className="w-full h-full p-3 text-[12px] font-mono bg-background resize-none focus:outline-none leading-relaxed"
+                      spellCheck={false}
+                    />
+                  </div>
                 </div>
+
+                {/* SQL toolbar */}
                 <div className="px-3 py-1.5 border-t flex items-center gap-1.5 bg-muted/30 shrink-0">
                   <Button
-                    variant="outline"
+                    variant="default"
                     size="sm"
-                    className="text-[10px] gap-1 h-6"
-                    onClick={() => copyToClipboard(generateSQL())}
+                    className="h-6 text-[10px] gap-1 bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white"
+                    onClick={() => executeSQL(sqlEditor)}
+                    disabled={sqlExecuting || !sqlEditor.trim()}
                   >
-                    <Copy className="h-2.5 w-2.5" />
-                    Copy SQL
+                    {sqlExecuting ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : <Play className="h-2.5 w-2.5" />}
+                    Run
                   </Button>
                   <Button
                     variant="outline"
                     size="sm"
-                    className="text-[10px] gap-1 h-6"
+                    className="h-6 text-[10px] gap-1"
+                    onClick={() => copyToClipboard(sqlEditor || generateSchemaSQL())}
+                  >
+                    <Copy className="h-2.5 w-2.5" />
+                    Copy
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 text-[10px] gap-1"
                     onClick={() => {
-                      const blob = new Blob([generateSQL()], { type: 'text/sql' })
+                      const content = sqlEditor || generateSchemaSQL()
+                      const blob = new Blob([content], { type: 'text/sql' })
                       const url = URL.createObjectURL(blob)
                       const a = document.createElement('a')
                       a.href = url
@@ -876,7 +1411,126 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
                     <Download className="h-2.5 w-2.5" />
                     Download
                   </Button>
+
+                  <div className="flex-1" />
+
+                  {/* Query history dropdown */}
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="ghost" size="sm" className="h-6 text-[10px] gap-0.5">
+                        <History className="h-2.5 w-2.5" />
+                        History ({queryHistory.length})
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-80">
+                      {queryHistory.length === 0 ? (
+                        <DropdownMenuItem disabled>No queries yet</DropdownMenuItem>
+                      ) : (
+                        queryHistory.map((q, i) => (
+                          <DropdownMenuItem key={i} onClick={() => setSqlEditor(q)}>
+                            <code className="text-[10px] truncate max-w-[280px]">{q}</code>
+                          </DropdownMenuItem>
+                        ))
+                      )}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+
+                  {/* Saved queries */}
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-6 text-[10px] gap-0.5"
+                        onClick={() => {
+                          if (sqlEditor.trim()) {
+                            const name = prompt('Name this query:')
+                            if (name) {
+                              setSavedQueries(prev => [...prev, { name, sql: sqlEditor }])
+                              toast.success('Query saved!')
+                            }
+                          }
+                        }}
+                      >
+                        <Save className="h-2.5 w-2.5" />
+                        Save
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-80">
+                      {savedQueries.length === 0 ? (
+                        <DropdownMenuItem disabled>No saved queries</DropdownMenuItem>
+                      ) : (
+                        savedQueries.map((sq, i) => (
+                          <DropdownMenuItem key={i} onClick={() => setSqlEditor(sq.sql)}>
+                            <span className="text-[10px] font-medium mr-2">{sq.name}</span>
+                            <code className="text-[9px] text-muted-foreground truncate max-w-[200px]">{sq.sql}</code>
+                          </DropdownMenuItem>
+                        ))
+                      )}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                 </div>
+
+                {/* SQL Results */}
+                {sqlResults && (
+                  <div className="border-t max-h-64 overflow-auto shrink-0">
+                    <div className="px-3 py-1 border-b bg-muted/30 flex items-center justify-between sticky top-0 z-10">
+                      <span className="text-[10px] font-medium text-muted-foreground">
+                        Results ({sqlResults.rows.length} rows · {sqlResults.executionTime}ms)
+                      </span>
+                      <div className="flex items-center gap-1">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-5 text-[9px] gap-0.5 px-1"
+                          onClick={() => exportAsCSV(sqlResults.rows, 'query_results.csv')}
+                        >
+                          <Download className="h-2.5 w-2.5" />
+                          CSV
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-5 text-[9px] gap-0.5 px-1"
+                          onClick={() => exportAsJSON(sqlResults.rows, 'query_results.json')}
+                        >
+                          <Download className="h-2.5 w-2.5" />
+                          JSON
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-5 w-5 p-0"
+                          onClick={() => setSqlResults(null)}
+                        >
+                          <X className="h-2.5 w-2.5" />
+                        </Button>
+                      </div>
+                    </div>
+                    <table className="w-full text-[11px] border-collapse">
+                      <thead className="sticky top-[33px] z-10 bg-background">
+                        <tr className="border-b">
+                          {sqlResults.columns.map((col) => (
+                            <th key={col} className="text-left py-1 px-2 font-medium text-muted-foreground bg-muted/50 whitespace-nowrap">
+                              {col}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {sqlResults.rows.slice(0, 100).map((row, i) => (
+                          <tr key={i} className="border-b hover:bg-muted/30">
+                            {sqlResults.columns.map((col) => (
+                              <td key={col} className="py-1 px-2 font-mono text-[10px] whitespace-nowrap max-w-[200px] truncate">
+                                {row[col] === null ? <span className="italic text-muted-foreground">NULL</span> : String(row[col] ?? '')}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             </TabsContent>
 
@@ -884,7 +1538,7 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
             <TabsContent value="explorer" className="flex-1 overflow-hidden m-0">
               <div className="flex h-full">
                 {/* Schema tree sidebar */}
-                <div className="w-48 border-r bg-muted/30 flex flex-col shrink-0">
+                <div className="w-56 border-r bg-muted/30 flex flex-col shrink-0">
                   <div className="px-2 py-1.5 border-b">
                     <p className="text-[9px] font-semibold text-muted-foreground uppercase tracking-wider">Schema Tree</p>
                   </div>
@@ -892,6 +1546,7 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
                     <div className="space-y-1.5">
                       {generatedSchema.map((table) => {
                         const tableData = generatedData[table.name] as Record<string, unknown>[] | undefined
+                        const isFav = favoriteTables.has(table.name)
                         return (
                           <div key={table.name} className="rounded border bg-card overflow-hidden">
                             <div className="px-2 py-1 bg-muted/50 flex items-center gap-1.5 border-b">
@@ -900,13 +1555,33 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
                               <Badge variant="outline" className="text-[7px] ml-auto px-0.5 py-0">
                                 {tableData?.length || 0} rows
                               </Badge>
+                              <button
+                                onClick={() => {
+                                  setFavoriteTables(prev => {
+                                    const next = new Set(prev)
+                                    if (next.has(table.name)) next.delete(table.name)
+                                    else next.add(table.name)
+                                    return next
+                                  })
+                                }}
+                                className="ml-0.5"
+                              >
+                                {isFav ? (
+                                  <Star className="h-2.5 w-2.5 text-amber-500 fill-amber-500" />
+                                ) : (
+                                  <StarOff className="h-2.5 w-2.5 text-muted-foreground/50" />
+                                )}
+                              </button>
                             </div>
                             <div className="p-1 space-y-px">
                               {table.columns.map((col) => (
-                                <div key={col.name} className="flex items-center justify-between px-1 py-px rounded text-[9px]">
+                                <div key={col.name} className="flex items-center justify-between px-1 py-px rounded text-[9px] hover:bg-muted/50">
                                   <div className="flex items-center gap-0.5">
-                                    {(col.name === 'id' || col.name.endsWith('_id')) && (
-                                      <div className="h-1 w-1 rounded-full bg-amber-500" title="Key" />
+                                    {col.name === 'id' && (
+                                      <Badge variant="secondary" className="text-[6px] px-0.5 py-0 bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">PK</Badge>
+                                    )}
+                                    {col.name.endsWith('_id') && col.name !== 'id' && (
+                                      <Badge variant="secondary" className="text-[6px] px-0.5 py-0 bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-400">FK</Badge>
                                     )}
                                     <span className="font-mono">{col.name}</span>
                                   </div>
@@ -914,6 +1589,15 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
                                 </div>
                               ))}
                             </div>
+                            {/* Quick preview */}
+                            {tableData && tableData.length > 0 && (
+                              <button
+                                onClick={() => { setSelectedTable(table.name); setActiveTab('data'); setVisibleRows(20) }}
+                                className="w-full px-2 py-1 text-[9px] text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-950/30 border-t transition-colors"
+                              >
+                                Preview first 5 rows →
+                              </button>
+                            )}
                           </div>
                         )
                       })}
@@ -921,88 +1605,217 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
                   </ScrollArea>
                 </div>
 
-                {/* Graph visualization area */}
-                <div className="flex-1 flex items-center justify-center bg-muted/10 relative overflow-auto">
-                  <svg width="100%" height="100%" className="absolute inset-0">
-                    {(() => {
-                      const tableNames = Object.keys(generatedData)
-                      const centerX = 350
-                      const centerY = 250
-                      const radius = Math.min(180, tableNames.length * 55)
+                {/* ER Diagram visualization */}
+                <div className="flex-1 relative overflow-hidden bg-muted/10">
+                  {/* Zoom controls */}
+                  <div className="absolute top-2 right-2 z-10 flex items-center gap-1 bg-card border rounded-lg px-1.5 py-1 shadow-sm">
+                    <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => setExplorerZoom(z => Math.max(0.3, z - 0.2))}>
+                      <ZoomOut className="h-3 w-3" />
+                    </Button>
+                    <span className="text-[9px] font-mono min-w-[32px] text-center">{Math.round(explorerZoom * 100)}%</span>
+                    <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => setExplorerZoom(z => Math.min(2, z + 0.2))}>
+                      <ZoomIn className="h-3 w-3" />
+                    </Button>
+                    <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => { setExplorerZoom(1); setExplorerPan({ x: 0, y: 0 }) }}>
+                      <Move className="h-3 w-3" />
+                    </Button>
+                  </div>
 
-                      return tableNames.map((name, i) => {
-                        const angle = (2 * Math.PI * i) / tableNames.length - Math.PI / 2
-                        const x = centerX + radius * Math.cos(angle)
-                        const y = centerY + radius * Math.sin(angle)
+                  <div
+                    className="w-full h-full overflow-auto cursor-grab active:cursor-grabbing"
+                    onMouseDown={(e) => {
+                      setIsPanning(true)
+                      setPanStart({ x: e.clientX - explorerPan.x, y: e.clientY - explorerPan.y })
+                    }}
+                    onMouseMove={(e) => {
+                      if (isPanning) {
+                        setExplorerPan({
+                          x: e.clientX - panStart.x,
+                          y: e.clientY - panStart.y,
+                        })
+                      }
+                    }}
+                    onMouseUp={() => setIsPanning(false)}
+                    onMouseLeave={() => setIsPanning(false)}
+                  >
+                    <svg
+                      width={svgWidth}
+                      height={svgHeight}
+                      style={{
+                        transform: `translate(${explorerPan.x}px, ${explorerPan.y}px) scale(${explorerZoom})`,
+                        transformOrigin: '0 0',
+                      }}
+                    >
+                      {/* Render relationship lines */}
+                      {erLayout.edges.map((edge, i) => {
+                        const fromNode = erLayout.nodes.find(n => n.name === edge.from)
+                        const toNode = erLayout.nodes.find(n => n.name === edge.to)
+                        if (!fromNode || !toNode) return null
 
-                        const schema = generatedSchema.find(t => t.name === name)
-                        const fkColumns = schema?.columns.filter(c => c.name.endsWith('_id') && c.name !== 'id') || []
+                        const fromX = fromNode.x + 110
+                        const fromY = fromNode.y + 50
+                        const toX = toNode.x + 110
+                        const toY = toNode.y + 50
 
                         return (
-                          <g key={name}>
-                            {fkColumns.map((col) => {
-                              const targetTable = col.name.replace('_id', '')
-                              const targetIdx = tableNames.indexOf(targetTable)
-                              if (targetIdx === -1) return null
-                              const targetAngle = (2 * Math.PI * targetIdx) / tableNames.length - Math.PI / 2
-                              const tx = centerX + radius * Math.cos(targetAngle)
-                              const ty = centerY + radius * Math.sin(targetAngle)
-
-                              return (
-                                <line
-                                  key={col.name}
-                                  x1={x}
-                                  y1={y}
-                                  x2={tx}
-                                  y2={ty}
-                                  stroke="currentColor"
-                                  className="text-muted-foreground"
-                                  strokeWidth={1.5}
-                                  strokeDasharray="4 4"
-                                  opacity={0.3}
-                                />
-                              )
-                            })}
-                            <rect
-                              x={x - 55}
-                              y={y - 18}
-                              width={110}
-                              height={36}
-                              rx={6}
-                              className="fill-card stroke-amber-500"
+                          <g key={`edge-${i}`}>
+                            <line
+                              x1={fromX}
+                              y1={fromY}
+                              x2={toX}
+                              y2={toY}
+                              className="stroke-violet-400 dark:stroke-violet-500"
                               strokeWidth={1.5}
+                              strokeDasharray="6 3"
+                              opacity={0.5}
                             />
+                            {/* Cardinality labels */}
                             <text
-                              x={x}
-                              y={y - 2}
-                              textAnchor="middle"
-                              dominantBaseline="middle"
-                              className="fill-foreground"
-                              fontSize={10}
+                              x={fromX + (toX - fromX) * 0.15}
+                              y={fromY + (toY - fromY) * 0.15 - 5}
+                              className="fill-violet-600 dark:fill-violet-400"
+                              fontSize={8}
                               fontWeight={600}
                             >
-                              {name}
+                              N
                             </text>
                             <text
-                              x={x}
-                              y={y + 10}
+                              x={toX + (fromX - toX) * 0.15}
+                              y={toY + (fromY - toY) * 0.15 - 5}
+                              className="fill-violet-600 dark:fill-violet-400"
+                              fontSize={8}
+                              fontWeight={600}
+                            >
+                              1
+                            </text>
+                            {/* Relationship type */}
+                            <text
+                              x={(fromX + toX) / 2}
+                              y={(fromY + toY) / 2 - 5}
                               textAnchor="middle"
                               className="fill-muted-foreground"
                               fontSize={7}
                             >
-                              {(generatedData[name] as Record<string, unknown>[])?.length || 0} rows · {schema?.columns.length || 0} cols
+                              {edge.type}
                             </text>
                           </g>
                         )
-                      })
-                    })()}
-                  </svg>
+                      })}
+
+                      {/* Render table nodes */}
+                      {erLayout.nodes.map((node) => {
+                        const isFav = favoriteTables.has(node.name)
+                        const headerHeight = 24
+                        const colHeight = 14
+                        const nodeWidth = 200
+                        const nodeHeight = headerHeight + Math.min(node.schema.columns.length, 8) * colHeight + 8
+
+                        return (
+                          <g
+                            key={node.name}
+                            onClick={() => { setSelectedTable(node.name); setActiveTab('data'); setVisibleRows(20) }}
+                            className="cursor-pointer"
+                          >
+                            {/* Shadow */}
+                            <rect
+                              x={node.x + 2}
+                              y={node.y + 2}
+                              width={nodeWidth}
+                              height={nodeHeight}
+                              rx={6}
+                              className="fill-black/5 dark:fill-black/20"
+                            />
+                            {/* Main box */}
+                            <rect
+                              x={node.x}
+                              y={node.y}
+                              width={nodeWidth}
+                              height={nodeHeight}
+                              rx={6}
+                              className="fill-card stroke-amber-500/50"
+                              strokeWidth={selectedTable === node.name ? 2 : 1}
+                            />
+                            {/* Header */}
+                            <rect
+                              x={node.x}
+                              y={node.y}
+                              width={nodeWidth}
+                              height={headerHeight}
+                              rx={6}
+                              className="fill-amber-100 dark:fill-amber-900/40"
+                            />
+                            <rect
+                              x={node.x}
+                              y={node.y + headerHeight - 6}
+                              width={nodeWidth}
+                              height={6}
+                              className="fill-amber-100 dark:fill-amber-900/40"
+                            />
+                            {/* Table name */}
+                            <text
+                              x={node.x + 10}
+                              y={node.y + 16}
+                              className="fill-amber-800 dark:fill-amber-300"
+                              fontSize={10}
+                              fontWeight={700}
+                            >
+                              {isFav && '★ '}{node.name}
+                            </text>
+                            {/* Row count badge */}
+                            <text
+                              x={node.x + nodeWidth - 10}
+                              y={node.y + 16}
+                              textAnchor="end"
+                              className="fill-muted-foreground"
+                              fontSize={8}
+                            >
+                              {node.rows} rows
+                            </text>
+                            {/* Columns */}
+                            {node.schema.columns.slice(0, 8).map((col, ci) => (
+                              <g key={col.name}>
+                                <text
+                                  x={node.x + 10}
+                                  y={node.y + headerHeight + 10 + ci * colHeight}
+                                  className={col.name === 'id' || col.name.endsWith('_id') ? 'fill-amber-700 dark:fill-amber-400' : 'fill-foreground'}
+                                  fontSize={8}
+                                  fontFamily="monospace"
+                                >
+                                  {col.name === 'id' ? '🔑 ' : col.name.endsWith('_id') ? '🔗 ' : ''}{col.name}
+                                </text>
+                                <text
+                                  x={node.x + nodeWidth - 10}
+                                  y={node.y + headerHeight + 10 + ci * colHeight}
+                                  textAnchor="end"
+                                  className="fill-muted-foreground"
+                                  fontSize={7}
+                                  fontFamily="monospace"
+                                >
+                                  {col.type}
+                                </text>
+                              </g>
+                            ))}
+                            {node.schema.columns.length > 8 && (
+                              <text
+                                x={node.x + 10}
+                                y={node.y + headerHeight + 10 + 8 * colHeight}
+                                className="fill-muted-foreground"
+                                fontSize={7}
+                              >
+                                +{node.schema.columns.length - 8} more columns...
+                              </text>
+                            )}
+                          </g>
+                        )
+                      })}
+                    </svg>
+                  </div>
 
                   {Object.keys(generatedData).length <= 1 && (
                     <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                       <div className="text-center text-muted-foreground">
                         <GitBranch className="h-6 w-6 mx-auto mb-1.5 opacity-20" />
-                        <p className="text-[10px]">Relationship graph appears with</p>
+                        <p className="text-[10px]">ER diagram appears with</p>
                         <p className="text-[10px]">multiple connected tables</p>
                       </div>
                     </div>
@@ -1042,6 +1855,38 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
           </div>
         )}
       </div>
+
+      {/* SQL Confirmation Dialog */}
+      <Dialog open={sqlConfirmOpen} onOpenChange={setSqlConfirmOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <AlertTriangle className="h-5 w-5 text-amber-500" />
+              Confirm Destructive Operation
+            </DialogTitle>
+            <DialogDescription>
+              This SQL statement may modify or delete data. Please review it carefully before proceeding.
+            </DialogDescription>
+          </DialogHeader>
+          <pre className="bg-muted p-3 rounded-lg text-xs font-mono overflow-auto max-h-40">
+            {sqlConfirmQuery}
+          </pre>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSqlConfirmOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                setSqlConfirmOpen(false)
+                executeSQL(sqlConfirmQuery, true)
+              }}
+            >
+              Execute Anyway
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

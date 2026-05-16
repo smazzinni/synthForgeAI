@@ -39,46 +39,87 @@ interface ChatMessage {
   content: string
 }
 
-const SYSTEM_PROMPT = `You are SynthForge AI, an expert synthetic data generation assistant powered by a multi-agent pipeline. You help users design database schemas and generate realistic synthetic data.
+const BASE_SYSTEM_PROMPT = `You are SynthForge AI, an expert synthetic data generation assistant powered by a multi-agent pipeline. You help users design database schemas and generate realistic synthetic data.
 
-When users describe their data needs:
-1. Understand their requirements (tables, relationships, constraints, volume)
-2. Design an appropriate database schema with proper types
-3. Generate realistic sample data (5-10 rows per table minimum)
-4. Ensure privacy compliance and data quality
-5. Make data realistic - use real-looking names, emails, addresses, phone numbers, etc.
+## YOUR BEHAVIOR
 
-IMPORTANT: When generating data, you MUST respond with a JSON code block in this exact format:
-\`\`\`json
-{
-  "database_name": "descriptive_name",
-  "tables": {
-    "table_name": [
-      {"column1": "value1", "column2": "value2"},
-      {"column1": "value1", "column2": "value2"}
-    ]
-  }
-}
-\`\`\`
+When users describe their data needs, you act as a smart database architect who asks clarifying questions before generating data. You should:
 
-Rules for data generation:
+1. **Ask Interactive Questions**: Before generating, ask about:
+   - Business type and Industry (offer choices)
+   - Target country/region for localized data
+   - Data size (how many rows per table)
+   - Data realism level (basic/demo vs. production-quality)
+   - Special requirements (timestamps, soft deletes, audit trails)
+
+2. **Use Structured Options**: When asking questions, embed option blocks in your response:
+   For single-choice questions:
+   \`\`\`
+   {"type":"options","question":"What industry is this database for?","choices":[{"label":"E-commerce","value":"ecommerce"},{"label":"Healthcare","value":"healthcare"},{"label":"Finance","value":"finance"},{"label":"Education","value":"education"},{"label":"SaaS/Tech","value":"saas"}],"multi":false}
+   \`\`\`
+
+   For multiple-choice:
+   \`\`\`
+   {"type":"options","question":"What features should be included?","choices":[{"label":"Soft deletes","value":"soft_deletes"},{"label":"Audit trail","value":"audit_trail"},{"label":"Multi-tenant","value":"multi_tenant"},{"label":"UUIDs","value":"uuids"}],"multi":true}
+   \`\`\`
+
+3. **Show Agent Status**: When working, indicate which sub-agent is active:
+   \`\`\`
+   {"type":"agent_status","agent":"Schema Architect","status":"designing","progress":30}
+   \`\`\`
+   Use these agents: Orchestrator, Schema Architect, Data Generator, Quality Analyst, Privacy Officer
+
+4. **Generate Data**: When generating data, you MUST respond with a JSON code block in this exact format:
+   \`\`\`json
+   {
+     "database_name": "descriptive_name",
+     "tables": {
+       "table_name": [
+         {"column1": "value1", "column2": "value2"},
+         {"column1": "value1", "column2": "value2"}
+       ]
+     }
+   }
+   \`\`\`
+
+## DATA GENERATION RULES
+
 - Use realistic values (real-looking names, emails, addresses, phone numbers, cities, companies)
 - Use proper data types (numbers for quantities, ISO dates for timestamps, UUIDs for IDs)
 - Include foreign key relationships between tables where appropriate
-- Generate 5-10 rows per table
+- Generate 5-10 rows per table (or as requested)
 - Always include an "id" column as UUID for each table
 - Include timestamps (created_at) as ISO 8601 strings
 - Make data internally consistent (e.g., order dates after customer registration, etc.)
-- Each column should have realistic constraints (not null, unique where appropriate)
+- Each column should have realistic constraints
+- For localized data, use appropriate names, phone formats, currencies, and addresses
+- For time-series data, ensure realistic patterns (trends, seasonality, anomalies)
+- For transactional data, ensure realistic distributions
+
+## CONTEXT-AWARE OPERATIONS
+
+When the user references "add more rows", "delete duplicates", "modify the schema", etc., they are ALWAYS referring to the currently selected database. You must:
+- Understand the current database schema and data
+- Apply operations to the correct tables
+- Show previews of what will change before executing
+- For destructive actions (DELETE, DROP, TRUNCATE, mass UPDATE), ask for confirmation:
+  "⚠️ This will [description of action]. Are you sure you want to proceed?"
+
+## SMART DEFAULTS
+
+When the user doesn't specify, make intelligent assumptions:
+- Database name: based on the business domain
+- Table names: plural, snake_case
+- Row count: 10 rows per table
+- Include common fields: id (UUID), created_at, updated_at
+- Use appropriate data types for each column
 
 Current agent: Orchestrator
 You coordinate between these sub-agents:
 - Schema Architect: Designs database schemas and relationships
 - Data Generator: Creates realistic synthetic data rows
 - Quality Analyst: Validates data quality and consistency
-- Privacy Officer: Ensures privacy compliance
-
-When responding, explain your design decisions briefly, then provide the JSON data block.`
+- Privacy Officer: Ensures privacy compliance`
 
 export async function POST(request: NextRequest) {
   cleanup()
@@ -102,7 +143,23 @@ export async function POST(request: NextRequest) {
     }
 
     const body = JSON.parse(text)
-    const { message, databaseId, databaseName, history = [] } = body
+    const {
+      message,
+      databaseId,
+      databaseName,
+      history = [],
+      currentSchema,
+      currentData,
+      conversationId,
+    } = body as {
+      message: string
+      databaseId?: string
+      databaseName?: string
+      history?: ChatMessage[]
+      currentSchema?: Array<{ name: string; columns: Array<{ name: string; type: string }> }>
+      currentData?: Record<string, unknown[]>
+      conversationId?: string
+    }
 
     if (!message || typeof message !== 'string') {
       return new Response(JSON.stringify({ error: 'Message is required' }), {
@@ -118,15 +175,45 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    // Build messages array with history
-    const messages: ChatMessage[] = [
-      { role: 'system', content: SYSTEM_PROMPT },
-    ]
+    // Build system prompt with context
+    let systemPrompt = BASE_SYSTEM_PROMPT
 
     // Add context about existing database
     if (databaseId) {
-      messages[0].content += `\n\nThe user is currently editing database "${databaseName || databaseId}" (ID: ${databaseId}). Help them modify or extend the existing data.`
+      systemPrompt += `\n\n## CURRENT DATABASE CONTEXT`
+      systemPrompt += `\nYou are currently editing database "${databaseName || databaseId}" (ID: ${databaseId}).`
+      if (conversationId) {
+        systemPrompt += `\nConversation ID: ${conversationId}`
+      }
+
+      if (currentSchema && currentSchema.length > 0) {
+        systemPrompt += `\n\n### Current Schema:`
+        for (const table of currentSchema) {
+          systemPrompt += `\n- Table "${table.name}": ${table.columns.map(c => `${c.name}(${c.type})`).join(', ')}`
+        }
+      }
+
+      if (currentData && Object.keys(currentData).length > 0) {
+        systemPrompt += `\n\n### Current Data Summary:`
+        for (const [tableName, rows] of Object.entries(currentData)) {
+          if (Array.isArray(rows)) {
+            systemPrompt += `\n- Table "${tableName}": ${rows.length} rows`
+            if (rows.length > 0) {
+              const sampleRow = rows[0] as Record<string, unknown>
+              systemPrompt += ` | Columns: ${Object.keys(sampleRow).join(', ')}`
+            }
+          }
+        }
+        systemPrompt += `\n\nWhen the user says "add more rows", "delete", "update", etc., they are referring to THIS database.`
+      }
+
+      systemPrompt += `\n\nIMPORTANT: When modifying existing data, include ALL tables in your response (both modified and unmodified). Do not omit tables that haven't changed.`
     }
+
+    // Build messages array with history
+    const messages: ChatMessage[] = [
+      { role: 'system', content: systemPrompt },
+    ]
 
     // Add conversation history (last 10 messages for context)
     const recentHistory = (history as ChatMessage[]).slice(-10)
@@ -182,6 +269,16 @@ export async function POST(request: NextRequest) {
       async start(controller) {
         const decoder = new TextDecoder()
         let buffer = ''
+        let closed = false
+
+        const safeEnqueue = (data: Uint8Array) => {
+          if (closed) return
+          try {
+            controller.enqueue(data)
+          } catch {
+            closed = true
+          }
+        }
 
         try {
           while (true) {
@@ -199,7 +296,7 @@ export async function POST(request: NextRequest) {
               const data = trimmed.slice(6)
               if (data === '[DONE]') {
                 // Send completion event
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`))
+                safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`))
                 continue
               }
 
@@ -212,7 +309,7 @@ export async function POST(request: NextRequest) {
 
                 // Handle reasoning content (Chain of Thought)
                 if (delta?.reasoning_content) {
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                  safeEnqueue(encoder.encode(`data: ${JSON.stringify({
                     type: 'reasoning',
                     content: delta.reasoning_content,
                   })}\n\n`))
@@ -220,7 +317,7 @@ export async function POST(request: NextRequest) {
 
                 // Handle main content (answer)
                 if (delta?.content) {
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                  safeEnqueue(encoder.encode(`data: ${JSON.stringify({
                     type: 'content',
                     content: delta.content,
                   })}\n\n`))
@@ -228,7 +325,7 @@ export async function POST(request: NextRequest) {
 
                 // Handle finish
                 if (choice.finish_reason) {
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                  safeEnqueue(encoder.encode(`data: ${JSON.stringify({
                     type: 'finish',
                     reason: choice.finish_reason,
                     usage: parsed.usage || null,
@@ -241,12 +338,18 @@ export async function POST(request: NextRequest) {
           }
         } catch (err) {
           console.error('[Chat API] Stream error:', err)
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+          safeEnqueue(encoder.encode(`data: ${JSON.stringify({
             type: 'error',
             content: 'Stream interrupted',
           })}\n\n`))
         } finally {
-          controller.close()
+          if (!closed) {
+            try {
+              controller.close()
+            } catch {
+              // Already closed
+            }
+          }
         }
       },
     })

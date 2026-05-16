@@ -1,58 +1,61 @@
 ---
 Task ID: 1
-Agent: Main Agent
-Task: Fix all issues, implement DeepSeek streaming, rebuild AI Studio
+Agent: main
+Task: Update .env.local with correct Supabase credentials
 
 Work Log:
-- Wrote .env.local with Supabase + DeepSeek credentials
-- Fetched DeepSeek API documentation for reasoning model streaming
-- Implemented DeepSeek streaming chat API route (/api/chat) using SSE
-- Created conversations API route for chat history persistence
-- Rebuilt AI Studio page with 1/4 chat + 3/4 data/SQL/explorer layout
-- Implemented scrollable AI chat section with independent scroll
-- Implemented DeepSeek Reasoner live streaming with reasoning_content + content phases
-- Parsed AI responses to hide JSON from chat (shows formatted text only)
-- Implemented Data section with table selector, horizontal+vertical scroll, lazy loading
-- Implemented SQL section with auto-generated SQL from schema, copy/download
-- Implemented Explorer section with schema tree + SVG graph visualization
-- Implemented hideable sidebar with collapse toggle
-- Implemented DB deletion from dashboard and databases page
-- Implemented auto-save of generated data immediately after AI generation
-- Implemented Dashboard AI Studio textbox that navigates to studio with query
-- Added Suspense boundary for useSearchParams in studio page
-- Removed Connection: close headers from next.config.ts (was crashing server)
-- Improved CSS with custom scrollbar styling and better dark mode colors
-- Fixed build errors (useSearchParams Suspense requirement)
-- Build succeeds, all pages return 200
+- Updated .env.local with correct Supabase credentials (old format sb_publishable_/sb_secret_ keys work, JWT keys rejected)
+- Verified Supabase connectivity with both anon and service role keys
+- Tested auth login successfully with mazzinni1@gmail.com
 
 Stage Summary:
-- App is fully functional with DeepSeek streaming
-- Supabase integration works but needs valid JWT keys from dashboard
-- All pages load correctly (200 status)
-- Chat API streams DeepSeek Reasoner responses in real-time
-- JSON data is extracted from AI responses and displayed in Data tab
-- Auto-save persists data to Supabase when available
+- Correct Supabase keys: anon=sb_publishable_placeholder_redacted, service=sb_secret_placeholder_redacted
+- JWT-format keys provided by user were rejected by Supabase API (401 Invalid API key)
+- Database contains 3 existing records: Mini DB, users, saas_billing
+
 ---
-Task ID: 1
-Agent: Main Agent
-Task: Fix all issues and implement DeepSeek reasoning model with live streaming
+Task ID: 2
+Agent: main
+Task: Explore project structure
 
 Work Log:
-- Explored full project structure and identified all source files
-- Fetched DeepSeek API documentation - confirmed endpoint, streaming format, reasoning_content field
-- Updated .env.local with correct Supabase credentials (short-format keys are the valid ones)
-- Enabled auth (NEXT_PUBLIC_AUTH_ENABLED=true) now that Supabase keys are confirmed working
-- Fixed databases API: Added DEFAULT_USER_ID fallback, improved JWT extraction from cookies
-- Fixed auth callback route: Proper cookie handling with createServerClient
-- Fixed login page: Proper error handling for Supabase auth errors
-- Improved chat API: Increased max_tokens from 8192 to 16384 for DeepSeek reasoner
-- Fixed studio page: Added messagesRef/loadingRef to prevent stale closures, fixed auto-send from dashboard
-- Verified DeepSeek streaming: reasoning_content → content → finish → done events all working
-- Verified all API endpoints: health, databases, chat streaming all functional
-- Build passes successfully
+- Read all key files: studio/page.tsx, studio/[id]/page.tsx, chat/route.ts, databases/route.ts, conversations/route.ts, api-client.ts, dashboard-sidebar.tsx, supabase types, auth hooks
+- Identified existing architecture: Next.js 16 + TypeScript + TailwindCSS 4 + shadcn/ui + Supabase
+- Studio page is 1060 lines with 1/4 chat + 3/4 data/SQL/explorer layout
+- Build compiles successfully
 
 Stage Summary:
-- All core issues fixed: auth enabled, Supabase connected, DeepSeek streaming confirmed working
-- DeepSeek reasoner model properly streams both reasoning (chain-of-thought) and content tokens
-- Server runs stable in production mode
-- Health check: healthy (Supabase: OK, AI: OK, envVars: OK)
+- Complete codebase understanding achieved
+- All 6 Supabase tables mapped: profiles, synthetic_databases, conversations, messages, datasets, api_keys
+- API routes: /api/chat (DeepSeek streaming), /api/databases (CRUD), /api/conversations (CRUD)
+
+---
+Task ID: 3
+Agent: full-stack-developer
+Task: Complete SynthForge AI overhaul with all features
+
+Work Log:
+- Created /src/lib/ai-agents.ts with multi-agent definitions (Orchestrator, Schema Architect, Data Generator, Quality Analyst, Privacy Officer)
+- Created /src/app/api/sql/execute/route.ts with SQL execution engine (SELECT/WHERE/ORDER BY/LIMIT/LIKE support)
+- Created /src/app/api/export/route.ts with export endpoint (SQL dump, CSV, JSON, XLSX)
+- Enhanced /api/chat/route.ts with context-aware system prompt, currentSchema/currentData injection, agent status reporting
+- Overhauled /dashboard/studio/page.tsx (1905 lines) with:
+  - Resizable chat panel with drag handle
+  - Interactive option buttons from AI responses
+  - Agent status bar with progress percentage
+  - SQL Workspace with editor, execution, query history, AI-assisted SQL
+  - Destructive SQL confirmation dialog
+  - Export dropdown (SQL dump, CSV, JSON)
+  - ER Diagram with detailed table nodes, relationship lines, zoom/pan
+  - Schema tree with PK/FK badges, favorites, quick previews
+  - Conversation persistence (save/load messages)
+  - Agent-specific colored avatars
+  - New chat button
+- Updated /dashboard/studio/[id]/page.tsx with conversation loading (fixes previous chat not visible bug)
+- Enhanced /dashboard/page.tsx with sparkline charts, quick-start templates, recent activity feed
+
+Stage Summary:
+- Build compiles successfully with no new errors
+- All features implemented: context-aware AI, interactive data generation, SQL workspace, explorer improvements, export system, conversation persistence, agent system
+- Server tested: all pages return 200, API endpoints functional, Supabase healthy
+- Studio page grew from 1060 to 1905 lines with comprehensive feature set

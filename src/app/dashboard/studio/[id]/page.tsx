@@ -10,6 +10,20 @@ interface SchemaTable {
   columns: { name: string; type: string }[]
 }
 
+interface PersistedMessage {
+  id: string
+  role: string
+  content: string
+  agent_name?: string | null
+  created_at: string
+}
+
+interface PersistedConversation {
+  id: string
+  title: string
+  messages: PersistedMessage[]
+}
+
 export default function StudioDatabasePage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params)
   const [loading, setLoading] = useState(true)
@@ -17,10 +31,19 @@ export default function StudioDatabasePage({ params }: { params: Promise<{ id: s
   const [schema, setSchema] = useState<SchemaTable[]>([])
   const [data, setData] = useState<Record<string, unknown[]>>({})
   const [error, setError] = useState<string | null>(null)
+  const [initialMessages, setInitialMessages] = useState<Array<{
+    id: string
+    role: 'user' | 'assistant' | 'system'
+    content: string
+    agentName?: string
+    timestamp: Date
+  }> | undefined>(undefined)
+  const [conversationId, setConversationId] = useState<string | undefined>(undefined)
 
   useEffect(() => {
     async function loadDatabase() {
       try {
+        // Fetch database data
         const result = await apiGet<{ database: Record<string, unknown> | null }>(
           `/api/databases?id=${id}`,
           { cacheTtl: 5000, timeout: 10000 }
@@ -51,6 +74,34 @@ export default function StudioDatabasePage({ params }: { params: Promise<{ id: s
             }
           }
           setData(dataMap)
+        }
+
+        // Also fetch conversations for this database
+        try {
+          const convResult = await apiGet<{ conversations: PersistedConversation[] }>(
+            `/api/conversations?databaseId=${id}`,
+            { cacheTtl: 5000, timeout: 10000 }
+          )
+
+          const conversations = convResult.conversations || []
+          if (conversations.length > 0 && conversations[0].messages?.length > 0) {
+            const conv = conversations[0]
+            setConversationId(conv.id)
+
+            // Convert persisted messages to studio message format
+            const restoredMessages = conv.messages.map((msg: PersistedMessage) => ({
+              id: msg.id,
+              role: msg.role as 'user' | 'assistant' | 'system',
+              content: msg.content,
+              agentName: msg.agent_name || undefined,
+              timestamp: new Date(msg.created_at),
+            }))
+
+            setInitialMessages(restoredMessages)
+          }
+        } catch (convErr) {
+          console.warn('[Studio] Failed to load conversations:', convErr)
+          // Non-critical: continue without conversation history
         }
 
         setLoading(false)
@@ -93,6 +144,8 @@ export default function StudioDatabasePage({ params }: { params: Promise<{ id: s
       initialName={dbName}
       initialSchema={schema}
       initialData={data}
+      initialMessages={initialMessages}
+      conversationId={conversationId}
     />
   )
 }
