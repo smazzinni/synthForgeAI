@@ -151,6 +151,7 @@ export async function POST(request: NextRequest) {
         messages,
         stream: true,
         max_tokens: 8192,
+        stream_options: { include_usage: true },
       }),
     })
 

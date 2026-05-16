@@ -1,10 +1,10 @@
 #!/bin/bash
 # SynthForge AI - Auto-restart server wrapper
-# Uses the efficient Rust-based Next.js server with automatic restart on crash
+# Uses Next.js production server with automatic restart on crash
 
 PORT=${PORT:-3000}
 MAX_RESTARTS=20
-RESTART_DELAY=2
+RESTART_DELAY=3
 restart_count=0
 
 echo "[start.sh] Starting SynthForge AI server on port $PORT"
@@ -12,7 +12,8 @@ echo "[start.sh] Starting SynthForge AI server on port $PORT"
 while [ $restart_count -lt $MAX_RESTARTS ]; do
     echo "[start.sh] Attempt $((restart_count + 1))/$MAX_RESTARTS"
     
-    NODE_OPTIONS="--max-old-space-size=4096" \
+    NODE_ENV=production \
+    NODE_OPTIONS="--max-old-space-size=2048" \
     npx next start -p $PORT
     
     EXIT_CODE=$?

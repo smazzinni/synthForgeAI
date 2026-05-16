@@ -38,7 +38,8 @@ function LoginForm() {
     setError(null)
 
     try {
-      const { error } = await signIn(email, password) as { error: Error | null }
+      const result = await signIn(email, password)
+      const error = result.error as { message?: string } | null
       if (error) {
         const message = error.message || String(error)
         if (message.includes('Invalid login credentials')) {
@@ -47,6 +48,8 @@ function LoginForm() {
           setError('Please check your email and confirm your account before signing in.')
         } else if (message.includes('Too many requests')) {
           setError('Too many login attempts. Please wait a moment and try again.')
+        } else if (message.includes('rate limit')) {
+          setError('Too many login attempts. Please wait a moment and try again.')
         } else {
           setError(message)
         }
@@ -54,12 +57,13 @@ function LoginForm() {
       } else {
         // Auth state will update, the useEffect will handle redirect
         // But also do a hard redirect after a short delay as a fallback
+        // to ensure Supabase cookies are properly set
         setTimeout(() => {
           if (!hasRedirected.current) {
             hasRedirected.current = true
             window.location.href = redirect
           }
-        }, 1000)
+        }, 500)
       }
     } catch {
       setError('An unexpected error occurred. Please try again.')

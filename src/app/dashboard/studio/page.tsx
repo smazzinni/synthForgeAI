@@ -152,6 +152,13 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
   const chatEndRef = useRef<HTMLDivElement>(null)
   const chatContainerRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const messagesRef = useRef<Message[]>(messages)
+  const loadingRef = useRef(false)
+
+  // Keep messagesRef in sync with messages state
+  useEffect(() => {
+    messagesRef.current = messages
+  }, [messages])
 
   const hasGeneratedData = generatedSchema.length > 0 || Object.keys(generatedData).length > 0
 
@@ -187,7 +194,7 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
   // ─── Send message with DeepSeek streaming ───
   const sendMessage = useCallback(async (messageText?: string) => {
     const textToSend = messageText || input
-    if (!textToSend.trim() || loading) return
+    if (!textToSend.trim() || loadingRef.current) return
 
     if (abortRef.current) {
       abortRef.current.abort()
@@ -214,6 +221,7 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
     setMessages(prev => [...prev, userMessage, assistantMessage])
     setInput('')
     setLoading(true)
+    loadingRef.current = true
     setReasoningVisible(true)
     setCurrentReasoning('')
 
@@ -221,8 +229,8 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
     abortRef.current = controller
 
     try {
-      // Build history from previous messages
-      const history = messages
+      // Build history from previous messages using ref to avoid stale closure
+      const history = messagesRef.current
         .filter(m => m.role === 'user' || m.role === 'assistant')
         .map(m => ({ role: m.role, content: m.content }))
 
@@ -327,6 +335,7 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
       }
 
       setLoading(false)
+      loadingRef.current = false
       setReasoningVisible(false)
       setCurrentReasoning('')
     } catch (err) {
@@ -343,9 +352,10 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
         },
       ])
       setLoading(false)
+      loadingRef.current = false
       setReasoningVisible(false)
     }
-  }, [input, loading, messages, databaseId, databaseName])
+  }, [input, databaseId, databaseName])
 
   // Auto-send query from dashboard
   useEffect(() => {
@@ -354,10 +364,10 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
       setInitialQuerySent(true)
       const timer = setTimeout(() => {
         sendMessage(q)
-      }, 300)
+      }, 500)
       return () => clearTimeout(timer)
     }
-  }, [searchParams, initialQuerySent, sendMessage])
+  }, [searchParams, initialQuerySent])
 
   // ─── Auto-save generated data ───
   const autoSaveData = async (
@@ -604,7 +614,7 @@ function StudioPageInner({ databaseId, initialName, initialSchema, initialData }
               )}
             </div>
           ))}
-          {loading && !messages[messages.length - 1]?.isStreaming && (
+          {loading && messages.length > 0 && !messages[messages.length - 1]?.isStreaming && (
             <div className="flex gap-1.5">
               <div className="h-5 w-5 rounded-full bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center shrink-0">
                 <Bot className="h-2.5 w-2.5 text-white" />

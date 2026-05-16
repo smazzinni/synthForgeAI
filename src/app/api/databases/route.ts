@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
 
+// ─── Default user ID for fallback when auth is not available ───
+const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
+
 // ─── In-memory request cache with automatic cleanup ───
 const apiCache = new Map<string, { data: unknown; timestamp: number }>()
 const CACHE_TTL = 3000 // 3 seconds cache
@@ -58,34 +61,42 @@ function checkRateLimit(clientId: string, endpoint: string): boolean {
   return true
 }
 
-// Lightweight user extraction from cookies
+// Lightweight user extraction from cookies - decodes Supabase JWT
 function getUserIdFromCookies(request: NextRequest): string | null {
   try {
-    // Try multiple cookie name patterns that Supabase uses
-    const authCookies = request.cookies.getAll().filter(c =>
-      c.name.includes('auth-token') ||
-      c.name.startsWith('sb-') ||
+    // Try to find Supabase auth cookie - the pattern is sb-{ref}-auth-token
+    const supabaseCookies = request.cookies.getAll().filter(c =>
       c.name.includes('-auth-token')
     )
 
-    for (const cookie of authCookies) {
+    for (const cookie of supabaseCookies) {
       try {
-        const cookieValue = decodeURIComponent(cookie.value)
-        // Try parsing as JSON first (newer Supabase format)
+        const rawValue = decodeURIComponent(cookie.value)
+
+        // Supabase stores the session as JSON: {access_token, refresh_token, ...}
+        let accessToken: string | null = null
+
         try {
-          const parsed = JSON.parse(cookieValue)
-          if (parsed?.user?.id) return parsed.user.id
-          if (parsed?.access_token) {
-            // We have an access token but need to decode it to get user ID
-            // For now, just return null - the admin client will handle this
-          }
+          const parsed = JSON.parse(rawValue)
+          accessToken = parsed?.access_token || null
         } catch {
-          // Not JSON
+          // Might be just the token directly
+          accessToken = rawValue
         }
+
+        if (!accessToken) continue
+
+        // Decode JWT without verification (we trust the cookie since it came from our server)
+        const parts = accessToken.split('.')
+        if (parts.length !== 3) continue
+
+        const payload = JSON.parse(atob(parts[1]))
+        if (payload?.sub) return payload.sub
       } catch {
         continue
       }
     }
+
     return null
   } catch {
     return null
@@ -124,7 +135,7 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    const userId = getUserIdFromCookies(request)
+    const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
 
     // If requesting a specific database by ID
     if (id) {
@@ -149,9 +160,7 @@ export async function GET(request: NextRequest) {
       .order('created_at', { ascending: false })
       .limit(50)
 
-    if (userId) {
-      query = query.eq('user_id', userId)
-    }
+    query = query.eq('user_id', userId)
 
     const { data, error } = await query
 
@@ -210,7 +219,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Database service not configured' }, { status: 503 })
     }
 
-    const userId = getUserIdFromCookies(request)
+    const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
 
     const insertData: Record<string, unknown> = {
       name,
@@ -220,7 +229,7 @@ export async function POST(request: NextRequest) {
       data_json,
       row_count: row_count || 0,
       quality_score,
-      ...(userId ? { user_id: userId } : {}),
+      user_id: userId,
     }
 
     const { data, error } = await admin

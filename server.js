@@ -59,11 +59,11 @@ app.prepare().then(() => {
     }
   });
 
-  // Server timeouts
-  server.timeout = 120000;
-  server.keepAliveTimeout = 1000; // Close keep-alive connections quickly
-  server.headersTimeout = 65000;
-  server.requestTimeout = 120000;
+  // Server timeouts - generous for AI streaming requests
+  server.timeout = 300000; // 5 minutes
+  server.keepAliveTimeout = 5000;
+  server.headersTimeout = 300000;
+  server.requestTimeout = 300000;
   server.maxConnections = 100;
 
   server.on('error', (err) => {
