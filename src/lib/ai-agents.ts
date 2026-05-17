@@ -134,11 +134,28 @@ export function parseInteractiveOptions(content: string): InteractiveOptions | n
 
 /**
  * Remove agent_status and options JSON blocks from display text.
+ * Handles nested JSON structures (e.g., choices array in options).
+ * Also removes any leftover code fences that only contain agent commands.
  */
 export function cleanDisplayText(content: string): string {
   let cleaned = content
-  cleaned = cleaned.replace(/\{"type":"agent_status",[^}]+\}\s*/g, '')
-  cleaned = cleaned.replace(/\{"type":"options",[^}]+\}\s*/g, '')
+
+  // Remove agent_status blocks (flat JSON, no nesting)
+  cleaned = cleaned.replace(/\{"type"\s*:\s*"agent_status"\s*,[^}]+\}\s*/g, '')
+
+  // Remove options blocks (may contain nested choices array)
+  // Use a more robust pattern that matches the full structure including nested objects
+  cleaned = cleaned.replace(/\{"type"\s*:\s*"options"\s*,[\s\S]*?"multi"\s*:\s*(?:true|false)\}\s*/g, '')
+
+  // Remove any standalone JSON-like blocks that look like agent commands
+  cleaned = cleaned.replace(/\{"type"\s*:\s*"(?:agent_status|options|follow_up|recommendation)"[^}]*\}\s*/g, '')
+
+  // Remove empty code fences left after JSON extraction
+  cleaned = cleaned.replace(/```\s*\n?\s*```/g, '')
+
+  // Remove orphaned code fences with only whitespace or JSON commands
+  cleaned = cleaned.replace(/```(?:json)?\s*\n?\s*\{"type"\s*:\s*"(?:agent_status|options)"[\s\S]*?\n?\s*```/g, '')
+
   return cleaned.trim()
 }
 

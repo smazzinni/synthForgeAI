@@ -30,7 +30,7 @@ function startServer() {
     cwd: __dirname,
     env: {
       ...process.env,
-      NODE_OPTIONS: '--max-old-space-size=4096',
+      NODE_OPTIONS: '--max-old-space-size=8192',
     },
     stdio: 'inherit',
   });

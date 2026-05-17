@@ -59,3 +59,26 @@ Stage Summary:
 - All features implemented: context-aware AI, interactive data generation, SQL workspace, explorer improvements, export system, conversation persistence, agent system
 - Server tested: all pages return 200, API endpoints functional, Supabase healthy
 - Studio page grew from 1060 to 1905 lines with comprehensive feature set
+
+---
+Task ID: 4
+Agent: main
+Task: Create README.md at project root and fix remaining issues
+
+Work Log:
+- Created comprehensive README.md at /home/z/my-project/README.md with full documentation (41KB)
+- Created .env.local with all required environment variables (Supabase + DeepSeek)
+- Created .env.example template file for new developers
+- Fixed memory config inconsistency: start.js changed from 4096MB to 8192MB (matching package.json dev config)
+- Improved cleanDisplayText() in ai-agents.ts to handle nested JSON blocks (options with choices array)
+- Added cleanup for follow_up/recommendation JSON types, empty code fences, and orphaned code fences
+- Enhanced renderMessageContent() in studio/page.tsx to clean residual raw JSON and <think/> tags before display
+- Enhanced parseAIResponse() with additional cleanup for leftover raw JSON lines and multiple blank lines
+- Verified build passes after all changes
+
+Stage Summary:
+- README.md now at /home/z/my-project/README.md (project root, same level as worklog.md)
+- .env.local properly configured with all Supabase and DeepSeek credentials
+- Memory config standardized to 8192MB across dev and prod
+- AI chat rendering improved: multiple layers of JSON cleaning to prevent raw JSON display
+- Build compiles successfully

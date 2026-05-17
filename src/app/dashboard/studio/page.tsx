@@ -210,6 +210,10 @@ function parseAIResponse(content: string): {
   displayText = displayText.replace(/<think[\s\S]*?<\/think>/gi, '')
   displayText = displayText.replace(/<thinking[\s\S]*?<\/thinking>/gi, '')
   displayText = cleanDisplayText(displayText)
+  // Additional cleanup: remove any leftover raw JSON lines that look like agent commands
+  displayText = displayText.replace(/^\s*\{"type"\s*:\s*"[^"]+"\s*[,\}][^\n]*$/gm, '')
+  // Remove multiple consecutive blank lines
+  displayText = displayText.replace(/\n{3,}/g, '\n\n')
   displayText = displayText.trim()
 
   return { displayText, tables, databaseName }
@@ -814,7 +818,7 @@ function StudioPageInner({
       return <span className="whitespace-pre-wrap">{message.content}</span>
     }
 
-    const content = message.content
+    let content = message.content
     if (!content) {
       if (message.isStreaming) {
         return (
@@ -826,6 +830,15 @@ function StudioPageInner({
       }
       return null
     }
+
+    // Clean any residual raw JSON blocks that might have slipped through
+    content = cleanDisplayText(content)
+    // Strip <think/> and <thinking/> tags that may appear in streaming
+    content = content.replace(/<think[\s\S]*?<\/think>/gi, '')
+    content = content.replace(/<thinking[\s\S]*?<\/thinking>/gi, '')
+    content = content.trim()
+
+    if (!content) return null
 
     // Format the text with basic markdown-like rendering
     const parts = content.split(/(\*\*[^*]+\*\*|\`[^`]+\`|\n)/g)
