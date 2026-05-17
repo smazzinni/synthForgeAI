@@ -76,9 +76,57 @@ export const AI_AGENTS: Record<string, AgentDef> = {
 export const AGENT_LIST = Object.values(AI_AGENTS)
 
 /**
+ * Helper: Extract a complete JSON object from a string starting at a given position.
+ * Uses bracket counting to handle nested objects and arrays.
+ */
+function extractJsonObject(content: string, startIndex: number): string | null {
+  let depth = 0
+  let inString = false
+  let escape = false
+  const len = content.length
+
+  for (let i = startIndex; i < len; i++) {
+    const ch = content[i]
+
+    if (escape) {
+      escape = false
+      continue
+    }
+
+    if (ch === '\\' && inString) {
+      escape = true
+      continue
+    }
+
+    if (ch === '"') {
+      inString = !inString
+      continue
+    }
+
+    if (inString) continue
+
+    if (ch === '{' || ch === '[') {
+      depth++
+    } else if (ch === '}' || ch === ']') {
+      depth--
+      if (depth === 0) {
+        return content.substring(startIndex, i + 1)
+      }
+    }
+  }
+
+  // If we got here, brackets don't balance — return what we have
+  if (depth <= 0) {
+    return content.substring(startIndex)
+  }
+  return null
+}
+
+/**
  * Parse agent status from AI response content.
  * The AI may embed JSON blocks like:
  * {"type":"agent_status","agent":"Schema Architect","status":"designing","progress":30}
+ * These may span multiple lines or have slight format variations.
  */
 export interface AgentStatus {
   agent: string
@@ -87,19 +135,90 @@ export interface AgentStatus {
 }
 
 export function parseAgentStatus(content: string): AgentStatus | null {
-  const match = content.match(/\{"type":"agent_status","agent":"([^"]+)","status":"([^"]+)","progress":(\d+)\}/)
-  if (!match) return null
-  return {
-    agent: match[1],
-    status: match[2],
-    progress: parseInt(match[3], 10),
+  // Try simple regex first (single-line, fast path)
+  const simpleMatch = content.match(/\{"type"\s*:\s*"agent_status"\s*,\s*"agent"\s*:\s*"([^"]+)"\s*,\s*"status"\s*:\s*"([^"]+)"\s*,\s*"progress"\s*:\s*(\d+)\s*\}/)
+  if (simpleMatch) {
+    return {
+      agent: simpleMatch[1],
+      status: simpleMatch[2],
+      progress: parseInt(simpleMatch[3], 10),
+    }
   }
+
+  // Fallback: find {"type":"agent_status" and extract the full JSON object using bracket counting
+  const marker = '{"type":"agent_status"'
+  const markerLoose = '{"type": "agent_status"'
+  let idx = content.indexOf(marker)
+  if (idx === -1) idx = content.indexOf(markerLoose)
+  if (idx === -1) return null
+
+  const jsonStr = extractJsonObject(content, idx)
+  if (!jsonStr) return null
+
+  try {
+    const parsed = JSON.parse(jsonStr)
+    if (parsed?.type === 'agent_status' && parsed.agent && parsed.status) {
+      return {
+        agent: String(parsed.agent),
+        status: String(parsed.status),
+        progress: Number(parsed.progress) || 0,
+      }
+    }
+  } catch {
+    // Not parseable
+  }
+
+  return null
 }
 
 /**
- * Parse interactive options from AI response.
+ * Parse ALL interactive options blocks from AI response content.
+ * Returns an array of InteractiveOptions found in the content.
+ */
+export function parseAllInteractiveOptions(content: string): InteractiveOptions[] {
+  const results: InteractiveOptions[] = []
+
+  // Find all occurrences of {"type":"options" and extract each one
+  const markerStrict = '{"type":"options"'
+  const markerLoose = '{"type": "options"'
+
+  let searchFrom = 0
+  while (searchFrom < content.length) {
+    let idx = content.indexOf(markerStrict, searchFrom)
+    if (idx === -1) idx = content.indexOf(markerLoose, searchFrom)
+    if (idx === -1) break
+
+    const jsonStr = extractJsonObject(content, idx)
+    if (jsonStr) {
+      try {
+        const parsed = JSON.parse(jsonStr)
+        if (parsed?.type === 'options' && Array.isArray(parsed.choices)) {
+          results.push({
+            question: String(parsed.question || ''),
+            choices: parsed.choices.map((c: { label?: string; value?: string }) => ({
+              label: String(c.label || c.value || ''),
+              value: String(c.value || c.label || ''),
+            })),
+            multi: Boolean(parsed.multi),
+          })
+        }
+      } catch {
+        // Not parseable, skip
+      }
+      searchFrom = idx + jsonStr.length
+    } else {
+      searchFrom = idx + markerStrict.length
+    }
+  }
+
+  return results
+}
+
+/**
+ * Parse interactive options from AI response (returns the LAST one found).
  * The AI may embed JSON blocks like:
- * {"type":"options","question":"What industry?","choices":[{"label":"E-commerce","value":"ecommerce"},{"label":"Healthcare","value":"healthcare"}],"multi":false}
+ * {"type":"options","question":"What industry?","choices":[{"label":"E-commerce","value":"ecommerce"},...],"multi":false}
+ * These may span multiple lines.
  */
 export interface OptionChoice {
   label: string
@@ -113,42 +232,38 @@ export interface InteractiveOptions {
 }
 
 export function parseInteractiveOptions(content: string): InteractiveOptions | null {
-  const match = content.match(/\{"type":"options","question":"([^"]+)","choices":\[(.*?)\],"multi":(true|false)\}/)
-  if (!match) return null
-  try {
-    const choices: OptionChoice[] = []
-    const choiceRegex = /\{"label":"([^"]+)","value":"([^"]+)"\}/g
-    let choiceMatch
-    while ((choiceMatch = choiceRegex.exec(match[2])) !== null) {
-      choices.push({ label: choiceMatch[1], value: choiceMatch[2] })
-    }
-    return {
-      question: match[1],
-      choices,
-      multi: match[3] === 'true',
-    }
-  } catch {
-    return null
-  }
+  const all = parseAllInteractiveOptions(content)
+  return all.length > 0 ? all[all.length - 1] : null
 }
 
 /**
- * Remove agent_status and options JSON blocks from display text.
- * Handles nested JSON structures (e.g., choices array in options).
- * Also removes any leftover code fences that only contain agent commands.
+ * Remove ALL agent_status and options JSON blocks from display text.
+ * Handles multiline JSON, nested objects, and various format variations.
  */
 export function cleanDisplayText(content: string): string {
   let cleaned = content
 
-  // Remove agent_status blocks (flat JSON, no nesting)
-  cleaned = cleaned.replace(/\{"type"\s*:\s*"agent_status"\s*,[^}]+\}\s*/g, '')
+  // Remove agent_status blocks — find each one and remove it
+  const agentStatusMarker = '{"type":"agent_status"'
+  const agentStatusMarkerLoose = '{"type": "agent_status"'
+  cleaned = removeJsonBlocks(cleaned, agentStatusMarker, agentStatusMarkerLoose)
 
-  // Remove options blocks (may contain nested choices array)
-  // Use a more robust pattern that matches the full structure including nested objects
-  cleaned = cleaned.replace(/\{"type"\s*:\s*"options"\s*,[\s\S]*?"multi"\s*:\s*(?:true|false)\}\s*/g, '')
+  // Remove options blocks — find each one and remove it
+  const optionsMarker = '{"type":"options"'
+  const optionsMarkerLoose = '{"type": "options"'
+  cleaned = removeJsonBlocks(cleaned, optionsMarker, optionsMarkerLoose)
 
-  // Remove any standalone JSON-like blocks that look like agent commands
-  cleaned = cleaned.replace(/\{"type"\s*:\s*"(?:agent_status|options|follow_up|recommendation)"[^}]*\}\s*/g, '')
+  // Remove follow_up and recommendation blocks
+  const followUpMarker = '{"type":"follow_up"'
+  const followUpMarkerLoose = '{"type": "follow_up"'
+  cleaned = removeJsonBlocks(cleaned, followUpMarker, followUpMarkerLoose)
+
+  const recMarker = '{"type":"recommendation"'
+  const recMarkerLoose = '{"type": "recommendation"'
+  cleaned = removeJsonBlocks(cleaned, recMarker, recMarkerLoose)
+
+  // Remove any standalone JSON-like lines that look like agent commands (single-line fallback)
+  cleaned = cleaned.replace(/^\s*\{"type"\s*:\s*"(?:agent_status|options|follow_up|recommendation)"[^}]*\}\s*$/gm, '')
 
   // Remove empty code fences left after JSON extraction
   cleaned = cleaned.replace(/```\s*\n?\s*```/g, '')
@@ -157,6 +272,37 @@ export function cleanDisplayText(content: string): string {
   cleaned = cleaned.replace(/```(?:json)?\s*\n?\s*\{"type"\s*:\s*"(?:agent_status|options)"[\s\S]*?\n?\s*```/g, '')
 
   return cleaned.trim()
+}
+
+/**
+ * Remove all JSON blocks starting with a given marker from the content.
+ */
+function removeJsonBlocks(content: string, marker: string, markerLoose: string): string {
+  let result = content
+  let safety = 0
+
+  while (safety < 100) {
+    let idx = result.indexOf(marker)
+    const idxLoose = result.indexOf(markerLoose)
+    if (idx === -1 || (idxLoose !== -1 && idxLoose < idx)) idx = idxLoose
+    if (idx === -1) break
+
+    const jsonStr = extractJsonObject(result, idx)
+    if (jsonStr) {
+      result = result.substring(0, idx) + result.substring(idx + jsonStr.length)
+    } else {
+      // Can't extract, try removing a reasonable chunk
+      const endGuess = result.indexOf('}', idx + marker.length + 200)
+      if (endGuess !== -1) {
+        result = result.substring(0, idx) + result.substring(endGuess + 1)
+      } else {
+        break
+      }
+    }
+    safety++
+  }
+
+  return result
 }
 
 /**

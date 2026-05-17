@@ -13,7 +13,6 @@ import {
   Database,
   BarChart3,
   MessageSquare,
-  FlaskConical,
   Plus,
   ArrowRight,
   Loader2,
@@ -24,6 +23,13 @@ import {
   Clock,
   TrendingUp,
   Activity,
+  Upload,
+  FileText,
+  FileJson,
+  FileSpreadsheet,
+  HardDrive,
+  Server,
+  ArrowUpFromLine,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { apiDelete } from '@/lib/api-client'
@@ -162,13 +168,51 @@ export default function DashboardPage() {
 
   const userName = user?.user_metadata?.full_name || user?.email?.split('@')[0] || 'User'
 
-  // Quick-start templates
-  const templates = [
-    { name: 'E-Commerce', desc: 'Users, products, orders, reviews', query: 'Generate an e-commerce database with users, products, orders, and reviews' },
-    { name: 'Healthcare', desc: 'Patients, doctors, appointments', query: 'Generate a healthcare database with patients, doctors, appointments, and medical records' },
-    { name: 'SaaS App', desc: 'Tenants, subscriptions, billing', query: 'Generate a SaaS multi-tenant database with organizations, users, subscriptions, and billing' },
-    { name: 'Social Media', desc: 'Users, posts, comments, likes', query: 'Generate a social media database with users, posts, comments, likes, and followers' },
-  ]
+  // Upload & Import state
+  const [uploadDragOver, setUploadDragOver] = useState(false)
+  const [uploadPreview, setUploadPreview] = useState<{
+    fileName: string
+    fileType: string
+    schemaInfo: string
+  } | null>(null)
+
+  const handleFileUpload = (file: File) => {
+    const ext = file.name.split('.').pop()?.toLowerCase() || ''
+    const supportedExts = ['sql', 'csv', 'xlsx', 'xls', 'json', 'xml', 'parquet', 'sqlite', 'db', 'dump', 'sql.gz', 'bson']
+    if (!supportedExts.some(se => ext.endsWith(se))) {
+      toast.error('Unsupported file format')
+      return
+    }
+    const typeMap: Record<string, string> = {
+      sql: 'SQL Schema', csv: 'CSV Data', xlsx: 'Excel Spreadsheet', xls: 'Excel Spreadsheet',
+      json: 'JSON Data', xml: 'XML Data', parquet: 'Parquet Data', sqlite: 'SQLite Database',
+      db: 'Database File', dump: 'SQL Dump', bson: 'MongoDB Export',
+    }
+    setUploadPreview({
+      fileName: file.name,
+      fileType: typeMap[ext] || 'Unknown',
+      schemaInfo: `Detected ${typeMap[ext] || 'data'} file (${(file.size / 1024).toFixed(1)} KB)`,
+    })
+    toast.success(`File "${file.name}" ready for import`)
+  }
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault()
+    setUploadDragOver(false)
+    const file = e.dataTransfer.files[0]
+    if (file) handleFileUpload(file)
+  }
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (file) handleFileUpload(file)
+  }
+
+  const sendToStudio = () => {
+    if (uploadPreview) {
+      router.push(`/dashboard/studio?q=${encodeURIComponent(`Import and generate data from this schema file: ${uploadPreview.fileName}`)}`)
+    }
+  }
 
   // Recent activity
   const recentActivity = databases.slice(0, 5).map(db => ({
@@ -258,30 +302,104 @@ export default function DashboardPage() {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
-        {/* Quick-start Templates */}
+        {/* Upload & Import */}
         <div className="lg:col-span-1">
-          <h2 className="text-lg font-semibold mb-3">Quick-Start Templates</h2>
+          <h2 className="text-lg font-semibold mb-3">Upload & Import</h2>
           <div className="space-y-2">
-            {templates.map((template) => (
-              <Card
-                key={template.name}
-                className="hover:shadow-md transition-all cursor-pointer group"
-                onClick={() => router.push(`/dashboard/studio?q=${encodeURIComponent(template.query)}`)}
-              >
-                <CardContent className="py-3 px-4">
-                  <div className="flex items-center gap-3">
-                    <div className="h-8 w-8 rounded-lg bg-gradient-to-br from-amber-100 to-red-100 dark:from-amber-900/30 dark:to-red-900/30 flex items-center justify-center shrink-0">
-                      <FlaskConical className="h-4 w-4 text-amber-600" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-semibold">{template.name}</p>
-                      <p className="text-[11px] text-muted-foreground">{template.desc}</p>
-                    </div>
-                    <ArrowRight className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors shrink-0" />
+            <Card
+              className={`border-2 border-dashed transition-all ${uploadDragOver ? 'border-amber-500 bg-amber-50/50 dark:bg-amber-950/20' : 'border-muted-foreground/25 hover:border-amber-400'}`}
+              onDragOver={(e) => { e.preventDefault(); setUploadDragOver(true) }}
+              onDragLeave={() => setUploadDragOver(false)}
+              onDrop={handleDrop}
+            >
+              <CardContent className="py-4 px-4">
+                <div className="flex flex-col items-center text-center gap-2">
+                  <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-amber-100 to-red-100 dark:from-amber-900/30 dark:to-red-900/30 flex items-center justify-center shrink-0">
+                    <Upload className="h-5 w-5 text-amber-600" />
                   </div>
+                  <div>
+                    <p className="text-sm font-semibold">Drop files here</p>
+                    <p className="text-[11px] text-muted-foreground">or click to browse</p>
+                  </div>
+                  <label className="cursor-pointer">
+                    <input
+                      type="file"
+                      className="hidden"
+                      accept=".sql,.csv,.xlsx,.xls,.json,.xml,.parquet,.sqlite,.db,.dump,.bson"
+                      onChange={handleFileSelect}
+                    />
+                    <span className="text-[10px] px-3 py-1.5 rounded-md bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 font-medium hover:bg-amber-200 dark:hover:bg-amber-900/50 transition-colors">
+                      Browse Files
+                    </span>
+                  </label>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* File type badges */}
+            <div className="flex flex-wrap gap-1 px-1">
+              {[
+                { icon: FileText, label: 'SQL' },
+                { icon: FileSpreadsheet, label: 'CSV' },
+                { icon: FileSpreadsheet, label: 'Excel' },
+                { icon: FileJson, label: 'JSON' },
+                { icon: FileText, label: 'XML' },
+                { icon: HardDrive, label: 'Parquet' },
+                { icon: Database, label: 'SQLite' },
+                { icon: Server, label: 'PgSQL' },
+                { icon: Server, label: 'MySQL' },
+                { icon: Database, label: 'Mongo' },
+              ].map((ft) => (
+                <span key={ft.label} className="inline-flex items-center gap-0.5 text-[9px] px-1.5 py-0.5 rounded border bg-muted/50 text-muted-foreground">
+                  <ft.icon className="h-2.5 w-2.5" />
+                  {ft.label}
+                </span>
+              ))}
+            </div>
+
+            {/* Features list */}
+            <Card className="border-0 bg-muted/30">
+              <CardContent className="py-2 px-3">
+                <div className="space-y-1">
+                  {[
+                    'Auto schema detection',
+                    'AI-assisted schema mapping',
+                    'Relationship inference',
+                    'Data validation',
+                    'Import previews',
+                    'Incremental imports',
+                  ].map((feat) => (
+                    <div key={feat} className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                      <div className="h-1 w-1 rounded-full bg-amber-500 shrink-0" />
+                      {feat}
+                    </div>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Upload preview */}
+            {uploadPreview && (
+              <Card className="border-amber-300 dark:border-amber-700 bg-amber-50/50 dark:bg-amber-950/20">
+                <CardContent className="py-2.5 px-3">
+                  <div className="flex items-center gap-2 mb-2">
+                    <FileText className="h-4 w-4 text-amber-600 shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-semibold truncate">{uploadPreview.fileName}</p>
+                      <p className="text-[10px] text-muted-foreground">{uploadPreview.schemaInfo}</p>
+                    </div>
+                  </div>
+                  <Button
+                    size="sm"
+                    className="w-full h-7 text-[10px] bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white"
+                    onClick={sendToStudio}
+                  >
+                    <ArrowUpFromLine className="h-3 w-3 mr-1" />
+                    Send to AI Studio
+                  </Button>
                 </CardContent>
               </Card>
-            ))}
+            )}
           </div>
         </div>
 

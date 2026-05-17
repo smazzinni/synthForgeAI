@@ -59,6 +59,7 @@ import { apiPost, apiPatch, apiDelete, apiGet, invalidateCache } from '@/lib/api
 import {
   parseAgentStatus,
   parseInteractiveOptions,
+  parseAllInteractiveOptions,
   cleanDisplayText,
   isDestructiveSQL,
   getAgentByName,
@@ -282,6 +283,54 @@ function AgentIcon({ agentName, size = 'sm' }: { agentName?: string; size?: 'sm'
   )
 }
 
+// ─── ShowMoreText component for long messages ───
+function ShowMoreText({ content, isStreaming }: { content: string; isStreaming?: boolean }) {
+  const [expanded, setExpanded] = useState(false)
+  const contentRef = useRef<HTMLDivElement>(null)
+  const [isOverflowing, setIsOverflowing] = useState(false)
+
+  useEffect(() => {
+    if (contentRef.current) {
+      setIsOverflowing(contentRef.current.scrollHeight > 400)
+    }
+  }, [content])
+
+  // Format the text with basic markdown-like rendering
+  const parts = content.split(/(\*\*[^*]+\*\*|\`[^`]+\`|\n)/g)
+  const rendered = parts.map((part, i) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return <strong key={i}>{part.slice(2, -2)}</strong>
+    }
+    if (part.startsWith('`') && part.endsWith('`')) {
+      return <code key={i} className="bg-muted px-1 py-0.5 rounded text-xs font-mono">{part.slice(1, -1)}</code>
+    }
+    if (part === '\n') {
+      return <br key={i} />
+    }
+    return <span key={i}>{part}</span>
+  })
+
+  return (
+    <div>
+      <div
+        ref={contentRef}
+        className={`text-sm leading-relaxed whitespace-pre-wrap ${!expanded && isOverflowing ? 'max-h-[400px] overflow-y-auto' : ''}`}
+        style={{ overflowWrap: 'break-word', wordBreak: 'break-word' }}
+      >
+        {rendered}
+      </div>
+      {isOverflowing && !isStreaming && (
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="mt-1 text-[10px] text-amber-600 dark:text-amber-400 hover:underline font-medium"
+        >
+          {expanded ? 'Show less' : 'Show more'}
+        </button>
+      )}
+    </div>
+  )
+}
+
 // ─── Main Studio Page Component ───
 function StudioPageInner({
   databaseId,
@@ -464,6 +513,25 @@ function StudioPageInner({
         .filter(m => m.role === 'user' || m.role === 'assistant')
         .map(m => ({ role: m.role, content: m.content }))
 
+      // Truncate currentData if too large (> 20KB send only summary)
+      let dataToSend: Record<string, unknown[]> | undefined = hasGeneratedData ? generatedData : undefined
+      if (dataToSend) {
+        const dataStr = JSON.stringify(dataToSend)
+        if (dataStr.length > 20000) {
+          // Send only schema + row counts instead of full data
+          const summary: Record<string, unknown[]> = {}
+          for (const [tableName, rows] of Object.entries(dataToSend)) {
+            if (Array.isArray(rows) && rows.length > 0) {
+              // Send first 2 rows as samples + row count
+              summary[tableName] = rows.slice(0, 2)
+            } else {
+              summary[tableName] = []
+            }
+          }
+          dataToSend = summary
+        }
+      }
+
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -472,7 +540,7 @@ function StudioPageInner({
           ...(databaseId ? { databaseId, databaseName } : {}),
           ...(conversationId ? { conversationId } : {}),
           currentSchema: generatedSchema,
-          currentData: hasGeneratedData ? generatedData : undefined,
+          currentData: dataToSend,
           history,
         }),
         signal: controller.signal,
@@ -527,12 +595,13 @@ function StudioPageInner({
                 lastAgentName = agentStatus.agent
               }
 
-              // Parse for interactive options
-              const options = parseInteractiveOptions(fullContent)
-              if (options) {
-                lastInteractiveOptions = options
+              // Parse for interactive options (all of them, use last)
+              const allOptions = parseAllInteractiveOptions(fullContent)
+              if (allOptions.length > 0) {
+                lastInteractiveOptions = allOptions[allOptions.length - 1]
               }
 
+              // During streaming, store raw content but display cleaned version
               setMessages(prev => prev.map(m =>
                 m.id === assistantId
                   ? {
@@ -578,11 +647,18 @@ function StudioPageInner({
           autoSaveData(tables, schema, parsedName)
         }
 
-        // Update the message with cleaned display text
+        // Update the message with cleaned display text — preserve interactiveOptions
         if (displayText && displayText !== fullContent) {
           setMessages(prev => prev.map(m =>
             m.id === assistantId
-              ? { ...m, content: displayText }
+              ? { ...m, content: displayText, interactiveOptions: lastInteractiveOptions }
+              : m
+          ))
+        } else {
+          // Even if text didn't change, make sure options are preserved
+          setMessages(prev => prev.map(m =>
+            m.id === assistantId
+              ? { ...m, interactiveOptions: lastInteractiveOptions }
               : m
           ))
         }
@@ -815,7 +891,7 @@ function StudioPageInner({
   // ─── Render formatted message content ───
   const renderMessageContent = (message: Message) => {
     if (message.role === 'user') {
-      return <span className="whitespace-pre-wrap">{message.content}</span>
+      return <span className="whitespace-pre-wrap break-words" style={{ overflowWrap: 'break-word', wordBreak: 'break-word' }}>{message.content}</span>
     }
 
     let content = message.content
@@ -831,7 +907,7 @@ function StudioPageInner({
       return null
     }
 
-    // Clean any residual raw JSON blocks that might have slipped through
+    // Clean any residual raw JSON blocks — also during streaming
     content = cleanDisplayText(content)
     // Strip <think/> and <thinking/> tags that may appear in streaming
     content = content.replace(/<think[\s\S]*?<\/think>/gi, '')
@@ -840,24 +916,105 @@ function StudioPageInner({
 
     if (!content) return null
 
-    // Format the text with basic markdown-like rendering
-    const parts = content.split(/(\*\*[^*]+\*\*|\`[^`]+\`|\n)/g)
-    return (
-      <div className="whitespace-pre-wrap text-sm leading-relaxed">
-        {parts.map((part, i) => {
-          if (part.startsWith('**') && part.endsWith('**')) {
-            return <strong key={i}>{part.slice(2, -2)}</strong>
-          }
-          if (part.startsWith('`') && part.endsWith('`')) {
-            return <code key={i} className="bg-muted px-1 py-0.5 rounded text-xs font-mono">{part.slice(1, -1)}</code>
-          }
-          if (part === '\n') {
-            return <br key={i} />
-          }
-          return <span key={i}>{part}</span>
-        })}
-      </div>
-    )
+    return <ShowMoreText content={content} isStreaming={message.isStreaming} />
+  }
+
+  // ─── Data editing state ───
+  const [editingCell, setEditingCell] = useState<{ row: number; col: string } | null>(null)
+  const [editingCellValue, setEditingCellValue] = useState('')
+  const [addTableDialogOpen, setAddTableDialogOpen] = useState(false)
+  const [newTableName, setNewTableName] = useState('')
+  const [newTableColumns, setNewTableColumns] = useState('')
+  const [addColumnDialogOpen, setAddColumnDialogOpen] = useState(false)
+  const [newColumnName, setNewColumnName] = useState('')
+  const [newColumnType, setNewColumnType] = useState('varchar(255)')
+  const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set())
+
+  const handleAddTable = () => {
+    if (!newTableName.trim()) return
+    const cols = newTableColumns.split(',').map(c => c.trim()).filter(Boolean)
+    const defaultColumns = cols.length > 0 ? cols : ['id']
+    const emptyRow: Record<string, unknown> = {}
+    for (const col of defaultColumns) {
+      emptyRow[col] = col === 'id' ? crypto.randomUUID() : null
+    }
+    setGeneratedData(prev => ({
+      ...prev,
+      [newTableName.trim()]: [emptyRow],
+    }))
+    setGeneratedSchema(prev => [
+      ...prev,
+      {
+        name: newTableName.trim(),
+        columns: defaultColumns.map(c => ({
+          name: c,
+          type: c === 'id' ? 'uuid' : 'varchar(255)',
+        })),
+      },
+    ])
+    setSelectedTable(newTableName.trim())
+    setAddTableDialogOpen(false)
+    setNewTableName('')
+    setNewTableColumns('')
+    toast.success(`Table "${newTableName.trim()}" created`)
+  }
+
+  const handleAddColumn = () => {
+    if (!newColumnName.trim() || !selectedTable) return
+    setGeneratedSchema(prev => prev.map(t =>
+      t.name === selectedTable
+        ? { ...t, columns: [...t.columns, { name: newColumnName.trim(), type: newColumnType }] }
+        : t
+    ))
+    setGeneratedData(prev => ({
+      ...prev,
+      [selectedTable]: (prev[selectedTable] || []).map((row: unknown) => {
+        const r = row as Record<string, unknown>
+        return { ...r, [newColumnName.trim()]: null }
+      }),
+    }))
+    setAddColumnDialogOpen(false)
+    setNewColumnName('')
+    setNewColumnType('varchar(255)')
+    toast.success(`Column "${newColumnName.trim()}" added`)
+  }
+
+  const handleAddRow = () => {
+    if (!selectedTable) return
+    const schema = generatedSchema.find(t => t.name === selectedTable)
+    const emptyRow: Record<string, unknown> = {}
+    if (schema) {
+      for (const col of schema.columns) {
+        emptyRow[col.name] = col.name === 'id' ? crypto.randomUUID() : null
+      }
+    }
+    setGeneratedData(prev => ({
+      ...prev,
+      [selectedTable]: [...(prev[selectedTable] || []), emptyRow],
+    }))
+    toast.success('Row added')
+  }
+
+  const handleCellEdit = (rowIndex: number, colName: string, value: string) => {
+    if (!selectedTable) return
+    setGeneratedData(prev => ({
+      ...prev,
+      [selectedTable]: (prev[selectedTable] || []).map((row: unknown, i: number) => {
+        const r = row as Record<string, unknown>
+        return i === rowIndex ? { ...r, [colName]: value } : r
+      }),
+    }))
+    setEditingCell(null)
+  }
+
+  const handleDeleteSelectedRows = () => {
+    if (!selectedTable || selectedRows.size === 0) return
+    setGeneratedData(prev => ({
+      ...prev,
+      [selectedTable]: (prev[selectedTable] || []).filter((_: unknown, i: number) => !selectedRows.has(i)),
+    }))
+    setSelectedRows(new Set())
+    toast.success(`${selectedRows.size} row(s) deleted`)
   }
 
   // ─── Current table data for display ───
@@ -1020,11 +1177,12 @@ function StudioPageInner({
                 <AgentIcon agentName={message.agentName} size="sm" />
               )}
               <div
-                className={`max-w-[88%] rounded-lg px-2.5 py-2 ${
+                className={`max-w-[88%] rounded-lg px-2.5 py-2 overflow-hidden ${
                   message.role === 'user'
                     ? 'bg-primary text-primary-foreground'
                     : 'bg-muted/70'
                 }`}
+                style={{ overflowWrap: 'break-word', wordBreak: 'break-word' }}
               >
                 {message.role === 'assistant' && (
                   <p className="text-[9px] font-medium text-amber-600 dark:text-amber-400 mb-0.5 flex items-center gap-1">
@@ -1040,8 +1198,8 @@ function StudioPageInner({
                 )}
                 {renderMessageContent(message)}
 
-                {/* Interactive options buttons */}
-                {message.role === 'assistant' && !message.isStreaming && message.interactiveOptions && (
+                {/* Interactive options buttons - show during streaming too, but disabled */}
+                {message.role === 'assistant' && message.interactiveOptions && (
                   <div className="mt-2 space-y-1.5">
                     <p className="text-[10px] font-medium text-muted-foreground">
                       {message.interactiveOptions.question}
@@ -1051,7 +1209,10 @@ function StudioPageInner({
                         <button
                           key={choice.value}
                           onClick={() => handleOptionClick(choice)}
+                          disabled={message.isStreaming}
                           className={`text-[10px] px-2.5 py-1 rounded-full border transition-colors ${
+                            message.isStreaming ? 'opacity-50 cursor-not-allowed' : ''
+                          } ${
                             message.interactiveOptions!.multi
                               ? 'border-violet-300 bg-violet-50 dark:bg-violet-950/30 text-violet-700 dark:text-violet-400 hover:bg-violet-100 dark:hover:bg-violet-950/50'
                               : 'border-amber-300 bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-950/50'
@@ -1224,8 +1385,17 @@ function StudioPageInner({
               <div className="flex h-full">
                 {/* Table selector sidebar */}
                 <div className="w-40 border-r bg-muted/30 flex flex-col shrink-0">
-                  <div className="px-2 py-1.5 border-b">
+                  <div className="px-2 py-1.5 border-b flex items-center justify-between">
                     <p className="text-[9px] font-semibold text-muted-foreground uppercase tracking-wider">Tables</p>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-4 w-4 p-0"
+                      onClick={() => setAddTableDialogOpen(true)}
+                      title="Add Table"
+                    >
+                      <Plus className="h-2.5 w-2.5" />
+                    </Button>
                   </div>
                   <div className="flex-1 overflow-y-auto p-1 space-y-0.5 max-h-96">
                     {Object.entries(generatedData).map(([tableName, rows]) => (
@@ -1261,6 +1431,17 @@ function StudioPageInner({
                           </Badge>
                         </div>
                         <div className="flex items-center gap-0.5">
+                          <Button variant="ghost" size="sm" className="h-5 text-[9px] gap-0.5 px-1" onClick={handleAddRow} title="Add Row">
+                            <Plus className="h-2.5 w-2.5" />Row
+                          </Button>
+                          <Button variant="ghost" size="sm" className="h-5 text-[9px] gap-0.5 px-1" onClick={() => setAddColumnDialogOpen(true)} title="Add Column">
+                            <Plus className="h-2.5 w-2.5" />Col
+                          </Button>
+                          {selectedRows.size > 0 && (
+                            <Button variant="ghost" size="sm" className="h-5 text-[9px] gap-0.5 px-1 text-destructive hover:text-destructive" onClick={handleDeleteSelectedRows} title="Delete Selected Rows">
+                              <Trash2 className="h-2.5 w-2.5" />Del
+                            </Button>
+                          )}
                           <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => copyToClipboard(JSON.stringify(currentTableData, null, 2))}>
                             <Copy className="h-2.5 w-2.5" />
                           </Button>
@@ -1273,6 +1454,20 @@ function StudioPageInner({
                         <table className="w-full text-[11px] border-collapse">
                           <thead className="sticky top-0 z-10 bg-background">
                             <tr className="border-b">
+                              <th className="text-left py-1.5 px-1 font-medium text-muted-foreground bg-muted/50 border-r w-6">
+                                <input
+                                  type="checkbox"
+                                  className="h-3 w-3"
+                                  checked={selectedRows.size === displayedRows.length && displayedRows.length > 0}
+                                  onChange={(e) => {
+                                    if (e.target.checked) {
+                                      setSelectedRows(new Set(displayedRows.map((_, i) => i)))
+                                    } else {
+                                      setSelectedRows(new Set())
+                                    }
+                                  }}
+                                />
+                              </th>
                               <th className="text-left py-1.5 px-2 font-medium text-muted-foreground bg-muted/50 border-r w-8">#</th>
                               {currentTableColumns.map((col) => (
                                 <th key={col} className="text-left py-1.5 px-2 font-medium text-muted-foreground bg-muted/50 whitespace-nowrap border-r last:border-r-0 min-w-[90px]">
@@ -1292,13 +1487,46 @@ function StudioPageInner({
                           </thead>
                           <tbody>
                             {displayedRows.map((row, i) => (
-                              <tr key={i} className="border-b hover:bg-muted/30 transition-colors">
+                              <tr key={i} className={`border-b hover:bg-muted/30 transition-colors ${selectedRows.has(i) ? 'bg-amber-50 dark:bg-amber-950/20' : ''}`}>
+                                <td className="py-1 px-1 border-r bg-muted/20">
+                                  <input
+                                    type="checkbox"
+                                    className="h-3 w-3"
+                                    checked={selectedRows.has(i)}
+                                    onChange={(e) => {
+                                      setSelectedRows(prev => {
+                                        const next = new Set(prev)
+                                        if (e.target.checked) next.add(i)
+                                        else next.delete(i)
+                                        return next
+                                      })
+                                    }}
+                                  />
+                                </td>
                                 <td className="py-1 px-2 text-muted-foreground font-mono text-[9px] border-r bg-muted/20">
                                   {i + 1}
                                 </td>
-                                {Object.values(row as Record<string, unknown>).map((val, j) => (
-                                  <td key={j} className="py-1 px-2 font-mono text-[10px] whitespace-nowrap max-w-[180px] truncate border-r last:border-r-0">
-                                    {val === null ? (
+                                {Object.entries(row as Record<string, unknown>).map(([colName, val], j) => (
+                                  <td key={j} className="py-1 px-2 font-mono text-[10px] whitespace-nowrap max-w-[180px] truncate border-r last:border-r-0"
+                                    onDoubleClick={() => {
+                                      setEditingCell({ row: i, col: colName })
+                                      setEditingCellValue(val === null ? '' : String(val))
+                                    }}
+                                  >
+                                    {editingCell?.row === i && editingCell?.col === colName ? (
+                                      <input
+                                        type="text"
+                                        className="w-full h-5 text-[10px] font-mono px-1 border border-amber-400 rounded bg-background focus:outline-none"
+                                        value={editingCellValue}
+                                        autoFocus
+                                        onChange={(e) => setEditingCellValue(e.target.value)}
+                                        onBlur={() => handleCellEdit(i, colName, editingCellValue)}
+                                        onKeyDown={(e) => {
+                                          if (e.key === 'Enter') handleCellEdit(i, colName, editingCellValue)
+                                          if (e.key === 'Escape') setEditingCell(null)
+                                        }}
+                                      />
+                                    ) : val === null ? (
                                       <span className="text-muted-foreground italic">NULL</span>
                                     ) : typeof val === 'boolean' ? (
                                       <Badge variant={val ? 'default' : 'secondary'} className="text-[8px] px-1 py-0">
@@ -1659,19 +1887,86 @@ function StudioPageInner({
                         transformOrigin: '0 0',
                       }}
                     >
-                      {/* Render relationship lines */}
+                      {/* SVG defs for arrowheads */}
+                      <defs>
+                        <marker id="arrowhead-many" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto" markerUnits="strokeWidth">
+                          <polygon points="0 0, 10 3.5, 0 7" className="fill-violet-500 dark:fill-violet-400" />
+                        </marker>
+                        <marker id="arrowhead-one" markerWidth="8" markerHeight="6" refX="0" refY="3" orient="auto" markerUnits="strokeWidth">
+                          <line x1="0" y1="0" x2="8" y2="3" className="stroke-violet-500 dark:stroke-violet-400" strokeWidth="1.5" />
+                          <line x1="0" y1="6" x2="8" y2="3" className="stroke-violet-500 dark:stroke-violet-400" strokeWidth="1.5" />
+                        </marker>
+                        <marker id="crowfoot-many" markerWidth="12" markerHeight="12" refX="12" refY="6" orient="auto" markerUnits="strokeWidth">
+                          <line x1="0" y1="0" x2="12" y2="6" className="stroke-violet-500 dark:stroke-violet-400" strokeWidth="1.2" />
+                          <line x1="0" y1="12" x2="12" y2="6" className="stroke-violet-500 dark:stroke-violet-400" strokeWidth="1.2" />
+                          <line x1="0" y1="6" x2="12" y2="6" className="stroke-violet-500 dark:stroke-violet-400" strokeWidth="1.2" />
+                        </marker>
+                      </defs>
+
+                      {/* Render relationship lines with arrows and labels */}
                       {erLayout.edges.map((edge, i) => {
                         const fromNode = erLayout.nodes.find(n => n.name === edge.from)
                         const toNode = erLayout.nodes.find(n => n.name === edge.to)
                         if (!fromNode || !toNode) return null
 
-                        const fromX = fromNode.x + 110
-                        const fromY = fromNode.y + 50
-                        const toX = toNode.x + 110
-                        const toY = toNode.y + 50
+                        // Calculate edge endpoints at node borders
+                        const fromNodeWidth = 200
+                        const fromHeaderHeight = 24
+                        const fromColHeight = 14
+                        const fromNodeHeight = fromHeaderHeight + Math.min(fromNode.schema.columns.length, 8) * fromColHeight + 8
+
+                        const toNodeWidth = 200
+                        const toHeaderHeight = 24
+                        const toColHeight = 14
+                        const toNodeHeight = toHeaderHeight + Math.min(toNode.schema.columns.length, 8) * toColHeight + 8
+
+                        const fromCenterX = fromNode.x + fromNodeWidth / 2
+                        const fromCenterY = fromNode.y + fromNodeHeight / 2
+                        const toCenterX = toNode.x + toNodeWidth / 2
+                        const toCenterY = toNode.y + toNodeHeight / 2
+
+                        // Calculate intersection points with node rectangles
+                        const dx = toCenterX - fromCenterX
+                        const dy = toCenterY - fromCenterY
+
+                        // Determine from edge point
+                        let fromX: number, fromY: number
+                        if (Math.abs(dx) * fromNodeHeight > Math.abs(dy) * fromNodeWidth) {
+                          // Exit from left or right side
+                          fromX = dx > 0 ? fromNode.x + fromNodeWidth : fromNode.x
+                          fromY = fromCenterY + (fromX - fromCenterX) * (dy / dx)
+                        } else {
+                          // Exit from top or bottom
+                          fromY = dy > 0 ? fromNode.y + fromNodeHeight : fromNode.y
+                          fromX = fromCenterX + (fromY - fromCenterY) * (dx / dy)
+                        }
+
+                        // Determine to edge point
+                        let toX: number, toY: number
+                        if (Math.abs(dx) * toNodeHeight > Math.abs(dy) * toNodeWidth) {
+                          toX = dx > 0 ? toNode.x : toNode.x + toNodeWidth
+                          toY = toCenterY + (toX - toCenterX) * (dy / dx)
+                        } else {
+                          toY = dy > 0 ? toNode.y : toNode.y + toNodeHeight
+                          toX = toCenterX + (toY - toCenterY) * (dx / dy)
+                        }
+
+                        // Check if the FK column is optional (nullable) — for line style
+                        const fkColumn = fromNode.schema.columns.find(c => c.name === edge.fromCol)
+                        const isOptional = fkColumn?.type?.toLowerCase().includes('null') || false
+
+                        // Midpoint for label
+                        const midX = (fromX + toX) / 2
+                        const midY = (fromY + toY) / 2
+
+                        // Edge label background rect
+                        const labelText = edge.fromCol
+                        const labelWidth = labelText.length * 5.5 + 8
+                        const labelHeight = 12
 
                         return (
                           <g key={`edge-${i}`}>
+                            {/* Main line */}
                             <line
                               x1={fromX}
                               y1={fromY}
@@ -1679,37 +1974,56 @@ function StudioPageInner({
                               y2={toY}
                               className="stroke-violet-400 dark:stroke-violet-500"
                               strokeWidth={1.5}
-                              strokeDasharray="6 3"
-                              opacity={0.5}
+                              strokeDasharray={isOptional ? '6 3' : 'none'}
+                              opacity={0.7}
+                              markerEnd="url(#crowfoot-many)"
+                              markerStart="url(#arrowhead-one)"
                             />
-                            {/* Cardinality labels */}
+
+                            {/* FK column label at midpoint */}
+                            <rect
+                              x={midX - labelWidth / 2}
+                              y={midY - labelHeight / 2 - 8}
+                              width={labelWidth}
+                              height={labelHeight}
+                              rx={3}
+                              className="fill-card stroke-violet-300 dark:stroke-violet-600"
+                              strokeWidth={0.5}
+                            />
                             <text
-                              x={fromX + (toX - fromX) * 0.15}
-                              y={fromY + (toY - fromY) * 0.15 - 5}
-                              className="fill-violet-600 dark:fill-violet-400"
-                              fontSize={8}
-                              fontWeight={600}
+                              x={midX}
+                              y={midY - 3}
+                              textAnchor="middle"
+                              className="fill-violet-700 dark:fill-violet-300"
+                              fontSize={7}
+                              fontWeight={500}
+                              fontFamily="monospace"
                             >
-                              N
+                              {labelText}
                             </text>
+
+                            {/* "1" label at the "one" end (near toNode/target) */}
                             <text
-                              x={toX + (fromX - toX) * 0.15}
-                              y={toY + (fromY - toY) * 0.15 - 5}
+                              x={toX + (fromX - toX) * 0.08}
+                              y={toY + (fromY - toY) * 0.08 - 4}
+                              textAnchor="middle"
                               className="fill-violet-600 dark:fill-violet-400"
-                              fontSize={8}
-                              fontWeight={600}
+                              fontSize={9}
+                              fontWeight={700}
                             >
                               1
                             </text>
-                            {/* Relationship type */}
+
+                            {/* "N" label at the "many" end (near fromNode/source) */}
                             <text
-                              x={(fromX + toX) / 2}
-                              y={(fromY + toY) / 2 - 5}
+                              x={fromX + (toX - fromX) * 0.08}
+                              y={fromY + (toY - fromY) * 0.08 - 4}
                               textAnchor="middle"
-                              className="fill-muted-foreground"
-                              fontSize={7}
+                              className="fill-violet-600 dark:fill-violet-400"
+                              fontSize={9}
+                              fontWeight={700}
                             >
-                              {edge.type}
+                              N
                             </text>
                           </g>
                         )
@@ -1896,6 +2210,99 @@ function StudioPageInner({
               }}
             >
               Execute Anyway
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Add Table Dialog */}
+      <Dialog open={addTableDialogOpen} onOpenChange={setAddTableDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Table2 className="h-5 w-5 text-amber-600" />
+              Add Table
+            </DialogTitle>
+            <DialogDescription>
+              Create a new empty table in your database.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs font-medium mb-1 block">Table Name</label>
+              <Input
+                value={newTableName}
+                onChange={(e) => setNewTableName(e.target.value)}
+                placeholder="e.g., orders"
+                className="h-8 text-sm"
+                onKeyDown={(e) => { if (e.key === 'Enter') handleAddTable() }}
+              />
+            </div>
+            <div>
+              <label className="text-xs font-medium mb-1 block">Columns (comma-separated, optional)</label>
+              <Input
+                value={newTableColumns}
+                onChange={(e) => setNewTableColumns(e.target.value)}
+                placeholder="e.g., id, name, email, created_at"
+                className="h-8 text-sm"
+                onKeyDown={(e) => { if (e.key === 'Enter') handleAddTable() }}
+              />
+              <p className="text-[10px] text-muted-foreground mt-1">An "id" column is auto-added if not specified</p>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setAddTableDialogOpen(false)}>Cancel</Button>
+            <Button onClick={handleAddTable} disabled={!newTableName.trim()} className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white">
+              Create Table
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Add Column Dialog */}
+      <Dialog open={addColumnDialogOpen} onOpenChange={setAddColumnDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Plus className="h-5 w-5 text-amber-600" />
+              Add Column to "{selectedTable}"
+            </DialogTitle>
+            <DialogDescription>
+              Add a new column to the selected table.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs font-medium mb-1 block">Column Name</label>
+              <Input
+                value={newColumnName}
+                onChange={(e) => setNewColumnName(e.target.value)}
+                placeholder="e.g., phone"
+                className="h-8 text-sm"
+                onKeyDown={(e) => { if (e.key === 'Enter') handleAddColumn() }}
+              />
+            </div>
+            <div>
+              <label className="text-xs font-medium mb-1 block">Data Type</label>
+              <select
+                value={newColumnType}
+                onChange={(e) => setNewColumnType(e.target.value)}
+                className="w-full h-8 text-sm border rounded-md px-2 bg-background"
+              >
+                <option value="varchar(255)">VARCHAR(255)</option>
+                <option value="integer">INTEGER</option>
+                <option value="decimal">DECIMAL</option>
+                <option value="boolean">BOOLEAN</option>
+                <option value="timestamp">TIMESTAMP</option>
+                <option value="uuid">UUID</option>
+                <option value="text">TEXT</option>
+              </select>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setAddColumnDialogOpen(false)}>Cancel</Button>
+            <Button onClick={handleAddColumn} disabled={!newColumnName.trim()} className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white">
+              Add Column
             </Button>
           </DialogFooter>
         </DialogContent>

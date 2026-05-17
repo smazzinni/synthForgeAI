@@ -135,7 +135,7 @@ export async function POST(request: NextRequest) {
 
   try {
     const text = await request.text()
-    if (text.length > 50000) {
+    if (text.length > 200000) {
       return new Response(JSON.stringify({ error: 'Message too long' }), {
         status: 413,
         headers: { 'Content-Type': 'application/json' },
@@ -237,7 +237,7 @@ export async function POST(request: NextRequest) {
         model: 'deepseek-reasoner',
         messages,
         stream: true,
-        max_tokens: 8192,
+        max_tokens: 16384,
         stream_options: { include_usage: true },
       }),
     })

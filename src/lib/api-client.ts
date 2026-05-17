@@ -126,7 +126,7 @@ export async function apiPost<T = unknown>(
   options?: ApiClientOptions
 ): Promise<T> {
   const controller = new AbortController()
-  const timeoutMs = options?.timeout ?? 30000 // Longer timeout for POST (AI calls)
+  const timeoutMs = options?.timeout ?? 120000 // Longer timeout for POST (AI calls - up to 120s)
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
 
   try {
