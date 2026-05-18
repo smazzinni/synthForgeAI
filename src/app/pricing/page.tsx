@@ -18,7 +18,7 @@ const plans = [
   },
   {
     name: 'Pro',
-    price: '$49',
+    price: '$19',
     period: '/month',
     description: 'For teams building production applications',
     features: ['Unlimited databases', '100,000 rows per database', 'Multi-agent pipeline', 'All export formats', 'Priority support', 'Team collaboration', 'API access'],
@@ -56,11 +56,10 @@ export default function PricingPage() {
             {plans.map((plan) => (
               <Card
                 key={plan.name}
-                className={`relative ${
-                  plan.popular
+                className={`relative ${plan.popular
                     ? 'border-amber-500 border-2 shadow-lg shadow-amber-500/10'
                     : 'border-border/50'
-                }`}
+                  }`}
               >
                 {plan.popular && (
                   <div className="absolute -top-3 left-1/2 -translate-x-1/2">
@@ -87,11 +86,10 @@ export default function PricingPage() {
                     ))}
                   </ul>
                   <Button
-                    className={`w-full ${
-                      plan.popular
+                    className={`w-full ${plan.popular
                         ? 'bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white'
                         : ''
-                    }`}
+                      }`}
                     variant={plan.popular ? 'default' : 'outline'}
                     asChild
                   >
