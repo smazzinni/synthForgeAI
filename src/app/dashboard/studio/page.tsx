@@ -344,6 +344,7 @@ function StudioPageInner({
   const searchParams = useSearchParams()
 
   // ─── State ───
+  const [currentDatabaseId, setCurrentDatabaseId] = useState<string | undefined>(databaseId)
   const [messages, setMessages] = useState<Message[]>(initialMessages && initialMessages.length > 0 ? initialMessages : [
     {
       id: '1',
@@ -458,7 +459,7 @@ function StudioPageInner({
         })
       } else {
         const result = await apiPost<{ conversationId: string }>('/api/conversations', {
-          databaseId,
+          databaseId: currentDatabaseId,
           title: databaseName || 'New Conversation',
           messages: msgs,
         })
@@ -469,7 +470,7 @@ function StudioPageInner({
     } catch (err) {
       console.warn('[Studio] Failed to save conversation:', err)
     }
-  }, [conversationId, databaseId, databaseName])
+  }, [conversationId, currentDatabaseId, databaseName])
 
   // ─── Send message with DeepSeek streaming ───
   const sendMessage = useCallback(async (messageText?: string) => {
@@ -537,7 +538,7 @@ function StudioPageInner({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: userMessage.content,
-          ...(databaseId ? { databaseId, databaseName } : {}),
+          ...(currentDatabaseId ? { databaseId: currentDatabaseId, databaseName } : {}),
           ...(conversationId ? { conversationId } : {}),
           currentSchema: generatedSchema,
           currentData: dataToSend,
@@ -688,7 +689,7 @@ function StudioPageInner({
       loadingRef.current = false
       setReasoningVisible(false)
     }
-  }, [input, databaseId, databaseName, conversationId, generatedSchema, generatedData, hasGeneratedData, saveConversation])
+  }, [input, currentDatabaseId, databaseName, conversationId, generatedSchema, generatedData, hasGeneratedData, saveConversation])
 
   // Auto-send query from dashboard
   useEffect(() => {
@@ -715,9 +716,9 @@ function StudioPageInner({
     }
 
     try {
-      if (databaseId) {
+      if (currentDatabaseId) {
         await apiPatch('/api/databases', {
-          id: databaseId,
+          id: currentDatabaseId,
           name,
           schema_json: schema,
           data_json: tables,
@@ -736,14 +737,18 @@ function StudioPageInner({
         })
 
         const dbId = result.database?.id
-        if (dbId && Object.keys(tables).length > 0) {
-          try {
-            await apiPatch('/api/databases', {
-              id: dbId,
-              data_json: tables,
-            })
-          } catch {
-            console.warn('[Studio] Failed to save data_json')
+        if (dbId) {
+          // Update the tracked database ID so SQL execution works
+          setCurrentDatabaseId(dbId)
+          if (Object.keys(tables).length > 0) {
+            try {
+              await apiPatch('/api/databases', {
+                id: dbId,
+                data_json: tables,
+              })
+            } catch {
+              console.warn('[Studio] Failed to save data_json')
+            }
           }
         }
       }
@@ -771,10 +776,10 @@ function StudioPageInner({
 
   // ─── Delete database ───
   const deleteDatabase = async () => {
-    if (!databaseId) return
+    if (!currentDatabaseId) return
     if (!confirm('Are you sure you want to delete this database? This cannot be undone.')) return
     try {
-      await apiDelete(`/api/databases?id=${databaseId}`)
+      await apiDelete(`/api/databases?id=${currentDatabaseId}`)
       invalidateCache('/api/databases')
       toast.success('Database deleted')
       router.push('/dashboard')
@@ -828,16 +833,21 @@ function StudioPageInner({
     setQueryHistory(prev => [sql, ...prev.filter(q => q !== sql)].slice(0, 10))
 
     try {
+      // Build request payload - include client data as fallback when no databaseId
+      const payload: Record<string, unknown> = { sql }
+      if (currentDatabaseId) {
+        payload.databaseId = currentDatabaseId
+      } else if (hasGeneratedData) {
+        payload.data = generatedData
+      }
+
       const result = await apiPost<{
         rows?: Record<string, unknown>[]
         columns?: string[]
         error?: string
         executionTime?: number
         rowCount?: number
-      }>('/api/sql/execute', {
-        sql,
-        databaseId,
-      })
+      }>('/api/sql/execute', payload)
 
       if (result.error) {
         toast.error(result.error)
@@ -1345,7 +1355,7 @@ function StudioPageInner({
                   {saving ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : <Save className="h-2.5 w-2.5" />}
                   Save
                 </Button>
-                {databaseId && (
+                {currentDatabaseId && (
                   <Button
                     variant="outline"
                     size="sm"
@@ -1779,11 +1789,11 @@ function StudioPageInner({
             <TabsContent value="explorer" className="flex-1 overflow-hidden m-0">
               <div className="flex h-full">
                 {/* Schema tree sidebar */}
-                <div className="w-56 border-r bg-muted/30 flex flex-col shrink-0">
-                  <div className="px-2 py-1.5 border-b">
+                <div className="w-56 border-r bg-muted/30 flex flex-col shrink-0 overflow-hidden">
+                  <div className="px-2 py-1.5 border-b shrink-0">
                     <p className="text-[9px] font-semibold text-muted-foreground uppercase tracking-wider">Schema Tree</p>
                   </div>
-                  <ScrollArea className="flex-1 p-1.5">
+                  <ScrollArea className="flex-1 min-h-0 p-1.5">
                     <div className="space-y-1.5">
                       {generatedSchema.map((table) => {
                         const tableData = generatedData[table.name] as Record<string, unknown>[] | undefined
@@ -1889,17 +1899,23 @@ function StudioPageInner({
                     >
                       {/* SVG defs for arrowheads */}
                       <defs>
-                        <marker id="arrowhead-many" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto" markerUnits="strokeWidth">
-                          <polygon points="0 0, 10 3.5, 0 7" className="fill-violet-500 dark:fill-violet-400" />
+                        {/* Arrow pointing to the "many" side (filled triangle) */}
+                        <marker id="arrowhead-many" markerWidth="12" markerHeight="8" refX="12" refY="4" orient="auto" markerUnits="strokeWidth">
+                          <path d="M0,0 L12,4 L0,8 L3,4 Z" fill="#8b5cf6" />
                         </marker>
-                        <marker id="arrowhead-one" markerWidth="8" markerHeight="6" refX="0" refY="3" orient="auto" markerUnits="strokeWidth">
-                          <line x1="0" y1="0" x2="8" y2="3" className="stroke-violet-500 dark:stroke-violet-400" strokeWidth="1.5" />
-                          <line x1="0" y1="6" x2="8" y2="3" className="stroke-violet-500 dark:stroke-violet-400" strokeWidth="1.5" />
+                        {/* "One" indicator — single perpendicular line */}
+                        <marker id="arrowhead-one" markerWidth="8" markerHeight="12" refX="4" refY="6" orient="auto" markerUnits="strokeWidth">
+                          <line x1="4" y1="0" x2="4" y2="12" stroke="#8b5cf6" strokeWidth="2" />
                         </marker>
-                        <marker id="crowfoot-many" markerWidth="12" markerHeight="12" refX="12" refY="6" orient="auto" markerUnits="strokeWidth">
-                          <line x1="0" y1="0" x2="12" y2="6" className="stroke-violet-500 dark:stroke-violet-400" strokeWidth="1.2" />
-                          <line x1="0" y1="12" x2="12" y2="6" className="stroke-violet-500 dark:stroke-violet-400" strokeWidth="1.2" />
-                          <line x1="0" y1="6" x2="12" y2="6" className="stroke-violet-500 dark:stroke-violet-400" strokeWidth="1.2" />
+                        {/* Crow's foot for "many" side */}
+                        <marker id="crowfoot-many" markerWidth="14" markerHeight="14" refX="14" refY="7" orient="auto" markerUnits="strokeWidth">
+                          <line x1="0" y1="0" x2="14" y2="7" stroke="#8b5cf6" strokeWidth="1.5" />
+                          <line x1="0" y1="14" x2="14" y2="7" stroke="#8b5cf6" strokeWidth="1.5" />
+                          <line x1="0" y1="7" x2="14" y2="7" stroke="#8b5cf6" strokeWidth="1.5" />
+                        </marker>
+                        {/* Simple filled arrow for the "to" end */}
+                        <marker id="arrow-filled" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto" markerUnits="strokeWidth">
+                          <polygon points="0,0 10,3.5 0,7" fill="#7c3aed" />
                         </marker>
                       </defs>
 
@@ -1966,35 +1982,45 @@ function StudioPageInner({
 
                         return (
                           <g key={`edge-${i}`}>
-                            {/* Main line */}
+                            {/* Background line (wider, semi-transparent for glow effect) */}
                             <line
                               x1={fromX}
                               y1={fromY}
                               x2={toX}
                               y2={toY}
-                              className="stroke-violet-400 dark:stroke-violet-500"
-                              strokeWidth={1.5}
-                              strokeDasharray={isOptional ? '6 3' : 'none'}
-                              opacity={0.7}
-                              markerEnd="url(#crowfoot-many)"
-                              markerStart="url(#arrowhead-one)"
+                              stroke="#8b5cf6"
+                              strokeWidth={4}
+                              strokeDasharray={isOptional ? '8 4' : 'none'}
+                              opacity={0.15}
+                            />
+                            {/* Main connection line */}
+                            <line
+                              x1={fromX}
+                              y1={fromY}
+                              x2={toX}
+                              y2={toY}
+                              stroke="#7c3aed"
+                              strokeWidth={2}
+                              strokeDasharray={isOptional ? '8 4' : 'none'}
+                              markerEnd="url(#arrow-filled)"
                             />
 
                             {/* FK column label at midpoint */}
                             <rect
                               x={midX - labelWidth / 2}
-                              y={midY - labelHeight / 2 - 8}
+                              y={midY - labelHeight / 2 - 9}
                               width={labelWidth}
                               height={labelHeight}
                               rx={3}
-                              className="fill-card stroke-violet-300 dark:stroke-violet-600"
-                              strokeWidth={0.5}
+                              fill="#ffffff"
+                              stroke="#8b5cf6"
+                              strokeWidth={0.8}
                             />
                             <text
                               x={midX}
                               y={midY - 3}
                               textAnchor="middle"
-                              className="fill-violet-700 dark:fill-violet-300"
+                              fill="#6d28d9"
                               fontSize={7}
                               fontWeight={500}
                               fontFamily="monospace"
@@ -2004,11 +2030,11 @@ function StudioPageInner({
 
                             {/* "1" label at the "one" end (near toNode/target) */}
                             <text
-                              x={toX + (fromX - toX) * 0.08}
-                              y={toY + (fromY - toY) * 0.08 - 4}
+                              x={toX + (fromX - toX) * 0.1}
+                              y={toY + (fromY - toY) * 0.1 - 5}
                               textAnchor="middle"
-                              className="fill-violet-600 dark:fill-violet-400"
-                              fontSize={9}
+                              fill="#7c3aed"
+                              fontSize={10}
                               fontWeight={700}
                             >
                               1
@@ -2016,11 +2042,11 @@ function StudioPageInner({
 
                             {/* "N" label at the "many" end (near fromNode/source) */}
                             <text
-                              x={fromX + (toX - fromX) * 0.08}
-                              y={fromY + (toY - fromY) * 0.08 - 4}
+                              x={fromX + (toX - fromX) * 0.1}
+                              y={fromY + (toY - fromY) * 0.1 - 5}
                               textAnchor="middle"
-                              className="fill-violet-600 dark:fill-violet-400"
-                              fontSize={9}
+                              fill="#7c3aed"
+                              fontSize={10}
                               fontWeight={700}
                             >
                               N
@@ -2050,7 +2076,7 @@ function StudioPageInner({
                               width={nodeWidth}
                               height={nodeHeight}
                               rx={6}
-                              className="fill-black/5 dark:fill-black/20"
+                              fill="rgba(0,0,0,0.08)"
                             />
                             {/* Main box */}
                             <rect
@@ -2059,8 +2085,9 @@ function StudioPageInner({
                               width={nodeWidth}
                               height={nodeHeight}
                               rx={6}
-                              className="fill-card stroke-amber-500/50"
-                              strokeWidth={selectedTable === node.name ? 2 : 1}
+                              fill="#ffffff"
+                              stroke={selectedTable === node.name ? '#d97706' : '#f59e0b'}
+                              strokeWidth={selectedTable === node.name ? 2.5 : 1}
                             />
                             {/* Header */}
                             <rect
@@ -2069,20 +2096,20 @@ function StudioPageInner({
                               width={nodeWidth}
                               height={headerHeight}
                               rx={6}
-                              className="fill-amber-100 dark:fill-amber-900/40"
+                              fill="#fef3c7"
                             />
                             <rect
                               x={node.x}
                               y={node.y + headerHeight - 6}
                               width={nodeWidth}
                               height={6}
-                              className="fill-amber-100 dark:fill-amber-900/40"
+                              fill="#fef3c7"
                             />
                             {/* Table name */}
                             <text
                               x={node.x + 10}
                               y={node.y + 16}
-                              className="fill-amber-800 dark:fill-amber-300"
+                              fill="#92400e"
                               fontSize={10}
                               fontWeight={700}
                             >
@@ -2093,7 +2120,7 @@ function StudioPageInner({
                               x={node.x + nodeWidth - 10}
                               y={node.y + 16}
                               textAnchor="end"
-                              className="fill-muted-foreground"
+                              fill="#6b7280"
                               fontSize={8}
                             >
                               {node.rows} rows
@@ -2104,7 +2131,7 @@ function StudioPageInner({
                                 <text
                                   x={node.x + 10}
                                   y={node.y + headerHeight + 10 + ci * colHeight}
-                                  className={col.name === 'id' || col.name.endsWith('_id') ? 'fill-amber-700 dark:fill-amber-400' : 'fill-foreground'}
+                                  fill={col.name === 'id' || col.name.endsWith('_id') ? '#b45309' : '#374151'}
                                   fontSize={8}
                                   fontFamily="monospace"
                                 >
@@ -2114,7 +2141,7 @@ function StudioPageInner({
                                   x={node.x + nodeWidth - 10}
                                   y={node.y + headerHeight + 10 + ci * colHeight}
                                   textAnchor="end"
-                                  className="fill-muted-foreground"
+                                  fill="#9ca3af"
                                   fontSize={7}
                                   fontFamily="monospace"
                                 >
@@ -2126,7 +2153,7 @@ function StudioPageInner({
                               <text
                                 x={node.x + 10}
                                 y={node.y + headerHeight + 10 + 8 * colHeight}
-                                className="fill-muted-foreground"
+                                fill="#9ca3af"
                                 fontSize={7}
                               >
                                 +{node.schema.columns.length - 8} more columns...

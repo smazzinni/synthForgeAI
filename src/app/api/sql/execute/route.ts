@@ -15,7 +15,7 @@ const DANGEROUS_PATTERNS = [
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { sql, databaseId } = body as { sql: string; databaseId?: string }
+    const { sql, databaseId, data: clientData } = body as { sql: string; databaseId?: string; data?: Record<string, unknown[]> }
 
     if (!sql || typeof sql !== 'string') {
       return NextResponse.json({ error: 'SQL query is required' }, { status: 400 })
@@ -60,8 +60,10 @@ export async function POST(request: NextRequest) {
       // Use Supabase's rpc() or from() based approach
       // Since we can't execute raw SQL directly, we'll work with the stored data
 
+      let dataJson: Record<string, unknown[]> = {}
+
       if (databaseId) {
-        // Fetch the database data
+        // Fetch the database data from Supabase
         const { data: db, error: dbError } = await admin
           .from('synthetic_databases')
           .select('data_json, schema_json')
@@ -72,23 +74,26 @@ export async function POST(request: NextRequest) {
           return NextResponse.json({ error: 'Database not found' }, { status: 404 })
         }
 
-        const dataJson = db.data_json as Record<string, unknown[]> || {}
-        const result = executeSQLAgainstData(trimmedSql, dataJson)
-        const executionTime = Date.now() - startTime
-
-        return NextResponse.json({
-          rows: result.rows,
-          columns: result.columns,
-          rowCount: result.rows.length,
-          executionTime,
-          sql: trimmedSql,
-        })
+        dataJson = db.data_json as Record<string, unknown[]> || {}
+      } else if (clientData && Object.keys(clientData).length > 0) {
+        // Use client-side data when no databaseId is available
+        dataJson = clientData
       } else {
-        // No database context - can't execute
         return NextResponse.json({
-          error: 'No database selected. Please select a database to execute SQL against.',
+          error: 'No database selected. Please generate some data first before executing SQL.',
         }, { status: 400 })
       }
+
+      const result = executeSQLAgainstData(trimmedSql, dataJson)
+      const executionTime = Date.now() - startTime
+
+      return NextResponse.json({
+        rows: result.rows,
+        columns: result.columns,
+        rowCount: result.rows.length,
+        executionTime,
+        sql: trimmedSql,
+      })
     } catch (execError) {
       const executionTime = Date.now() - startTime
       return NextResponse.json({

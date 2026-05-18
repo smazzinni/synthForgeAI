@@ -83,3 +83,27 @@
 4. After streaming completes and `parseAIResponse` cleans the content, `interactiveOptions` are preserved on the message (explicitly carried through in the setMessages update)
 
 **Files changed:** `src/app/dashboard/studio/page.tsx`, `src/lib/ai-agents.ts`
+---
+Task ID: 1
+Agent: Main Agent
+Task: Fix SQL execution error, Schema Tree scrollbar, and Explorer SVG connections
+
+Work Log:
+- Fixed SQL "No database selected" error by:
+  - Added `currentDatabaseId` state to track databaseId that updates when auto-save creates a new database
+  - Modified `/api/sql/execute/route.ts` to accept `data` (client-side data) as fallback when no `databaseId` is provided
+  - Updated `executeSQL()` in page.tsx to send `generatedData` when `currentDatabaseId` is not available
+  - Updated all references from `databaseId` to `currentDatabaseId` in save, delete, chat, and conversation functions
+- Fixed Schema Tree scrollbar by adding `overflow-hidden` to the flex container and `min-h-0` to the ScrollArea
+- Fixed SVG connection arrows by:
+  - Replaced className-based SVG styling with explicit fill/stroke attributes (className doesn't resolve reliably in SVG context)
+  - Added a proper `arrow-filled` marker with a solid triangle for the "to" end
+  - Added a glow effect line (wider, semi-transparent) behind the main connection line
+  - Increased stroke width from 1.5 to 2 for better visibility
+  - Used explicit hex colors instead of Tailwind classes for SVG elements
+  - Fixed the label background rect to use explicit `fill="#ffffff"` instead of `className="fill-card"`
+
+Stage Summary:
+- SQL execution now works with or without a databaseId (uses client-side data as fallback)
+- Schema Tree has proper scrollbar when content overflows
+- SVG connection lines with arrows are now visible with proper rendering using explicit SVG attributes
