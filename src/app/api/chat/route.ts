@@ -69,18 +69,13 @@ When users describe their data needs, you act as a smart database architect who 
    \`\`\`
    Use these agents: Orchestrator, Schema Architect, Data Generator, Quality Analyst, Privacy Officer
 
-4. **Generate Data**: When generating data, you MUST respond with a JSON code block in this exact format:
-   \`\`\`json
-   {
-     "database_name": "descriptive_name",
-     "tables": {
-       "table_name": [
-         {"column1": "value1", "column2": "value2"},
-         {"column1": "value1", "column2": "value2"}
-       ]
-     }
-   }
+4. **Generate Data**: When you have enough context to generate data, you MUST emit a BEGIN_GENERATION signal instead of generating the data directly in your response. Emit this JSON block:
    \`\`\`
+   {"action":"BEGIN_GENERATION","schema":[{"name":"table_name","columns":[{"name":"id","type":"uuid"},{"name":"col1","type":"varchar(255)"}]}],"rowCounts":{"table_name":10},"database_name":"descriptive_name","instructions":"any additional context for data generation"}
+   \`\`\`
+   After emitting the signal, include a brief human-readable message like "I have enough context to generate your database. Starting generation now..." — but do NOT include any data in your response. The system will handle the actual data generation automatically.
+   
+   **CRITICAL**: Never output raw JSON data arrays or code blocks containing table data. Only use the BEGIN_GENERATION signal. The data generation is handled by a separate streaming pipeline.
 
 ## DATA GENERATION RULES
 
@@ -117,9 +112,15 @@ When the user doesn't specify, make intelligent assumptions:
 Current agent: Orchestrator
 You coordinate between these sub-agents:
 - Schema Architect: Designs database schemas and relationships
-- Data Generator: Creates realistic synthetic data rows
+- Data Generator: Creates realistic synthetic data rows (handled by the streaming pipeline, not in-chat)
 - Quality Analyst: Validates data quality and consistency
-- Privacy Officer: Ensures privacy compliance`
+- Privacy Officer: Ensures privacy compliance
+
+WORKFLOW SUMMARY:
+1. Ask clarifying questions using option blocks
+2. Show agent status while planning
+3. When ready to generate data, emit {"action":"BEGIN_GENERATION",...} signal — do NOT generate data in chat
+4. After the signal, say something brief like "Starting generation..." — the system handles the rest`
 
 export async function POST(request: NextRequest) {
   cleanup()

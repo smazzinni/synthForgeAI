@@ -60,15 +60,28 @@ import {
   parseAgentStatus,
   parseInteractiveOptions,
   parseAllInteractiveOptions,
+  parseBeginGeneration,
   cleanDisplayText,
   isDestructiveSQL,
   getAgentByName,
   type AgentStatus,
   type InteractiveOptions,
   type OptionChoice,
+  type BeginGenerationSignal,
 } from '@/lib/ai-agents'
 
 // ─── Types ───
+interface GenerationProgress {
+  isGenerating: boolean
+  currentTable: string
+  rowsInserted: number
+  totalInserted: number
+  targetRows: number
+  tablesGenerated: number
+  statusMessages: string[]
+  databaseId?: string
+}
+
 interface Message {
   id: string
   role: 'user' | 'assistant' | 'system'
@@ -77,6 +90,7 @@ interface Message {
   agentName?: string
   agentStatus?: AgentStatus | null
   interactiveOptions?: InteractiveOptions | null
+  generationProgress?: GenerationProgress | null
   timestamp: Date
   isStreaming?: boolean
   tables?: Record<string, unknown[]> | null
@@ -390,6 +404,18 @@ function StudioPageInner({
   const [chatWidth, setChatWidth] = useState(340)
   const [isResizing, setIsResizing] = useState(false)
 
+  // Streaming generation state
+  const [generationProgress, setGenerationProgress] = useState<GenerationProgress>({
+    isGenerating: false,
+    currentTable: '',
+    rowsInserted: 0,
+    totalInserted: 0,
+    targetRows: 0,
+    tablesGenerated: 0,
+    statusMessages: [],
+  })
+  const generationAbortRef = useRef<AbortController | null>(null)
+
   const chatEndRef = useRef<HTMLDivElement>(null)
   const chatContainerRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -636,7 +662,41 @@ function StudioPageInner({
           : m
       ))
 
-      // Parse the response for tables/data
+      // Check for BEGIN_GENERATION signal first
+      const beginGenSignal = parseBeginGeneration(fullContent)
+
+      if (beginGenSignal) {
+        // Clean the display text — remove the BEGIN_GENERATION signal
+        const displayText = cleanDisplayText(fullContent)
+        const cleanText = displayText.replace(/<think[\s\S]*?<\/think>/gi, '').trim()
+
+        // Update the message with cleaned text (no signal, no raw data)
+        setMessages(prev => prev.map(m =>
+          m.id === assistantId
+            ? { ...m, content: cleanText || 'Starting database generation...', interactiveOptions: null }
+            : m
+        ))
+
+        // Set the schema immediately from the signal
+        if (beginGenSignal.schema && beginGenSignal.schema.length > 0) {
+          setGeneratedSchema(beginGenSignal.schema)
+        }
+        if (beginGenSignal.databaseName) {
+          setDatabaseName(beginGenSignal.databaseName)
+        }
+
+        // Trigger the streaming generation pipeline
+        setLoading(false)
+        loadingRef.current = false
+        setReasoningVisible(false)
+        setCurrentReasoning('')
+
+        // Start streaming generation in the background
+        startStreamingGeneration(beginGenSignal, assistantId)
+        return
+      }
+
+      // Fallback: Parse the response for tables/data (legacy path — kept for backward compatibility)
       if (fullContent) {
         const { tables, databaseName: parsedName, displayText } = parseAIResponse(fullContent)
 
@@ -898,10 +958,365 @@ function StudioPageInner({
     sendMessage(choice.value)
   }
 
+  // ─── Start streaming data generation ───
+  const startStreamingGeneration = async (signal: BeginGenerationSignal, assistantId: string) => {
+    const controller = new AbortController()
+    generationAbortRef.current = controller
+
+    const genProgressId = (Date.now() + 2).toString()
+
+    setGenerationProgress({
+      isGenerating: true,
+      currentTable: '',
+      rowsInserted: 0,
+      totalInserted: 0,
+      targetRows: Object.values(signal.rowCounts).reduce((s, n) => s + n, 0),
+      tablesGenerated: 0,
+      statusMessages: ['Generating database schema...'],
+      databaseId: currentDatabaseId,
+    })
+
+    // Add a generation progress message to chat
+    setMessages(prev => [...prev, {
+      id: genProgressId,
+      role: 'assistant' as const,
+      content: '',
+      agentName: 'Data Generator',
+      generationProgress: {
+        isGenerating: true,
+        currentTable: '',
+        rowsInserted: 0,
+        totalInserted: 0,
+        targetRows: Object.values(signal.rowCounts).reduce((s, n) => s + n, 0),
+        tablesGenerated: 0,
+        statusMessages: ['Generating database schema...'],
+      },
+      timestamp: new Date(),
+    }])
+
+    try {
+      // Build conversation history for context
+      const history = messagesRef.current
+        .filter(m => m.role === 'user' || m.role === 'assistant')
+        .map(m => ({ role: m.role, content: m.content }))
+
+      const response = await fetch('/api/generate-stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          databaseId: currentDatabaseId,
+          databaseName: signal.databaseName || databaseName,
+          schema: signal.schema,
+          rowCounts: signal.rowCounts,
+          instructions: signal.instructions,
+          conversationHistory: history,
+        }),
+        signal: controller.signal,
+      })
+
+      if (!response.ok) {
+        throw new Error(`Generation API error: ${response.status}`)
+      }
+
+      const reader = response.body?.getReader()
+      if (!reader) throw new Error('No response stream')
+
+      const decoder = new TextDecoder()
+      let sseBuffer = ''
+      const accumulatedData: Record<string, unknown[]> = {}
+      let totalInserted = 0
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        sseBuffer += decoder.decode(value, { stream: true })
+        const sseLines = sseBuffer.split('\n')
+        sseBuffer = sseLines.pop() || ''
+
+        for (const sseLine of sseLines) {
+          const trimmed = sseLine.trim()
+          if (!trimmed || !trimmed.startsWith('data: ')) continue
+
+          const sseData = trimmed.slice(6)
+          try {
+            const event = JSON.parse(sseData)
+
+            if (event.type === 'database_created' && event.databaseId) {
+              setCurrentDatabaseId(event.databaseId)
+              setGenerationProgress(prev => ({ ...prev, databaseId: event.databaseId }))
+            }
+
+            if (event.type === 'progress') {
+              const statusMsg = event.message
+                || (event.table
+                  ? `Streaming records into [${event.table}] — ${event.totalInserted || 0} rows`
+                  : `${event.totalInserted || 0} rows inserted`)
+
+              setGenerationProgress(prev => ({
+                ...prev,
+                currentTable: event.table || prev.currentTable,
+                rowsInserted: event.rowsInserted || 0,
+                totalInserted: event.totalInserted || prev.totalInserted,
+                targetRows: event.targetRows || prev.targetRows,
+                statusMessages: [...prev.statusMessages.slice(-5), statusMsg],
+              }))
+
+              // Update the progress message in chat
+              setMessages(prev => prev.map(m =>
+                m.id === genProgressId
+                  ? {
+                    ...m,
+                    generationProgress: {
+                      isGenerating: true,
+                      currentTable: event.table || '',
+                      rowsInserted: event.rowsInserted || 0,
+                      totalInserted: event.totalInserted || 0,
+                      targetRows: event.targetRows || 0,
+                      tablesGenerated: 0,
+                      statusMessages: [...(m.generationProgress?.statusMessages || []).slice(-5), statusMsg],
+                    },
+                  }
+                  : m
+              ))
+            }
+
+            if (event.type === 'table_complete') {
+              const tableName = event.table || ''
+              const tableRows = event.totalRows || 0
+
+              // Extract schema for this table
+              const tableSchema = signal.schema.find(s => s.name === tableName)
+              if (tableSchema && !accumulatedData[tableName]) {
+                // Update schema
+                setGeneratedSchema(prev => {
+                  const existing = prev.find(t => t.name === tableName)
+                  if (!existing) return [...prev, tableSchema]
+                  return prev
+                })
+              }
+
+              const completeMsg = `[${tableName}] — ${tableRows.toLocaleString()} rows inserted`
+
+              setGenerationProgress(prev => ({
+                ...prev,
+                tablesGenerated: prev.tablesGenerated + 1,
+                statusMessages: [...prev.statusMessages.slice(-5), completeMsg],
+              }))
+
+              setMessages(prev => prev.map(m =>
+                m.id === genProgressId
+                  ? {
+                    ...m,
+                    generationProgress: {
+                      ...m.generationProgress!,
+                      tablesGenerated: (m.generationProgress?.tablesGenerated || 0) + 1,
+                      statusMessages: [...(m.generationProgress?.statusMessages || []).slice(-5), completeMsg],
+                    },
+                  }
+                  : m
+              ))
+            }
+
+            if (event.type === 'complete') {
+              const durationSec = ((event.durationMs || 0) / 1000).toFixed(1)
+              const totalRows = event.totalRows || 0
+              const tablesGen = event.tablesGenerated || 0
+
+              // Update all the data at once from the server
+              // Fetch the full database data from Supabase
+              if (currentDatabaseId || generationProgress.databaseId) {
+                try {
+                  const dbId = currentDatabaseId || generationProgress.databaseId
+                  const dbResult = await apiGet<{ database?: { data_json: Record<string, unknown[]>; schema_json: SchemaTable[] } }>(`/api/databases?id=${dbId}`)
+                  if (dbResult.database?.data_json) {
+                    setGeneratedData(dbResult.database.data_json)
+                  }
+                  if (dbResult.database?.schema_json) {
+                    setGeneratedSchema(dbResult.database.schema_json)
+                  }
+                } catch {
+                  // Fallback: use accumulated data
+                  if (Object.keys(accumulatedData).length > 0) {
+                    setGeneratedData(accumulatedData)
+                  }
+                }
+              }
+
+              const finalMsg = `Generation complete — ${totalRows.toLocaleString()} rows across ${tablesGen} tables (${durationSec}s)`
+
+              setGenerationProgress(prev => ({
+                ...prev,
+                isGenerating: false,
+                tablesGenerated: tablesGen,
+                totalInserted: totalRows,
+                statusMessages: [...prev.statusMessages.slice(-5), finalMsg],
+              }))
+
+              // Update the progress message to show completion
+              setMessages(prev => prev.map(m =>
+                m.id === genProgressId
+                  ? {
+                    ...m,
+                    content: finalMsg,
+                    generationProgress: {
+                      isGenerating: false,
+                      currentTable: '',
+                      rowsInserted: totalRows,
+                      totalInserted: totalRows,
+                      targetRows: totalRows,
+                      tablesGenerated: tablesGen,
+                      statusMessages: [...(m.generationProgress?.statusMessages || []).slice(-5), finalMsg],
+                    },
+                  }
+                  : m
+              ))
+
+              // Update database name
+              if (signal.databaseName) setDatabaseName(signal.databaseName)
+
+              toast.success(`Database generated: ${totalRows.toLocaleString()} rows across ${tablesGen} tables`)
+              invalidateCache('/api/databases')
+            }
+
+            if (event.type === 'error') {
+              const errorMsg = event.message || 'Generation failed'
+
+              setGenerationProgress(prev => ({
+                ...prev,
+                isGenerating: false,
+                statusMessages: [...prev.statusMessages, `Error: ${errorMsg}`],
+              }))
+
+              setMessages(prev => prev.map(m =>
+                m.id === genProgressId
+                  ? {
+                    ...m,
+                    content: `Generation error: ${errorMsg}`,
+                    generationProgress: {
+                      ...m.generationProgress!,
+                      isGenerating: false,
+                      statusMessages: [...(m.generationProgress?.statusMessages || []), `Error: ${errorMsg}`],
+                    },
+                  }
+                  : m
+              ))
+
+              if (event.recoverable) {
+                toast.warning(`Generation partially completed: ${errorMsg}`)
+              } else {
+                toast.error(`Generation failed: ${errorMsg}`)
+              }
+            }
+          } catch {
+            // Skip unparseable SSE events
+          }
+        }
+      }
+
+      // Final cleanup
+      setGenerationProgress(prev => ({ ...prev, isGenerating: false }))
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') return
+
+      const errorMsg = err instanceof Error ? err.message : 'Generation failed'
+
+      setGenerationProgress(prev => ({
+        ...prev,
+        isGenerating: false,
+        statusMessages: [...prev.statusMessages, `Error: ${errorMsg}`],
+      }))
+
+      setMessages(prev => prev.map(m =>
+        m.id === genProgressId
+          ? {
+            ...m,
+            content: `Generation error: ${errorMsg}`,
+            generationProgress: m.generationProgress
+              ? { ...m.generationProgress, isGenerating: false }
+              : null,
+          }
+          : m
+      ))
+
+      toast.error(`Generation failed: ${errorMsg}`)
+    }
+  }
+
   // ─── Render formatted message content ───
   const renderMessageContent = (message: Message) => {
     if (message.role === 'user') {
       return <span className="whitespace-pre-wrap break-words" style={{ overflowWrap: 'break-word', wordBreak: 'break-word' }}>{message.content}</span>
+    }
+
+    // ─── Render generation progress UI ───
+    if (message.generationProgress) {
+      const gp = message.generationProgress
+      const progressPercent = gp.targetRows > 0 ? Math.min(100, Math.round((gp.totalInserted / gp.targetRows) * 100)) : 0
+
+      return (
+        <div className="space-y-2">
+          {/* Progress bar */}
+          <div className="flex items-center gap-2">
+            {gp.isGenerating && <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-500 shrink-0" />}
+            {!gp.isGenerating && gp.totalInserted > 0 && <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500 shrink-0" />}
+            <div className="flex-1">
+              <div className="flex items-center justify-between mb-0.5">
+                <span className="text-[10px] font-medium text-foreground">
+                  {gp.isGenerating ? 'Generating...' : 'Complete'}
+                </span>
+                <span className="text-[9px] text-muted-foreground">{progressPercent}%</span>
+              </div>
+              <div className="w-full h-1.5 bg-muted rounded-full overflow-hidden">
+                <div
+                  className={`h-full rounded-full transition-all duration-500 ${gp.isGenerating ? 'bg-emerald-500' : 'bg-emerald-600'}`}
+                  style={{ width: `${progressPercent}%` }}
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Current table */}
+          {gp.currentTable && gp.isGenerating && (
+            <div className="flex items-center gap-1.5 text-[9px]">
+              <div className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+              <span className="text-muted-foreground">Streaming into</span>
+              <span className="font-mono font-semibold text-emerald-600 dark:text-emerald-400">[{gp.currentTable}]</span>
+              <span className="text-muted-foreground">—</span>
+              <span className="font-mono">{gp.totalInserted.toLocaleString()}</span>
+              <span className="text-muted-foreground">/ {gp.targetRows.toLocaleString()} rows</span>
+            </div>
+          )}
+
+          {/* Status messages */}
+          {gp.statusMessages.length > 0 && (
+            <div className="space-y-0.5 pl-1">
+              {gp.statusMessages.slice(-5).map((msg, i) => (
+                <div key={i} className="text-[9px] flex items-center gap-1">
+                  {msg.startsWith('[') && msg.includes('rows inserted') ? (
+                    <span className="text-emerald-600 dark:text-emerald-400 font-medium">{msg}</span>
+                  ) : msg.startsWith('Error') ? (
+                    <span className="text-destructive font-medium">{msg}</span>
+                  ) : msg.startsWith('Generation complete') ? (
+                    <span className="text-emerald-600 dark:text-emerald-400 font-semibold">{msg}</span>
+                  ) : (
+                    <span className="text-muted-foreground">{msg}</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Summary when complete */}
+          {!gp.isGenerating && gp.tablesGenerated > 0 && (
+            <div className="flex items-center gap-2 text-[9px] text-muted-foreground pt-0.5 border-t border-border/50">
+              <span>{gp.tablesGenerated} tables</span>
+              <span>·</span>
+              <span>{gp.totalInserted.toLocaleString()} rows</span>
+            </div>
+          )}
+        </div>
+      )
     }
 
     let content = message.content

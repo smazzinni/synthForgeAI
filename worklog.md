@@ -107,3 +107,58 @@ Stage Summary:
 - SQL execution now works with or without a databaseId (uses client-side data as fallback)
 - Schema Tree has proper scrollbar when content overflows
 - SVG connection lines with arrows are now visible with proper rendering using explicit SVG attributes
+---
+Task ID: 2
+Agent: Main Agent
+Task: Implement Streaming Database Generation Architecture
+
+Work Log:
+- Created `/api/generate-stream/route.ts` — SSE streaming generation endpoint:
+  - Accepts generation signal with schema, rowCounts, instructions, and conversation history
+  - Opens SSE connection to frontend
+  - Calls DeepSeek AI with NDJSON-only generation prompt
+  - Parses AI output line-by-line using ###TABLE:marker### format
+  - Batch inserts records into Supabase (200 rows/batch or 300ms interval)
+  - Emits SSE progress events: progress, table_complete, complete, error, database_created
+  - Auto-creates database record in Supabase if no databaseId provided
+  - Handles malformed NDJSON lines gracefully (skip + log, never crash)
+  - Updates database status to 'generating' → 'ready' on completion
+  - Sends final data_json update on completion
+
+- Updated `/lib/ai-agents.ts`:
+  - Added `BeginGenerationSignal` interface
+  - Added `parseBeginGeneration()` function to detect {"action":"BEGIN_GENERATION",...} signals
+  - Added BEGIN_GENERATION block removal in `cleanDisplayText()`
+
+- Updated `/api/chat/route.ts` system prompt:
+  - Replaced direct JSON data generation instruction with BEGIN_GENERATION signal
+  - AI now emits {"action":"BEGIN_GENERATION","schema":[...],"rowCounts":{...}} instead of raw data
+  - Added WORKFLOW SUMMARY to reinforce the new flow
+  - Kept Q&A phase instructions completely unchanged
+
+- Updated `/app/dashboard/studio/page.tsx`:
+  - Added `GenerationProgress` interface and state
+  - Added `generationAbortRef` for cancellation support
+  - Added `startStreamingGeneration()` function that:
+    - Calls `/api/generate-stream` endpoint
+    - Subscribes to SSE events
+    - Updates progress bar, current table, row counts in real-time
+    - Fetches full data from Supabase on completion
+    - Handles errors with recoverable/non-recoverable distinction
+  - Modified `sendMessage()` to detect BEGIN_GENERATION signal and trigger streaming
+  - Kept legacy parseAIResponse path as fallback for backward compatibility
+  - Added generation progress UI in `renderMessageContent()`:
+    - Animated progress bar with percentage
+    - Current table streaming indicator
+    - Status messages (green for success, red for errors)
+    - Summary on completion (tables count, rows count)
+  - Schema is set immediately from the BEGIN_GENERATION signal
+  - Data is loaded from Supabase after generation completes
+
+Stage Summary:
+- New streaming architecture fully implemented
+- Q&A phase untouched — only generation and insertion phases replaced
+- Chat shows progress UI instead of raw JSON
+- Database updates continuously throughout generation
+- Malformed NDJSON lines are skipped, stream continues
+- Build passes successfully with new /api/generate-stream route

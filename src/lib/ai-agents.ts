@@ -236,8 +236,54 @@ export function parseInteractiveOptions(content: string): InteractiveOptions | n
   return all.length > 0 ? all[all.length - 1] : null
 }
 
+// ─── BEGIN_GENERATION signal types ───
+export interface BeginGenerationSignal {
+  action: 'BEGIN_GENERATION'
+  schema: Array<{ name: string; columns: Array<{ name: string; type: string }> }>
+  rowCounts: Record<string, number>
+  instructions?: string
+  databaseName?: string
+}
+
 /**
- * Remove ALL agent_status and options JSON blocks from display text.
+ * Parse BEGIN_GENERATION signal from AI response content.
+ * The AI emits this when it has enough context and is ready to generate data.
+ * Signal format: {"action":"BEGIN_GENERATION","schema":[...],"rowCounts":{...},"instructions":"..."}
+ * This signal must be intercepted by the frontend and never shown to the user.
+ */
+export function parseBeginGeneration(content: string): BeginGenerationSignal | null {
+  // Try strict marker first
+  const markerStrict = '{"action":"BEGIN_GENERATION"'
+  const markerLoose = '{"action": "BEGIN_GENERATION"'
+
+  let idx = content.indexOf(markerStrict)
+  const idxLoose = content.indexOf(markerLoose)
+  if (idx === -1 || (idxLoose !== -1 && idxLoose < idx)) idx = idxLoose
+  if (idx === -1) return null
+
+  const jsonStr = extractJsonObject(content, idx)
+  if (!jsonStr) return null
+
+  try {
+    const parsed = JSON.parse(jsonStr)
+    if (parsed?.action === 'BEGIN_GENERATION' && Array.isArray(parsed.schema)) {
+      return {
+        action: 'BEGIN_GENERATION',
+        schema: parsed.schema,
+        rowCounts: parsed.rowCounts || {},
+        instructions: parsed.instructions || undefined,
+        databaseName: parsed.databaseName || undefined,
+      }
+    }
+  } catch {
+    // Not parseable
+  }
+
+  return null
+}
+
+/**
+ * Remove ALL agent_status, options, and BEGIN_GENERATION JSON blocks from display text.
  * Handles multiline JSON, nested objects, and various format variations.
  */
 export function cleanDisplayText(content: string): string {
@@ -262,8 +308,13 @@ export function cleanDisplayText(content: string): string {
   const recMarkerLoose = '{"type": "recommendation"'
   cleaned = removeJsonBlocks(cleaned, recMarker, recMarkerLoose)
 
+  // Remove BEGIN_GENERATION signal blocks
+  const beginGenMarker = '{"action":"BEGIN_GENERATION"'
+  const beginGenMarkerLoose = '{"action": "BEGIN_GENERATION"'
+  cleaned = removeJsonBlocks(cleaned, beginGenMarker, beginGenMarkerLoose)
+
   // Remove any standalone JSON-like lines that look like agent commands (single-line fallback)
-  cleaned = cleaned.replace(/^\s*\{"type"\s*:\s*"(?:agent_status|options|follow_up|recommendation)"[^}]*\}\s*$/gm, '')
+  cleaned = cleaned.replace(/^\s*\{"(?:type"\s*:\s*"(?:agent_status|options|follow_up|recommendation)"|action"\s*:\s*"BEGIN_GENERATION")[^}]*\}\s*$/gm, '')
 
   // Remove empty code fences left after JSON extraction
   cleaned = cleaned.replace(/```\s*\n?\s*```/g, '')
