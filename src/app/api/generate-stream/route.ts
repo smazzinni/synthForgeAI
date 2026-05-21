@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import { Tables } from '@/lib/supabase/types'
 
 // ─── Streaming Database Generation API ───
 // Receives a generation signal (schema + row counts + instructions),
@@ -346,24 +347,24 @@ export async function POST(request: NextRequest) {
         .insert({
           name: dbName,
           db_type: 'postgresql',
-          schema_json: body.schema,
+          schema_json: body.schema as any,
           data_json: {},
           row_count: 0,
           quality_score: 0.85,
           status: 'generating',
           user_id: userId,
-        })
+        } as any)
         .select()
-        .single()
+        .single() as { data: Tables<'synthetic_databases'> | null; error: any }
 
       if (!dbError && newDb) {
         databaseId = newDb.id
       }
     } else if (databaseId && admin) {
       // Update existing database status
-      await admin
-        .from('synthetic_databases')
-        .update({ status: 'generating' })
+      await (admin
+        .from('synthetic_databases') as any)
+        .update({ status: 'generating' } as any)
         .eq('id', databaseId)
     }
 
@@ -468,7 +469,7 @@ export async function POST(request: NextRequest) {
             .from('synthetic_databases')
             .select('data_json')
             .eq('id', databaseId)
-            .single()
+            .single() as { data: Pick<Tables<'synthetic_databases'>, 'data_json'> | null; error: any }
 
           const existingData = (db?.data_json as Record<string, unknown[]>) || {}
           if (!existingData[tableName]) {
@@ -476,12 +477,12 @@ export async function POST(request: NextRequest) {
           }
           existingData[tableName] = [...existingData[tableName], ...records]
 
-          await admin
-            .from('synthetic_databases')
+          await (admin
+            .from('synthetic_databases') as any)
             .update({
               data_json: existingData,
               row_count: totalInserted + records.length,
-            })
+            } as any)
             .eq('id', databaseId)
         } catch (err) {
           console.warn('[Generate-Stream] DB update failed:', err)
@@ -700,15 +701,15 @@ export async function POST(request: NextRequest) {
           // ─── Update database status ───
           if (admin && databaseId) {
             try {
-              await admin
-                .from('synthetic_databases')
+              await (admin
+                .from('synthetic_databases') as any)
                 .update({
                   status: 'ready',
                   data_json: allTableData,
-                  schema_json: body.schema,
+                  schema_json: body.schema as any,
                   row_count: totalInserted,
                   quality_score: 0.85,
-                })
+                } as any)
                 .eq('id', databaseId)
             } catch (err) {
               console.warn('[Generate-Stream] Final DB update failed:', err)

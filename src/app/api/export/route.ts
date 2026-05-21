@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import { Tables } from '@/lib/supabase/types'
 
 // ─── Export API ───
 // Exports database data in various formats: SQL, CSV, JSON, XLSX
@@ -31,7 +32,7 @@ export async function POST(request: NextRequest) {
       .from('synthetic_databases')
       .select('name, data_json, schema_json')
       .eq('id', databaseId)
-      .single()
+      .single() as { data: Pick<Tables<'synthetic_databases'>, 'name' | 'data_json' | 'schema_json'> | null; error: any }
 
     if (dbError || !db) {
       return NextResponse.json({ error: 'Database not found' }, { status: 404 })

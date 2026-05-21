@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import { Tables } from '@/lib/supabase/types'
 
 // GET /api/conversations - List conversations for a user
 export async function GET(request: NextRequest) {
@@ -26,7 +27,7 @@ export async function GET(request: NextRequest) {
       query = query.eq('user_id', userId)
     }
 
-    const { data, error } = await query
+    const { data, error } = await query as { data: Tables<'conversations'>[] | null; error: any }
 
     if (error) {
       console.warn('[Conversations API] Query error:', error.message)
@@ -35,12 +36,12 @@ export async function GET(request: NextRequest) {
 
     // For each conversation, also fetch its messages
     const conversationsWithMessages = await Promise.all(
-      (data || []).map(async (conv) => {
+      (data || []).map(async (conv: Tables<'conversations'>) => {
         const { data: messages } = await admin
           .from('messages')
           .select('*')
           .eq('conversation_id', conv.id)
-          .order('created_at', { ascending: true })
+          .order('created_at', { ascending: true }) as { data: Tables<'messages'>[] | null; error: any }
 
         return { ...conv, messages: messages || [] }
       })
@@ -76,15 +77,15 @@ export async function POST(request: NextRequest) {
           user_id: userId || null,
           status: 'active',
           agent_mode: 'orchestrator',
-        })
+        } as any)
         .select()
-        .single()
+        .single() as { data: Tables<'conversations'> | null; error: any }
 
       if (convError) {
         console.error('[Conversations API] Insert error:', convError.message)
         return NextResponse.json({ error: convError.message }, { status: 500 })
       }
-      conversationId = conv.id
+      if (conv) conversationId = conv.id
     }
 
     // Insert messages if provided
@@ -98,7 +99,7 @@ export async function POST(request: NextRequest) {
 
       const { error: msgError } = await admin
         .from('messages')
-        .insert(messagesToInsert)
+        .insert(messagesToInsert as any)
 
       if (msgError) {
         console.error('[Conversations API] Messages insert error:', msgError.message)

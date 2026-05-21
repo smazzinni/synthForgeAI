@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server'
 import { isAuthEnabled } from '@/lib/supabase/admin'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
 import { mockUser } from '@/lib/mock-data'
+import { Tables } from '@/lib/supabase/types'
 
 export interface AuthenticatedUser {
   userId: string
@@ -56,7 +57,7 @@ export async function getAuthenticatedUser(request: NextRequest): Promise<Authen
         ? admin.from('profiles').select('*').eq('id', userId).single()
         : admin.from('profiles').select('*').eq('email', userEmail).single()
 
-      const { data: profile } = await query
+      const { data: profile } = await query as { data: Tables<'profiles'> | null; error: any }
       if (profile) {
         return {
           userId: profile.id,
@@ -114,7 +115,7 @@ export async function verifyDatabaseAccess(databaseId: string, userId: string): 
   try {
     const admin = getSupabaseAdmin()
     if (!admin) return true
-    const { data } = await admin.from('synthetic_databases').select('id, user_id').eq('id', databaseId).single()
+    const { data } = await admin.from('synthetic_databases').select('id, user_id').eq('id', databaseId).single() as { data: Pick<Tables<'synthetic_databases'>, 'id' | 'user_id'> | null; error: any }
     // For individual user mode: check if the database belongs to the user
     return !!data && (!data.user_id || data.user_id === userId)
   } catch {
@@ -129,7 +130,7 @@ export async function verifyConversationAccess(conversationId: string, userId: s
   try {
     const admin = getSupabaseAdmin()
     if (!admin) return true
-    const { data } = await admin.from('conversations').select('id, user_id').eq('id', conversationId).single()
+    const { data } = await admin.from('conversations').select('id, user_id').eq('id', conversationId).single() as { data: Pick<Tables<'conversations'>, 'id' | 'user_id'> | null; error: any }
     return !!data && (!data.user_id || data.user_id === userId)
   } catch {
     return true

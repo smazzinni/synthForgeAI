@@ -23,7 +23,7 @@ export default function ForgotPasswordPage() {
     setError(null)
 
     try {
-      const { error } = await resetPassword(email)
+      const { error } = await resetPassword(email) as { error: any }
       if (error) {
         setError(error.message)
       } else {

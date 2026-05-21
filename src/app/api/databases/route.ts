@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import { Tables } from '@/lib/supabase/types'
 
 // ─── Default user ID for fallback when auth is not available ───
 const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
@@ -131,7 +132,7 @@ export async function GET(request: NextRequest) {
       const cacheKey = `databases:list:${userId || 'anon'}`
       const cached = apiCache.get(cacheKey)
       if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-        return NextResponse.json(cached.data)
+        return NextResponse.json(cached.data as any)
       }
     }
 
@@ -143,7 +144,7 @@ export async function GET(request: NextRequest) {
         .from('synthetic_databases')
         .select('*')
         .eq('id', id)
-        .single()
+        .single() as { data: Tables<'synthetic_databases'> | null; error: any }
 
       if (error) {
         console.warn('[Databases API] Query error:', error.message)
@@ -162,7 +163,7 @@ export async function GET(request: NextRequest) {
 
     query = query.eq('user_id', userId)
 
-    const { data, error } = await query
+    const { data, error } = await query as { data: Tables<'synthetic_databases'>[] | null; error: any }
 
     if (error) {
       console.warn('[Databases API] Query error:', error.message)
@@ -234,9 +235,9 @@ export async function POST(request: NextRequest) {
 
     const { data, error } = await admin
       .from('synthetic_databases')
-      .insert(insertData)
+      .insert(insertData as any)
       .select()
-      .single()
+      .single() as { data: Tables<'synthetic_databases'> | null; error: any }
 
     if (error) {
       console.error('[Databases API] Insert error:', error.message)
@@ -299,12 +300,12 @@ export async function PATCH(request: NextRequest) {
     if (status !== undefined) updateData.status = status
     if (name !== undefined) updateData.name = name
 
-    const { data, error } = await admin
-      .from('synthetic_databases')
-      .update(updateData)
+    const { data, error } = await (admin
+      .from('synthetic_databases') as any)
+      .update(updateData as any)
       .eq('id', id)
       .select()
-      .single()
+      .single() as { data: Tables<'synthetic_databases'> | null; error: any }
 
     if (error) {
       console.error('[Databases API] Patch error:', error.message)

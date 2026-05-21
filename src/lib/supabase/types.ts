@@ -192,6 +192,6 @@ export interface Database {
 }
 
 // Helper types
-export type Tables<T extends keyof Database['public']['Tables']> = Database['public']['Tables'][T]['Row']
-export type InsertTables<T extends keyof Database['public']['Tables']> = Database['public']['Tables'][T]['Insert']
-export type UpdateTables<T extends keyof Database['public']['Tables']> = Database['public']['Tables'][T]['Update']
+export type Tables<T extends keyof Database['public']['Tables']> = Database['public']['Tables'][T] extends { Row: infer R } ? R : never
+export type InsertTables<T extends keyof Database['public']['Tables']> = Database['public']['Tables'][T] extends { Insert: infer I } ? I : never
+export type UpdateTables<T extends keyof Database['public']['Tables']> = Database['public']['Tables'][T] extends { Update: infer U } ? U : never

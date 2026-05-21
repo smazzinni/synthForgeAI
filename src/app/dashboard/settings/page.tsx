@@ -16,19 +16,34 @@ export default function SettingsPage() {
   const { user } = useAuth()
   const [showPassword, setShowPassword] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [fullName, setFullName] = useState(user?.user_metadata?.full_name || user?.email?.split('@')[0] || '')
 
   const userName = user?.user_metadata?.full_name || user?.email?.split('@')[0] || 'User'
   const userEmail = user?.email || ''
   const userInitials = userName.split(' ').map((n: string) => n[0]).join('').toUpperCase().slice(0, 2)
 
   const handleSaveProfile = async () => {
+    if (!fullName.trim()) {
+      toast.error('Full name is required')
+      return
+    }
+
     setSaving(true)
     try {
-      // TODO: Update profile via Supabase
-      await new Promise(resolve => setTimeout(resolve, 500))
+      const response = await fetch('/api/auth/user', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: fullName }),
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json()
+        throw new Error(errorData.error || 'Failed to update profile')
+      }
+
       toast.success('Profile updated successfully')
-    } catch {
-      toast.error('Failed to update profile')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to update profile')
     } finally {
       setSaving(false)
     }
@@ -72,7 +87,11 @@ export default function SettingsPage() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label htmlFor="fullName">Full Name</Label>
-                  <Input id="fullName" defaultValue={userName} />
+                  <Input
+                    id="fullName"
+                    value={fullName}
+                    onChange={(e) => setFullName(e.target.value)}
+                  />
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="email">Email</Label>
