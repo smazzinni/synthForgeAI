@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-require-imports */
 const { createServer } = require('http');
 const { URL } = require('url');
 const next = require('next');

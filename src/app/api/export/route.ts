@@ -32,7 +32,7 @@ export async function POST(request: NextRequest) {
       .from('synthetic_databases')
       .select('name, data_json, schema_json')
       .eq('id', databaseId)
-      .single() as { data: Pick<Tables<'synthetic_databases'>, 'name' | 'data_json' | 'schema_json'> | null; error: any }
+      .single() as { data: any | null; error: any }
 
     if (dbError || !db) {
       return NextResponse.json({ error: 'Database not found' }, { status: 404 })

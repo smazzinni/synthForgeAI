@@ -46,8 +46,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     if (!supabase) {
       // No Supabase client - run without auth
-      setLoading(false)
-      return
+      // Use a timer to avoid synchronous state update in effect
+      const timer = setTimeout(() => {
+        setLoading(false)
+      }, 0)
+      return () => clearTimeout(timer)
     }
 
     supabaseRef.current = supabase

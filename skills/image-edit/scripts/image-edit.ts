@@ -7,9 +7,9 @@ async function main(imageSource: string, prompt: string, size: '1024x1024' | '76
 
 		const response = await zai.images.generations.edit({
 			prompt,
-			images: [{ url: imageSource }],  // Array of objects with url property
+			image: { url: imageSource },
 			size
-		});
+		} as any);
 
 		const base64 = response?.data?.[0]?.base64;
 		if (!base64) {

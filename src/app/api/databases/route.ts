@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
-import { Tables } from '@/lib/supabase/types'
+import { Tables, InsertTables, UpdateTables } from '@/lib/supabase/types'
 
 // ─── Default user ID for fallback when auth is not available ───
 const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
@@ -144,7 +144,7 @@ export async function GET(request: NextRequest) {
         .from('synthetic_databases')
         .select('*')
         .eq('id', id)
-        .single() as { data: Tables<'synthetic_databases'> | null; error: any }
+        .single()
 
       if (error) {
         console.warn('[Databases API] Query error:', error.message)
@@ -163,7 +163,7 @@ export async function GET(request: NextRequest) {
 
     query = query.eq('user_id', userId)
 
-    const { data, error } = await query as { data: Tables<'synthetic_databases'>[] | null; error: any }
+    const { data, error } = await query
 
     if (error) {
       console.warn('[Databases API] Query error:', error.message)
@@ -237,7 +237,7 @@ export async function POST(request: NextRequest) {
       .from('synthetic_databases')
       .insert(insertData as any)
       .select()
-      .single() as { data: Tables<'synthetic_databases'> | null; error: any }
+      .single()
 
     if (error) {
       console.error('[Databases API] Insert error:', error.message)
@@ -305,7 +305,7 @@ export async function PATCH(request: NextRequest) {
       .update(updateData as any)
       .eq('id', id)
       .select()
-      .single() as { data: Tables<'synthetic_databases'> | null; error: any }
+      .single()
 
     if (error) {
       console.error('[Databases API] Patch error:', error.message)

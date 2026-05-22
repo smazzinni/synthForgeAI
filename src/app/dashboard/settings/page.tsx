@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useAuth } from '@/hooks/use-auth'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -16,7 +16,14 @@ export default function SettingsPage() {
   const { user } = useAuth()
   const [showPassword, setShowPassword] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [fullName, setFullName] = useState(user?.user_metadata?.full_name || user?.email?.split('@')[0] || '')
+  const [fullName, setFullName] = useState('')
+
+  // Sync fullName with user metadata when it loads
+  useEffect(() => {
+    if (user) {
+      setFullName(user.user_metadata?.full_name || user.email?.split('@')[0] || '')
+    }
+  }, [user])
 
   const userName = user?.user_metadata?.full_name || user?.email?.split('@')[0] || 'User'
   const userEmail = user?.email || ''

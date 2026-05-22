@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
-import { Tables } from '@/lib/supabase/types'
+import { Tables, InsertTables } from '@/lib/supabase/types'
 
 // GET /api/conversations - List conversations for a user
 export async function GET(request: NextRequest) {
@@ -27,7 +27,7 @@ export async function GET(request: NextRequest) {
       query = query.eq('user_id', userId)
     }
 
-    const { data, error } = await query as { data: Tables<'conversations'>[] | null; error: any }
+    const { data, error } = await query as { data: any[] | null; error: any }
 
     if (error) {
       console.warn('[Conversations API] Query error:', error.message)
@@ -36,12 +36,12 @@ export async function GET(request: NextRequest) {
 
     // For each conversation, also fetch its messages
     const conversationsWithMessages = await Promise.all(
-      (data || []).map(async (conv: Tables<'conversations'>) => {
+      (data || []).map(async (conv) => {
         const { data: messages } = await admin
           .from('messages')
           .select('*')
           .eq('conversation_id', conv.id)
-          .order('created_at', { ascending: true }) as { data: Tables<'messages'>[] | null; error: any }
+          .order('created_at', { ascending: true })
 
         return { ...conv, messages: messages || [] }
       })
@@ -79,7 +79,7 @@ export async function POST(request: NextRequest) {
           agent_mode: 'orchestrator',
         } as any)
         .select()
-        .single() as { data: Tables<'conversations'> | null; error: any }
+        .single() as { data: any | null; error: any }
 
       if (convError) {
         console.error('[Conversations API] Insert error:', convError.message)

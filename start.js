@@ -8,6 +8,7 @@
  * Connection: close headers are configured in next.config.ts for stability.
  */
 
+/* eslint-disable @typescript-eslint/no-require-imports */
 const { spawn } = require('child_process');
 const http = require('http');
 

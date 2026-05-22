@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
-import { Tables } from '@/lib/supabase/types'
+import { Tables, InsertTables, UpdateTables } from '@/lib/supabase/types'
 
 // ─── Streaming Database Generation API ───
 // Receives a generation signal (schema + row counts + instructions),
@@ -355,7 +355,7 @@ export async function POST(request: NextRequest) {
           user_id: userId,
         } as any)
         .select()
-        .single() as { data: Tables<'synthetic_databases'> | null; error: any }
+        .single() as { data: any | null; error: any }
 
       if (!dbError && newDb) {
         databaseId = newDb.id
@@ -469,7 +469,7 @@ export async function POST(request: NextRequest) {
             .from('synthetic_databases')
             .select('data_json')
             .eq('id', databaseId)
-            .single() as { data: Pick<Tables<'synthetic_databases'>, 'data_json'> | null; error: any }
+            .single() as { data: any | null; error: any }
 
           const existingData = (db?.data_json as Record<string, unknown[]>) || {}
           if (!existingData[tableName]) {
@@ -480,7 +480,7 @@ export async function POST(request: NextRequest) {
           await (admin
             .from('synthetic_databases') as any)
             .update({
-              data_json: existingData,
+              data_json: existingData as any,
               row_count: totalInserted + records.length,
             } as any)
             .eq('id', databaseId)
@@ -705,7 +705,7 @@ export async function POST(request: NextRequest) {
                 .from('synthetic_databases') as any)
                 .update({
                   status: 'ready',
-                  data_json: allTableData,
+                  data_json: allTableData as any,
                   schema_json: body.schema as any,
                   row_count: totalInserted,
                   quality_score: 0.85,
