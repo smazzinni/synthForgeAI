@@ -6,7 +6,7 @@ const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
 
 // ─── In-memory request cache with automatic cleanup ───
 const apiCache = new Map<string, { data: unknown; timestamp: number }>()
-const CACHE_TTL = 3000 // 3 seconds cache
+const CACHE_TTL = 30000 // 30 seconds cache
 
 // ─── Rate limiter with automatic cleanup ───
 const rateLimiter = new Map<string, { count: number; resetAt: number }>()
@@ -31,7 +31,7 @@ function cleanup() {
 
   // Clean up expired cache entries
   for (const [key, entry] of apiCache.entries()) {
-    if (now - entry.timestamp > 30000) { // Remove entries older than 30s
+    if (now - entry.timestamp > CACHE_TTL) {
       apiCache.delete(key)
     }
   }
@@ -125,17 +125,17 @@ export async function GET(request: NextRequest) {
     const { searchParams } = new URL(request.url)
     const id = searchParams.get('id')
 
+    // ✅ Compute userId ONCE with fallback, before any cache or query logic
+    const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
+
     // Check cache for list queries (not individual ID queries)
     if (!id) {
-      const userId = getUserIdFromCookies(request)
-      const cacheKey = `databases:list:${userId || 'anon'}`
+      const cacheKey = `databases:list:${userId}` // ✅ consistent key — no more read/write mismatch
       const cached = apiCache.get(cacheKey)
       if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
         return NextResponse.json(cached.data)
       }
     }
-
-    const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
 
     // If requesting a specific database by ID
     if (id) {
@@ -154,15 +154,12 @@ export async function GET(request: NextRequest) {
     }
 
     // List all databases
-    let query = admin
+    const { data, error } = await admin
       .from('synthetic_databases')
       .select('*')
+      .eq('user_id', userId)
       .order('created_at', { ascending: false })
       .limit(50)
-
-    query = query.eq('user_id', userId)
-
-    const { data, error } = await query
 
     if (error) {
       console.warn('[Databases API] Query error:', error.message)
@@ -171,8 +168,8 @@ export async function GET(request: NextRequest) {
 
     const responseData = { databases: data || [] }
 
-    // Cache the result
-    const cacheKey = `databases:list:${userId || 'anon'}`
+    // ✅ Same key used for both read and write — cache will now hit correctly
+    const cacheKey = `databases:list:${userId}`
     apiCache.set(cacheKey, { data: responseData, timestamp: Date.now() })
 
     return NextResponse.json(responseData)

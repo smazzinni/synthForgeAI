@@ -123,6 +123,82 @@ function extractJsonObject(content: string, startIndex: number): string | null {
 }
 
 /**
+ * Find and extract a JSON object from content that contains a specific marker.
+ * Searches backwards from the marker to find the enclosing '{'.
+ */
+function findJsonBlockWithMarker(content: string, marker: string): { jsonStr: string; startIndex: number } | null {
+  let pos = 0
+  while (true) {
+    const markerIdx = content.indexOf(marker, pos)
+    if (markerIdx === -1) break
+
+    // Search backwards for '{'
+    let braceIdx = content.lastIndexOf('{', markerIdx)
+    while (braceIdx !== -1) {
+      const jsonStr = extractJsonObject(content, braceIdx)
+      if (jsonStr) {
+        if (jsonStr.includes(marker)) {
+          return { jsonStr, startIndex: braceIdx }
+        }
+      }
+      braceIdx = content.lastIndexOf('{', braceIdx - 1)
+    }
+    pos = markerIdx + marker.length
+  }
+  return null
+}
+
+/**
+ * Find all JSON blocks containing a specific marker.
+ */
+function findAllJsonBlocksWithMarker(content: string, marker: string): Array<{ jsonStr: string; startIndex: number }> {
+  const results: Array<{ jsonStr: string; startIndex: number }> = []
+  let pos = 0
+  const seenStarts = new Set<number>()
+
+  while (true) {
+    const markerIdx = content.indexOf(marker, pos)
+    if (markerIdx === -1) break
+
+    // Search backwards for '{'
+    let braceIdx = content.lastIndexOf('{', markerIdx)
+    while (braceIdx !== -1) {
+      if (!seenStarts.has(braceIdx)) {
+        const jsonStr = extractJsonObject(content, braceIdx)
+        if (jsonStr) {
+          if (jsonStr.includes(marker)) {
+            results.push({ jsonStr, startIndex: braceIdx })
+            seenStarts.add(braceIdx)
+            break
+          }
+        }
+      }
+      braceIdx = content.lastIndexOf('{', braceIdx - 1)
+    }
+    pos = markerIdx + marker.length
+  }
+  return results
+}
+
+/**
+ * Remove all JSON blocks containing a marker from content.
+ */
+function removeJsonBlocksWithMarker(content: string, marker: string): string {
+  let result = content
+  let safety = 0
+
+  while (safety < 100) {
+    const block = findJsonBlockWithMarker(result, marker)
+    if (!block) break
+
+    result = result.substring(0, block.startIndex) + result.substring(block.startIndex + block.jsonStr.length)
+    safety++
+  }
+
+  return result
+}
+
+/**
  * Parse agent status from AI response content.
  * The AI may embed JSON blocks like:
  * {"type":"agent_status","agent":"Schema Architect","status":"designing","progress":30}
@@ -135,28 +211,11 @@ export interface AgentStatus {
 }
 
 export function parseAgentStatus(content: string): AgentStatus | null {
-  // Try simple regex first (single-line, fast path)
-  const simpleMatch = content.match(/\{"type"\s*:\s*"agent_status"\s*,\s*"agent"\s*:\s*"([^"]+)"\s*,\s*"status"\s*:\s*"([^"]+)"\s*,\s*"progress"\s*:\s*(\d+)\s*\}/)
-  if (simpleMatch) {
-    return {
-      agent: simpleMatch[1],
-      status: simpleMatch[2],
-      progress: parseInt(simpleMatch[3], 10),
-    }
-  }
-
-  // Fallback: find {"type":"agent_status" and extract the full JSON object using bracket counting
-  const marker = '{"type":"agent_status"'
-  const markerLoose = '{"type": "agent_status"'
-  let idx = content.indexOf(marker)
-  if (idx === -1) idx = content.indexOf(markerLoose)
-  if (idx === -1) return null
-
-  const jsonStr = extractJsonObject(content, idx)
-  if (!jsonStr) return null
+  const result = findJsonBlockWithMarker(content, '"agent_status"')
+  if (!result) return null
 
   try {
-    const parsed = JSON.parse(jsonStr)
+    const parsed = JSON.parse(result.jsonStr)
     if (parsed?.type === 'agent_status' && parsed.agent && parsed.status) {
       return {
         agent: String(parsed.agent),
@@ -172,42 +231,76 @@ export function parseAgentStatus(content: string): AgentStatus | null {
 }
 
 /**
+ * Normalize a single choice entry into {label, value}.
+ * Handles plain strings, objects with various key names, etc.
+ */
+function normalizeChoice(c: unknown): { label: string; value: string } {
+  if (typeof c === 'string') {
+    return { label: c, value: c }
+  }
+  if (typeof c === 'number' || typeof c === 'boolean') {
+    return { label: String(c), value: String(c) }
+  }
+  if (c && typeof c === 'object') {
+    const obj = c as Record<string, unknown>
+    const label = String(obj.Label || obj.label || obj.value || obj.Value || obj.text || obj.Text || '')
+    const value = String(obj.Value || obj.value || obj.Label || obj.label || obj.text || obj.Text || '')
+    return { label, value }
+  }
+  return { label: '', value: '' }
+}
+
+/**
  * Parse ALL interactive options blocks from AI response content.
  * Returns an array of InteractiveOptions found in the content.
  */
 export function parseAllInteractiveOptions(content: string): InteractiveOptions[] {
   const results: InteractiveOptions[] = []
 
-  // Find all occurrences of {"type":"options" and extract each one
-  const markerStrict = '{"type":"options"'
-  const markerLoose = '{"type": "options"'
+  const blocks = findAllJsonBlocksWithMarker(content, '"options"')
+  for (const block of blocks) {
+    try {
+      const parsed = JSON.parse(block.jsonStr)
+      if (parsed?.type === 'options' && Array.isArray(parsed.choices)) {
+        results.push({
+          question: String(parsed.question || ''),
+          choices: parsed.choices.map(normalizeChoice),
+          multi: Boolean(parsed.multi),
+          skip: Boolean(parsed.skip),
+          customAnswer: Boolean(parsed.customAnswer),
+          note: parsed.note ? String(parsed.note) : undefined,
+        })
+      }
+    } catch {
+      // Not parseable, skip
+    }
+  }
 
-  let searchFrom = 0
-  while (searchFrom < content.length) {
-    let idx = content.indexOf(markerStrict, searchFrom)
-    if (idx === -1) idx = content.indexOf(markerLoose, searchFrom)
-    if (idx === -1) break
-
-    const jsonStr = extractJsonObject(content, idx)
-    if (jsonStr) {
+  // Also detect question-style JSON blocks using keys like "Question" / "Options"
+  const questionMarkers = ['"Question"', '"question"']
+  for (const qm of questionMarkers) {
+    const blocks = findAllJsonBlocksWithMarker(content, qm)
+    for (const block of blocks) {
       try {
-        const parsed = JSON.parse(jsonStr)
-        if (parsed?.type === 'options' && Array.isArray(parsed.choices)) {
-          results.push({
-            question: String(parsed.question || ''),
-            choices: parsed.choices.map((c: { label?: string; value?: string }) => ({
-              label: String(c.label || c.value || ''),
-              value: String(c.value || c.label || ''),
-            })),
-            multi: Boolean(parsed.multi),
-          })
+        const parsed = JSON.parse(block.jsonStr)
+        const q = parsed.Question || parsed.question || null
+        const opts = parsed.Options || parsed.options || parsed.Choices || parsed.choices || null
+        if (q && Array.isArray(opts)) {
+          // Avoid duplicates if we already parsed this brace
+          if (!results.some(r => r.question === String(q))) {
+            results.push({
+              question: String(q),
+              choices: opts.map(normalizeChoice),
+              multi: Boolean(parsed.multi || parsed.Multi),
+              skip: Boolean(parsed.Skip || parsed.skip),
+              customAnswer: Boolean(parsed.CustomAnswer || parsed.customAnswer),
+              note: parsed.Note || parsed.note ? String(parsed.Note || parsed.note) : undefined,
+            })
+          }
         }
       } catch {
-        // Not parseable, skip
+        // ignore
       }
-      searchFrom = idx + jsonStr.length
-    } else {
-      searchFrom = idx + markerStrict.length
     }
   }
 
@@ -229,6 +322,9 @@ export interface InteractiveOptions {
   question: string
   choices: OptionChoice[]
   multi: boolean
+  skip?: boolean
+  customAnswer?: boolean
+  note?: string
 }
 
 export function parseInteractiveOptions(content: string): InteractiveOptions | null {
@@ -252,31 +348,58 @@ export interface BeginGenerationSignal {
  * This signal must be intercepted by the frontend and never shown to the user.
  */
 export function parseBeginGeneration(content: string): BeginGenerationSignal | null {
-  // Try strict marker first
-  const markerStrict = '{"action":"BEGIN_GENERATION"'
-  const markerLoose = '{"action": "BEGIN_GENERATION"'
-
-  let idx = content.indexOf(markerStrict)
-  const idxLoose = content.indexOf(markerLoose)
-  if (idx === -1 || (idxLoose !== -1 && idxLoose < idx)) idx = idxLoose
-  if (idx === -1) return null
-
-  const jsonStr = extractJsonObject(content, idx)
-  if (!jsonStr) return null
+  const result = findJsonBlockWithMarker(content, '"BEGIN_GENERATION"')
+  if (!result) return null
 
   try {
-    const parsed = JSON.parse(jsonStr)
-    if (parsed?.action === 'BEGIN_GENERATION' && Array.isArray(parsed.schema)) {
+    const parsed = JSON.parse(result.jsonStr)
+    if (typeof parsed?.action === 'string' && String(parsed.action).toUpperCase() === 'BEGIN_GENERATION' && Array.isArray(parsed.schema)) {
       return {
         action: 'BEGIN_GENERATION',
         schema: parsed.schema,
         rowCounts: parsed.rowCounts || {},
         instructions: parsed.instructions || undefined,
-        databaseName: parsed.databaseName || undefined,
+        // Accept both camelCase and snake_case since the AI may use either
+        databaseName: parsed.databaseName || parsed.database_name || undefined,
       }
     }
   } catch {
     // Not parseable
+  }
+
+  return null
+}
+
+export interface AgentControlAction {
+  action: 'RESTORE_SNAPSHOT' | 'CREATE_SNAPSHOT' | 'LIST_SNAPSHOTS' | 'GET_SNAPSHOT'
+  databaseId?: string
+  snapshotId?: string
+  name?: string
+  reason?: string
+}
+
+export function parseAgentControlAction(content: string): AgentControlAction | null {
+  const actions: AgentControlAction['action'][] = ['RESTORE_SNAPSHOT', 'CREATE_SNAPSHOT', 'LIST_SNAPSHOTS', 'GET_SNAPSHOT']
+
+  for (const action of actions) {
+    const result = findJsonBlockWithMarker(content, `"${action}"`)
+    if (!result) continue
+
+    try {
+      const parsed = JSON.parse(result.jsonStr)
+      const rawAction = typeof parsed?.action === 'string' ? String(parsed.action).trim().toUpperCase() : ''
+      if (rawAction === action) {
+        return {
+          action,
+          databaseId: parsed.databaseId || parsed.database_id,
+          snapshotId: parsed.snapshotId || parsed.snapshot_id,
+          name: parsed.name,
+          reason: parsed.reason,
+        }
+      }
+    } catch {
+      continue
+    }
   }
 
   return null
@@ -289,32 +412,26 @@ export function parseBeginGeneration(content: string): BeginGenerationSignal | n
 export function cleanDisplayText(content: string): string {
   let cleaned = content
 
-  // Remove agent_status blocks — find each one and remove it
-  const agentStatusMarker = '{"type":"agent_status"'
-  const agentStatusMarkerLoose = '{"type": "agent_status"'
-  cleaned = removeJsonBlocks(cleaned, agentStatusMarker, agentStatusMarkerLoose)
+  const markersToRemove = [
+    '"agent_status"',
+    '"options"',
+    '"follow_up"',
+    '"recommendation"',
+    '"BEGIN_GENERATION"',
+    '"RESTORE_SNAPSHOT"',
+    '"CREATE_SNAPSHOT"',
+    '"LIST_SNAPSHOTS"',
+    '"GET_SNAPSHOT"',
+    '"Question"',
+    '"question"'
+  ]
 
-  // Remove options blocks — find each one and remove it
-  const optionsMarker = '{"type":"options"'
-  const optionsMarkerLoose = '{"type": "options"'
-  cleaned = removeJsonBlocks(cleaned, optionsMarker, optionsMarkerLoose)
-
-  // Remove follow_up and recommendation blocks
-  const followUpMarker = '{"type":"follow_up"'
-  const followUpMarkerLoose = '{"type": "follow_up"'
-  cleaned = removeJsonBlocks(cleaned, followUpMarker, followUpMarkerLoose)
-
-  const recMarker = '{"type":"recommendation"'
-  const recMarkerLoose = '{"type": "recommendation"'
-  cleaned = removeJsonBlocks(cleaned, recMarker, recMarkerLoose)
-
-  // Remove BEGIN_GENERATION signal blocks
-  const beginGenMarker = '{"action":"BEGIN_GENERATION"'
-  const beginGenMarkerLoose = '{"action": "BEGIN_GENERATION"'
-  cleaned = removeJsonBlocks(cleaned, beginGenMarker, beginGenMarkerLoose)
+  for (const marker of markersToRemove) {
+    cleaned = removeJsonBlocksWithMarker(cleaned, marker)
+  }
 
   // Remove any standalone JSON-like lines that look like agent commands (single-line fallback)
-  cleaned = cleaned.replace(/^\s*\{"(?:type"\s*:\s*"(?:agent_status|options|follow_up|recommendation)"|action"\s*:\s*"BEGIN_GENERATION")[^}]*\}\s*$/gm, '')
+  cleaned = cleaned.replace(/^\s*\{"(?:type"\s*:\s*"(?:agent_status|options|follow_up|recommendation)"|action"\s*:\s*"(?:BEGIN_GENERATION|RESTORE_SNAPSHOT|CREATE_SNAPSHOT|LIST_SNAPSHOTS|GET_SNAPSHOT)")[^}]*\}\s*$/gm, '')
 
   // Remove empty code fences left after JSON extraction
   cleaned = cleaned.replace(/```\s*\n?\s*```/g, '')
@@ -325,36 +442,6 @@ export function cleanDisplayText(content: string): string {
   return cleaned.trim()
 }
 
-/**
- * Remove all JSON blocks starting with a given marker from the content.
- */
-function removeJsonBlocks(content: string, marker: string, markerLoose: string): string {
-  let result = content
-  let safety = 0
-
-  while (safety < 100) {
-    let idx = result.indexOf(marker)
-    const idxLoose = result.indexOf(markerLoose)
-    if (idx === -1 || (idxLoose !== -1 && idxLoose < idx)) idx = idxLoose
-    if (idx === -1) break
-
-    const jsonStr = extractJsonObject(result, idx)
-    if (jsonStr) {
-      result = result.substring(0, idx) + result.substring(idx + jsonStr.length)
-    } else {
-      // Can't extract, try removing a reasonable chunk
-      const endGuess = result.indexOf('}', idx + marker.length + 200)
-      if (endGuess !== -1) {
-        result = result.substring(0, idx) + result.substring(endGuess + 1)
-      } else {
-        break
-      }
-    }
-    safety++
-  }
-
-  return result
-}
 
 /**
  * Check if a SQL statement is destructive (DELETE, DROP, TRUNCATE, mass UPDATE)
@@ -380,4 +467,103 @@ export function getAgentByName(name: string): AgentDef | null {
     }
   }
   return AI_AGENTS.orchestrator
+}
+
+/**
+ * Helper function to generate row count suggestion options for interactive questions.
+ * Returns pre-configured options for different time-based data generation strategies.
+ */
+export function getRowCountSuggestionOptions(): Array<{ label: string; value: string; description?: string }> {
+  return [
+    { label: '⚡ Last 7 days of hourly events (168 records)', value: '7d_hourly', description: 'For high-frequency events' },
+    { label: '📊 Last 30 days of daily transactions (30 records)', value: '30d_daily', description: 'For standard business operations' },
+    { label: '📈 Last 90 days of daily events (90 records)', value: '90d_daily', description: 'For quarterly analysis' },
+    { label: '🗓️ Last 6 months of weekly data (26 records)', value: '6m_weekly', description: 'For monthly/weekly patterns' },
+    { label: '📅 Last 12 months of monthly data (12 records)', value: '12m_monthly', description: 'For annual trends' },
+    { label: '🎯 Last 2 years of daily data (730 records)', value: '2y_daily', description: 'For comprehensive history' },
+    { label: '⏰ Custom time period', value: 'custom', description: 'Specify your own period' },
+  ]
+}
+
+/**
+ * Helper function to provide row count calculation explanation for different business contexts.
+ * Shows how row counts are calculated based on the business context and time period.
+ */
+export function explainRowCountCalculation(context: string, timePeriod: string): string {
+  const explanations: Record<string, string> = {
+    transactions:
+      'Transactional data: Calculated based on average transactions per day multiplied by the time period. Child tables (line_items, payments) get 3-5x multiplier.',
+    user_activity:
+      'User activity: Based on active users and their daily interactions. Higher multiplier for tables like sessions, actions, logins.',
+    events:
+      'Real-time events: High-frequency data. Multiplied by events per hour × 24 hours. Tables like events and metrics get 5-10x multiplier.',
+    logs:
+      'System logs: Very high volume. Hourly logs multiplied by 24 × days. Audit trails and activity logs get 10-50x multiplier.',
+    analytics:
+      'Analytics/Reports: Aggregated data. Lower multiplier since data is summarized. Daily/weekly/monthly snapshots.',
+    mixed:
+      'Mixed data: Combines above patterns. Each table type uses its appropriate calculation.',
+  }
+  return (
+    explanations[context.toLowerCase()] ||
+    'Row counts are calculated based on your time period and business context to generate realistic data volumes.'
+  )
+}
+
+/**
+ * Calculate suggested row counts for each table in a schema based on time period
+ * Returns an object with table names and their calculated row counts
+ */
+export function calculateSuggestedRowCounts(
+  schema: Array<{ name: string }>,
+  timePeriod: string,
+  context?: string
+): Record<string, number> {
+  const rowCounts: Record<string, number> = {}
+
+  // Base calculation from time period
+  const baseCounts: Record<string, number> = {
+    '7d_hourly': 7 * 24, // 168
+    '30d_daily': 30,
+    '90d_daily': 90,
+    '6m_weekly': 26,
+    '12m_monthly': 12,
+    '2y_daily': 730,
+  }
+
+  const baseCount = baseCounts[timePeriod] || 30
+
+  for (const table of schema) {
+    const lower = table.name.toLowerCase()
+
+    // Detect table type and apply multiplier
+    let multiplier = 1
+
+    // Parent tables (users, customers, products)
+    if (lower.includes('user') || lower.includes('customer') || lower.includes('product') || lower.includes('account')) {
+      multiplier = 1
+    }
+    // Child tables (orders, items, comments)
+    else if (
+      lower.includes('order') ||
+      lower.includes('item') ||
+      lower.includes('line_item') ||
+      lower.includes('comment') ||
+      lower.includes('review')
+    ) {
+      multiplier = 3
+    }
+    // High-volume tables (events, logs, metrics)
+    else if (lower.includes('event') || lower.includes('log') || lower.includes('metric') || lower.includes('analytics')) {
+      multiplier = 5
+    }
+    // Transaction detail tables
+    else if (lower.includes('transaction') || lower.includes('payment') || lower.includes('invoice')) {
+      multiplier = 2
+    }
+
+    rowCounts[table.name] = Math.max(1, baseCount * multiplier)
+  }
+
+  return rowCounts
 }

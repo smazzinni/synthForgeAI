@@ -100,7 +100,7 @@ const pricingPlans = [
   },
   {
     name: 'Pro',
-    price: '$49',
+    price: '$19',
     period: '/month',
     description: 'For teams building production applications',
     features: ['Unlimited databases', '100,000 rows per database', 'Multi-agent pipeline', 'All export formats', 'Priority support', 'Team collaboration', 'API access'],

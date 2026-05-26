@@ -185,8 +185,8 @@ export interface Database {
     Views: Record<string, never>
     Functions: Record<string, never>
     Enums: {
-      database_status: 'draft' | 'generating' | 'ready' | 'error'
-      conversation_status: 'active' | 'archived' | 'error'
+      database_status: 'draft' | 'generating' | 'ready' | 'error' | 'archived'
+      conversation_status: 'active' | 'archived' | 'error' | 'deleted'
     }
   }
 }

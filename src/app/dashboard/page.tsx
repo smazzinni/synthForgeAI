@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { useAuth } from '@/hooks/use-auth'
-import { apiGet, invalidateCache } from '@/lib/api-client'
+import { apiGet, apiPost, invalidateCache } from '@/lib/api-client'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -176,7 +176,7 @@ export default function DashboardPage() {
     schemaInfo: string
   } | null>(null)
 
-  const handleFileUpload = (file: File) => {
+  const handleFileUpload = async (file: File) => {
     const ext = file.name.split('.').pop()?.toLowerCase() || ''
     const supportedExts = ['sql', 'csv', 'xlsx', 'xls', 'json', 'xml', 'parquet', 'sqlite', 'db', 'dump', 'sql.gz', 'bson']
     if (!supportedExts.some(se => ext.endsWith(se))) {
@@ -193,6 +193,25 @@ export default function DashboardPage() {
       fileType: typeMap[ext] || 'Unknown',
       schemaInfo: `Detected ${typeMap[ext] || 'data'} file (${(file.size / 1024).toFixed(1)} KB)`,
     })
+
+    // If JSON, upload immediately to /api/import for quick ingestion
+    if (ext === 'json') {
+      try {
+        const text = await file.text()
+        const resp = await apiPost<{ database?: { id: string } }>('/api/import', { fileName: file.name, fileType: 'json', content: text })
+        if (resp?.database?.id) {
+          toast.success(`Imported ${file.name} as database ${resp.database.id}`)
+          router.push(`/dashboard/studio?id=${resp.database.id}`)
+          return
+        }
+        toast.success(`File "${file.name}" ready for import`)
+      } catch (err) {
+        console.error('[Upload] Import failed:', err)
+        toast.error('Failed to import JSON file')
+      }
+      return
+    }
+
     toast.success(`File "${file.name}" ready for import`)
   }
 

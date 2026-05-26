@@ -4,6 +4,41 @@ import { getSupabaseAdmin } from '@/lib/supabase/admin'
 // ─── Export API ───
 // Exports database data in various formats: SQL, CSV, JSON, XLSX
 
+// ─── Maps schema/app-level type names to valid SQL types ───
+function mapToSQLType(type: string): string {
+  switch (type.toLowerCase()) {
+    case 'string':
+    case 'text':
+    case 'varchar':
+      return 'VARCHAR(255)'
+    case 'number':
+    case 'float':
+    case 'double':
+    case 'decimal':
+      return 'DECIMAL(18,2)'
+    case 'integer':
+    case 'int':
+    case 'bigint':
+      return 'INTEGER'
+    case 'boolean':
+    case 'bool':
+      return 'BOOLEAN'
+    case 'date':
+      return 'DATE'
+    case 'timestamp':
+    case 'datetime':
+      return 'TIMESTAMP'
+    case 'uuid':
+      return 'UUID'
+    case 'json':
+    case 'jsonb':
+      return 'JSONB'
+    default:
+      // If it already looks like a SQL type (e.g. VARCHAR(255)), pass it through uppercased
+      return type.toUpperCase()
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
@@ -70,11 +105,13 @@ export async function POST(request: NextRequest) {
         break
 
       case 'xlsx':
-        // For XLSX, we return CSV format (can be opened in Excel)
-        // A proper XLSX would require a library like exceljs
+        // ✅ A proper XLSX requires a binary library (e.g. exceljs).
+        // Returning CSV content with an .xlsx extension produces a corrupt file
+        // that modern Excel rejects. Fall back to CSV with the correct extension
+        // and content-type so the file is always openable.
         content = generateCSV(tablesToExport, tableName)
-        contentType = 'application/vnd.ms-excel'
-        filename = `${dbName}${tableName ? `_${tableName}` : ''}.xlsx`
+        contentType = 'text/csv'
+        filename = `${dbName}${tableName ? `_${tableName}` : ''}.csv`
         break
 
       default:
@@ -110,7 +147,9 @@ function generateSQLDump(
     sql += `CREATE TABLE ${tableName} (\n`
     if (tableSchema) {
       const colDefs = tableSchema.columns.map(col => {
-        let def = `  ${col.name} ${col.type.toUpperCase()}`
+        // ✅ Use mapToSQLType so app-level types like "string" become "VARCHAR(255)"
+        // instead of the invalid SQL keyword "STRING"
+        let def = `  ${col.name} ${mapToSQLType(col.type)}`
         if (col.name === 'id') def += ' PRIMARY KEY'
         return def
       })
@@ -119,8 +158,15 @@ function generateSQLDump(
       // Infer from data
       if (tableRows.length > 0) {
         const cols = Object.keys(tableRows[0]).map(key => {
-          let def = `  ${key} VARCHAR(255)`
-          if (key === 'id' || key.endsWith('_id')) def = `  ${key} UUID`
+          let def: string
+          if (key === 'id') {
+            // ✅ Add PRIMARY KEY in the inferred path, consistent with the schema path
+            def = `  ${key} UUID PRIMARY KEY`
+          } else if (key.endsWith('_id')) {
+            def = `  ${key} UUID`
+          } else {
+            def = `  ${key} VARCHAR(255)`
+          }
           return def
         })
         sql += cols.join(',\n')

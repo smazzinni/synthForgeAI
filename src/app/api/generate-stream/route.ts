@@ -1,273 +1,233 @@
-import { NextRequest } from 'next/server'
-import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import { NextRequest } from "next/server";
+import { getSupabaseAdmin } from "@/lib/supabase/admin";
+import { validateAndCleanRecord } from "@/lib/record-validation";
 
 // ─── Streaming Database Generation API ───
 // Receives a generation signal (schema + row counts + instructions),
 // calls the AI to produce NDJSON records, parses them line-by-line,
 // batch-inserts into the database, and streams SSE progress to the frontend.
 
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
-const DEEPSEEK_API_URL = process.env.DEEPSEEK_API_URL || 'https://api.deepseek.com'
-const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+const DEEPSEEK_API_URL =
+  process.env.DEEPSEEK_API_URL || "https://api.deepseek.com";
+const DEFAULT_USER_ID = "5a784d48-945a-47d3-ae95-d2aa5d9abe8c";
 
-const BATCH_SIZE = 200          // rows per batch insert
-const FLUSH_INTERVAL_MS = 300   // flush batch at least every 300ms
+const BATCH_SIZE = 200;
+const FLUSH_INTERVAL_MS = 300;
+const STALE_GENERATION_TIMEOUT_MS = 5 * 60 * 1000;
+
+const dbLocks: Map<string, Promise<void>> = new Map();
+
+async function markDatabaseStatus(
+  admin: ReturnType<typeof getSupabaseAdmin>,
+  databaseId: string,
+  status: "generating" | "ready" | "error",
+) {
+  try {
+    await admin
+      .from("synthetic_databases")
+      .update({ status })
+      .eq("id", databaseId);
+  } catch (err) {
+    console.warn(
+      `[Generate-Stream] Failed to set database ${databaseId} status to ${status}:`,
+      err,
+    );
+  }
+}
+
+function isStaleGeneration(
+  status: string | null | undefined,
+  updatedAt: string | null | undefined,
+) {
+  if (status !== "generating") return false;
+  if (!updatedAt) return false;
+  const ageMs = Date.now() - new Date(updatedAt).getTime();
+  return ageMs > STALE_GENERATION_TIMEOUT_MS;
+}
+
+async function acquireDbLock(id: string) {
+  const prev = dbLocks.get(id) || Promise.resolve();
+  let resolveFn!: () => void;
+  const next = new Promise<void>((res) => {
+    resolveFn = res;
+  });
+  dbLocks.set(
+    id,
+    prev.then(() => next),
+  );
+  await prev;
+  return () => {
+    resolveFn();
+    if (dbLocks.get(id) === next) dbLocks.delete(id);
+  };
+}
+
+// ─── Safe UUID generator (Bug 7 fix) ───
+function generateUUID(): string {
+  if (
+    typeof globalThis.crypto !== "undefined" &&
+    typeof (globalThis.crypto as Crypto).randomUUID === "function"
+  ) {
+    return (globalThis.crypto as Crypto).randomUUID();
+  }
+  // Fallback: proper RFC 4122 v4 UUID
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
 
 // ─── Types ───
 interface GenerationSchema {
-  name: string
-  columns: Array<{ name: string; type: string }>
-}
-
-// ─── Validation result for a single record ───
-interface ValidationResult {
-  valid: boolean
-  cleanedRecord: Record<string, unknown>
-  failures: Array<{ column: string; value: unknown; reason: string }>
+  name: string;
+  columns: Array<{ name: string; type: string }>;
 }
 
 interface GenerationRequest {
-  databaseId?: string
-  databaseName?: string
-  schema: GenerationSchema[]
-  rowCounts: Record<string, number>
-  instructions?: string
-  conversationHistory?: Array<{ role: string; content: string }>
-  userId?: string
+  databaseId?: string;
+  databaseName?: string;
+  schema: GenerationSchema[];
+  rowCounts: Record<string, number>;
+  instructions?: string;
+  conversationHistory?: Array<{ role: string; content: string }>;
+  userId?: string;
 }
 
 interface SSEEvent {
-  type: 'progress' | 'table_complete' | 'complete' | 'error' | 'database_created'
-  table?: string
-  rowsInserted?: number
-  totalInserted?: number
-  targetRows?: number
-  totalRows?: number
-  tablesGenerated?: number
-  durationMs?: number
-  message?: string
-  recoverable?: boolean
-  databaseId?: string
+  type:
+    | "progress"
+    | "table_complete"
+    | "complete"
+    | "error"
+    | "database_created";
+  table?: string;
+  rowsInserted?: number;
+  totalInserted?: number;
+  targetRows?: number;
+  totalRows?: number;
+  tablesGenerated?: number;
+  durationMs?: number;
+  message?: string;
+  recoverable?: boolean;
+  databaseId?: string;
 }
 
-// ─── Lightweight user extraction ───
 function getUserIdFromCookies(request: NextRequest): string | null {
   try {
-    const supabaseCookies = request.cookies.getAll().filter(c =>
-      c.name.includes('-auth-token')
-    )
+    const supabaseCookies = request.cookies
+      .getAll()
+      .filter((c) => c.name.includes("-auth-token"));
     for (const cookie of supabaseCookies) {
       try {
-        const rawValue = decodeURIComponent(cookie.value)
-        let accessToken: string | null = null
+        const rawValue = decodeURIComponent(cookie.value);
+        let accessToken: string | null = null;
         try {
-          const parsed = JSON.parse(rawValue)
-          accessToken = parsed?.access_token || null
+          const parsed = JSON.parse(rawValue);
+          accessToken = parsed?.access_token || null;
         } catch {
-          accessToken = rawValue
+          accessToken = rawValue;
         }
-        if (!accessToken) continue
-        const parts = accessToken.split('.')
-        if (parts.length !== 3) continue
-        const payload = JSON.parse(atob(parts[1]))
-        if (payload?.sub) return payload.sub
+        if (!accessToken) continue;
+        const parts = accessToken.split(".");
+        if (parts.length !== 3) continue;
+        const payload = JSON.parse(atob(parts[1]));
+        if (payload?.sub) return payload.sub;
       } catch {
-        continue
+        continue;
       }
     }
-    return null
+    return null;
   } catch {
-    return null
+    return null;
   }
 }
 
-// ─── Extract locale constraints from conversation history ───
-function extractLocaleFromHistory(history: Array<{ role: string; content: string }>): string {
-  if (!history || history.length === 0) return ''
+function extractLocaleFromHistory(
+  history: Array<{ role: string; content: string }>,
+): string {
+  if (!history || history.length === 0) return "";
 
   const localeKeywords = [
-    'country', 'region', 'city', 'locale', 'location', 'area',
-    'nation', 'state', 'province', 'territory', 'postal code',
-    'phone format', 'address format', 'currency', 'timezone',
-  'india', 'delhi', 'mumbai', 'bangalore', 'chennai', 'kolkata', 'hyderabad', 'pune',
-    'usa', 'united states', 'america', 'new york', 'california', 'texas', 'florida',
-    'uk', 'united kingdom', 'london', 'england', 'manchester',
-    'germany', 'berlin', 'munich', 'france', 'paris', 'lyon',
-    'japan', 'tokyo', 'osaka', 'china', 'beijing', 'shanghai',
-    'brazil', 'são paulo', 'rio', 'australia', 'sydney', 'melbourne',
-    'canada', 'toronto', 'vancouver', 'mexico', 'mexico city',
-    'italy', 'rome', 'milan', 'spain', 'madrid', 'barcelona',
-    'south korea', 'seoul', 'netherlands', 'amsterdam',
-    'singapore', 'hong kong', 'dubai', 'uae',
-    'africa', 'nigeria', 'lagos', 'kenya', 'nairobi', 'south africa', 'cape town',
-    'russia', 'moscow', 'poland', 'warsaw', 'sweden', 'stockholm',
-    'norway', 'oslo', 'denmark', 'copenhagen', 'finland', 'helsinki',
-    'switzerland', 'zurich', 'geneva', 'austria', 'vienna',
-    'belgium', 'brussels', 'portugal', 'lisbon',
-    'argentina', 'buenos aires', 'colombia', 'bogota', 'chile', 'santiago',
-    'peru', 'lima', 'ecuador', 'venezuela',
-    'thailand', 'bangkok', 'vietnam', 'hanoi', 'ho chi minh',
-    'malaysia', 'kuala lumpur', 'philippines', 'manila', 'indonesia', 'jakarta',
-    'pakistan', 'karachi', 'lahore', 'bangladesh', 'dhaka',
-    'egypt', 'cairo', 'morocco', 'casablanca',
-    'saudi arabia', 'riyadh', 'jeddah', 'qatar', 'doha',
-    'turkey', 'istanbul', 'ankara', 'israel', 'tel aviv',
-    'greece', 'athens', 'czech', 'prague', 'hungary', 'budapest',
-    'romania', 'bucharest', 'ireland', 'dublin',
-    'new zealand', 'auckland', 'wellington',
-  ]
+    "country", "region", "city", "locale", "location", "area", "nation",
+    "state", "province", "territory", "postal code", "phone format",
+    "address format", "currency", "timezone",
+    "india", "delhi", "mumbai", "bangalore", "chennai", "kolkata",
+    "hyderabad", "pune", "usa", "united states", "america", "new york",
+    "california", "texas", "florida", "uk", "united kingdom", "london",
+    "england", "manchester", "germany", "berlin", "munich", "france",
+    "paris", "lyon", "japan", "tokyo", "osaka", "china", "beijing",
+    "shanghai", "brazil", "são paulo", "rio", "australia", "sydney",
+    "melbourne", "canada", "toronto", "vancouver", "mexico", "mexico city",
+    "italy", "rome", "milan", "spain", "madrid", "barcelona",
+    "south korea", "seoul", "netherlands", "amsterdam", "singapore",
+    "hong kong", "dubai", "uae", "africa", "nigeria", "lagos", "kenya",
+    "nairobi", "south africa", "cape town", "russia", "moscow", "poland",
+    "warsaw", "sweden", "stockholm", "norway", "oslo", "denmark",
+    "copenhagen", "finland", "helsinki", "switzerland", "zurich", "geneva",
+    "austria", "vienna", "belgium", "brussels", "portugal", "lisbon",
+    "argentina", "buenos aires", "colombia", "bogota", "chile", "santiago",
+    "peru", "lima", "ecuador", "venezuela", "thailand", "bangkok",
+    "vietnam", "hanoi", "ho chi minh", "malaysia", "kuala lumpur",
+    "philippines", "manila", "indonesia", "jakarta", "pakistan", "karachi",
+    "lahore", "bangladesh", "dhaka", "egypt", "cairo", "morocco",
+    "casablanca", "saudi arabia", "riyadh", "jeddah", "qatar", "doha",
+    "turkey", "istanbul", "ankara", "israel", "tel aviv", "greece",
+    "athens", "czech", "prague", "hungary", "budapest", "romania",
+    "bucharest", "ireland", "dublin", "new zealand", "auckland", "wellington",
+  ];
 
-  const localeParts: string[] = []
+  const localeParts: string[] = [];
 
   for (const msg of history) {
-    const lower = msg.content.toLowerCase()
+    const lower = msg.content.toLowerCase();
     for (const keyword of localeKeywords) {
       if (lower.includes(keyword)) {
-        // Extract the surrounding context (up to 150 chars around the keyword)
-        const idx = lower.indexOf(keyword)
-        const start = Math.max(0, idx - 60)
-        const end = Math.min(msg.content.length, idx + keyword.length + 90)
-        const snippet = msg.content.substring(start, end).trim()
-        localeParts.push(snippet)
-        break // One snippet per message is enough
+        const idx = lower.indexOf(keyword);
+        const start = Math.max(0, idx - 60);
+        const end = Math.min(msg.content.length, idx + keyword.length + 90);
+        const snippet = msg.content.substring(start, end).trim();
+        localeParts.push(snippet);
+        break;
       }
     }
   }
 
-  if (localeParts.length === 0) return ''
+  if (localeParts.length === 0) return "";
 
-  // Deduplicate and join
-  const unique = [...new Set(localeParts.map(s => s.toLowerCase()))].slice(0, 5)
+  const unique = [...new Set(localeParts.map((s) => s.toLowerCase()))].slice(0, 5);
   return `LOCALE CONTEXT (from user conversation):
 The user specified the following location/region preferences:
-${unique.map(s => `- ${s}`).join('\n')}
-You MUST use this locale for ALL location-sensitive fields: city names, state/province names, phone number prefixes and formats, postal/zip code formats, address formats, currency symbols, and any other region-specific data. Do NOT default to US or any other region.`
+${unique.map((s) => `- ${s}`).join("\n")}
+You MUST use this locale for ALL location-sensitive fields: city names, state/province names, phone number prefixes and formats, postal/zip code formats, address formats, currency symbols, and any other region-specific data. Do NOT default to US or any other region.`;
 }
 
-// ─── Validate and clean a record against the table schema ───
-function validateAndCleanRecord(
-  tableName: string,
-  record: Record<string, unknown>,
-  schemaColumns: Array<{ name: string; type: string }>,
-  existingPrimaryKeys: Set<string>   // for FK validation
-): ValidationResult {
-  const failures: Array<{ column: string; value: unknown; reason: string }> = []
-  const cleanedRecord: Record<string, unknown> = {}
-
-  // Build a set of valid column names for this table
-  const validColumns = new Set(schemaColumns.map(c => c.name))
-
-  // Build a type lookup map
-  const typeLookup = new Map(schemaColumns.map(c => [c.name, c.type.toLowerCase()]))
-
-  // Step 1: Only keep keys that exist in the schema (Bug 2 fix)
-  for (const [key, value] of Object.entries(record)) {
-    if (!validColumns.has(key)) {
-      // Extra field not in schema — drop it silently
-      continue
-    }
-    cleanedRecord[key] = value
-  }
-
-  // Step 2: Ensure all schema columns exist in the cleaned record (fill nulls for missing)
-  for (const col of schemaColumns) {
-    if (!(col.name in cleanedRecord)) {
-      cleanedRecord[col.name] = null
-    }
-  }
-
-  // Step 3: Validate each value against its column type and semantic rules (Bug 3 fix)
-  for (const col of schemaColumns) {
-    const value = cleanedRecord[col.name]
-    if (value === null || value === undefined) continue // nulls are allowed
-
-    const colType = typeLookup.get(col.name) || ''
-    const colName = col.name.toLowerCase()
-
-    // UUID validation
-    if (colType.includes('uuid') || colName === 'id' || (colName.endsWith('_id') && colType.includes('uuid'))) {
-      if (typeof value !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
-        // Try to fix: if it looks like a name or email in a UUID column, it's wrong
-        failures.push({ column: col.name, value, reason: `Expected UUID format, got: ${typeof value === 'string' ? value.substring(0, 50) : typeof value}` })
-        cleanedRecord[col.name] = null
-        continue
-      }
-    }
-
-    // FK UUID validation — columns ending in _id that reference another table
-    if (colName.endsWith('_id') && colName !== 'id' && (colType.includes('uuid') || colType.includes('char'))) {
-      if (typeof value !== 'string') {
-        failures.push({ column: col.name, value, reason: `FK column expected UUID string, got: ${typeof value}` })
-        cleanedRecord[col.name] = null
-        continue
-      }
-      // If it's supposed to be a UUID FK, validate format
-      if (colType.includes('uuid') && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
-        // It might be a name/email/city in a FK column — definitely wrong
-        if (value.includes('@') || /^[A-Z]/i.test(value) && value.length < 50 && !value.includes('-')) {
-          failures.push({ column: col.name, value, reason: `FK UUID column contains non-UUID value (possible name/email): ${value.substring(0, 50)}` })
-          cleanedRecord[col.name] = null
-          continue
-        }
-      }
-    }
-
-    // Email validation
-    if (colName.includes('email')) {
-      if (typeof value !== 'string' || (!value.includes('@') || !value.includes('.'))) {
-        failures.push({ column: col.name, value, reason: `Expected email format, got: ${typeof value === 'string' ? value.substring(0, 50) : typeof value}` })
-        cleanedRecord[col.name] = null
-        continue
-      }
-    }
-
-    // Timestamp validation for created_/updated_ columns
-    if ((colName.startsWith('created_') || colName.startsWith('updated_')) && (colType.includes('timestamp') || colType.includes('date') || colType.includes('time'))) {
-      if (typeof value === 'string') {
-        const dateVal = new Date(value)
-        if (isNaN(dateVal.getTime())) {
-          failures.push({ column: col.name, value, reason: `Invalid date format: ${value.substring(0, 50)}` })
-          cleanedRecord[col.name] = null
-          continue
-        }
-        // Must be a plausible record creation date (not a birth year, not ancient)
-        const year = dateVal.getFullYear()
-        if (year < 2015 || year > new Date().getFullYear() + 1) {
-          failures.push({ column: col.name, value, reason: `Timestamp ${col.name} has implausible year ${year} (expected 2015-present): ${value}` })
-          cleanedRecord[col.name] = null
-          continue
-        }
-      }
-    }
-  }
-
-  return {
-    valid: true, // We clean rather than reject entirely; null out bad values instead of dropping the whole row
-    cleanedRecord,
-    failures,
-  }
-}
-
-// ─── Build NDJSON generation prompt ───
-function buildGenerationPrompt(req: GenerationRequest, localeContext: string): string {
-  const tableDescriptions = req.schema.map(table => {
-    const colDefs = table.columns.map(c => `  ${c.name}: ${c.type}`).join('\n')
-    const rowCount = req.rowCounts[table.name] || 10
-    // Explicitly list the exact column names the AI must use
-    const columnNames = table.columns.map(c => c.name).join(', ')
-    return `Table: ${table.name} (${rowCount} rows)
+function buildGenerationPrompt(
+  req: GenerationRequest,
+  localeContext: string,
+): string {
+  const tableDescriptions = req.schema
+    .map((table) => {
+      const colDefs = table.columns
+        .map((c) => `  ${c.name}: ${c.type}`)
+        .join("\n");
+      const rowCount = req.rowCounts[table.name] || 10;
+      const columnNames = table.columns.map((c) => c.name).join(", ");
+      return `Table: ${table.name} (${rowCount} rows)
 Columns: ${columnNames}
-${colDefs}`
-  }).join('\n\n')
+${colDefs}`;
+    })
+    .join("\n\n");
 
   return `You are a data generation engine. Generate realistic synthetic data for the following database schema.
 
-DATABASE: ${req.databaseName || 'synthetic_db'}
+DATABASE: ${req.databaseName || "synthetic_db"}
 
 SCHEMA:
 ${tableDescriptions}
 
-${localeContext ? `${localeContext}\n\n` : ''}${req.instructions ? `ADDITIONAL INSTRUCTIONS:\n${req.instructions}\n` : ''}
+${localeContext ? `${localeContext}\n\n` : ""}${req.instructions ? `ADDITIONAL INSTRUCTIONS:\n${req.instructions}\n` : ""}
 
 STRICT COLUMN RULES:
 - You MUST generate ONLY the columns listed above for each table. No extra fields.
@@ -303,366 +263,664 @@ Example output format:
 ###TABLE:orders###
 {"id":"c3d4e5f6-7890-1234-cdef-123456789012","user_id":"a1b2c3d4-5678-9012-abcd-ef1234567890","total":99.99,"created_at":"2024-02-01T09:15:00Z"}
 
-Now generate the data. Start with ###TABLE:${req.schema[0]?.name || 'table1'}###`
+Now generate the data. Start with ###TABLE:${req.schema[0]?.name || "table1"}###`;
 }
 
 export async function POST(request: NextRequest) {
   try {
-    const text = await request.text()
+    const text = await request.text();
     if (text.length > 200000) {
-      return new Response(JSON.stringify({ error: 'Request too large' }), {
+      return new Response(JSON.stringify({ error: "Request too large" }), {
         status: 413,
-        headers: { 'Content-Type': 'application/json' },
-      })
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
-    const body: GenerationRequest = JSON.parse(text)
+    const body: GenerationRequest = JSON.parse(text);
 
     if (!body.schema || body.schema.length === 0) {
-      return new Response(JSON.stringify({ error: 'Schema is required' }), {
+      return new Response(JSON.stringify({ error: "Schema is required" }), {
         status: 400,
-        headers: { 'Content-Type': 'application/json' },
-      })
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
     if (!DEEPSEEK_API_KEY) {
-      return new Response(JSON.stringify({ error: 'DeepSeek API key not configured' }), {
+      return new Response(
+        JSON.stringify({ error: "DeepSeek API key not configured" }),
+        { status: 503, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    const userId =
+      getUserIdFromCookies(request) || body.userId || DEFAULT_USER_ID;
+    const startTime = Date.now();
+
+    let databaseId = body.databaseId;
+    const admin = getSupabaseAdmin();
+
+    // If Supabase admin client isn't configured, fail fast so frontend can
+    // surface a clear error instead of silently accumulating in-memory data
+    // and never writing to the user's database.
+    if (!admin) {
+      console.warn('[Generate-Stream] Supabase admin client not configured');
+      return new Response(JSON.stringify({ error: 'Database service not configured' }), {
         status: 503,
         headers: { 'Content-Type': 'application/json' },
-      })
+      });
     }
 
-    const userId = getUserIdFromCookies(request) || body.userId || DEFAULT_USER_ID
-    const startTime = Date.now()
+    if (admin) {
+      if (databaseId) {
+        const { data: existingDb, error: selectError } = await admin
+          .from("synthetic_databases")
+          .select("status, updated_at")
+          .eq("id", databaseId)
+          .single();
 
-    // ─── Ensure a database record exists ───
-    let databaseId = body.databaseId
-    const admin = getSupabaseAdmin()
+        const isStale =
+          existingDb &&
+          !selectError &&
+          isStaleGeneration(existingDb.status, existingDb.updated_at);
 
-    if (!databaseId && admin) {
-      const dbName = body.databaseName || body.schema[0]?.name || 'synthetic_db'
-      const { data: newDb, error: dbError } = await admin
-        .from('synthetic_databases')
-        .insert({
-          name: dbName,
-          db_type: 'postgresql',
-          schema_json: body.schema,
-          data_json: {},
-          row_count: 0,
-          quality_score: 0.85,
-          status: 'generating',
-          user_id: userId,
-        })
-        .select()
-        .single()
+        if (
+          existingDb &&
+          !selectError &&
+          existingDb.status === "generating" &&
+          !isStale
+        ) {
+          return new Response(
+            JSON.stringify({
+              error: "Database is currently generating. Try again later.",
+            }),
+            { status: 409, headers: { "Content-Type": "application/json" } },
+          );
+        }
 
-      if (!dbError && newDb) {
-        databaseId = newDb.id
-      }
-    } else if (databaseId && admin) {
-      // Update existing database status
-      await admin
-        .from('synthetic_databases')
-        .update({ status: 'generating' })
-        .eq('id', databaseId)
-    }
+        if (existingDb && !selectError && existingDb.status === "generating" && isStale) {
+          console.warn(
+            `[Generate-Stream] Reclaiming stale generating status for database ${databaseId}`,
+          );
+        }
 
-    // ─── Extract locale context from conversation history (Bug 4 fix) ───
-    const localeContext = extractLocaleFromHistory(body.conversationHistory || [])
+        await admin
+          .from("synthetic_databases")
+          .update({ status: "generating" })
+          .eq("id", databaseId);
+      } else {
+        const dbName =
+          body.databaseName || body.schema[0]?.name || "synthetic_db";
 
-    // ─── Build schema lookup map for record validation ───
-    const schemaLookup = new Map<string, Array<{ name: string; type: string }>>()
-    for (const table of body.schema) {
-      schemaLookup.set(table.name, table.columns)
-    }
+        const { data: existingDb, error: selectError } = await admin
+          .from("synthetic_databases")
+          .select("id, status, updated_at")
+          .eq("user_id", userId)
+          .eq("name", dbName)
+          .single();
 
-    // ─── Build messages for the AI ───
-    const generationPrompt = buildGenerationPrompt(body, localeContext)
+        if (existingDb && !selectError) {
+          const isStale = isStaleGeneration(existingDb.status, existingDb.updated_at);
+          if (existingDb.status === "generating" && !isStale) {
+            return new Response(
+              JSON.stringify({
+                error: "Database is currently generating. Try again later.",
+              }),
+              { status: 409, headers: { "Content-Type": "application/json" } },
+            );
+          }
 
-    const messages: Array<{ role: string; content: string }> = [
-      { role: 'system', content: generationPrompt },
-    ]
+          if (existingDb.status === "generating" && isStale) {
+            console.warn(
+              `[Generate-Stream] Reclaiming stale generating status for database ${existingDb.id}`,
+            );
+          }
 
-    // Include relevant conversation history for context
-    if (body.conversationHistory && body.conversationHistory.length > 0) {
-      const recentHistory = body.conversationHistory.slice(-6)
-      for (const msg of recentHistory) {
-        if (msg.role === 'user' || msg.role === 'assistant') {
-          messages.push({ role: msg.role, content: msg.content })
+          databaseId = existingDb.id;
+          await admin
+            .from("synthetic_databases")
+            .update({ status: "generating" })
+            .eq("id", databaseId);
+        } else {
+          const { data: newDb, error: dbError } = await admin
+            .from("synthetic_databases")
+            .insert({
+              name: dbName,
+              db_type: "postgresql",
+              schema_json: body.schema,
+              data_json: {},
+              row_count: 0,
+              quality_score: 0.85,
+              status: "generating",
+              user_id: userId,
+            })
+            .select()
+            .single();
+
+          if (!dbError && newDb) {
+            databaseId = newDb.id;
+          } else if (dbError) {
+            if (
+              dbError.code === "23505" ||
+              dbError.message?.includes("unique")
+            ) {
+              const { data: fallbackDb } = await admin
+                .from("synthetic_databases")
+                .select("id")
+                .eq("user_id", userId)
+                .eq("name", dbName)
+                .single();
+
+              if (fallbackDb) {
+                databaseId = fallbackDb.id;
+                await admin
+                  .from("synthetic_databases")
+                  .update({ status: "generating" })
+                  .eq("id", databaseId);
+              } else {
+                const uniqueName = `${dbName}_${Date.now()}`;
+                const { data: newDb2 } = await admin
+                  .from("synthetic_databases")
+                  .insert({
+                    name: uniqueName,
+                    db_type: "postgresql",
+                    schema_json: body.schema,
+                    data_json: {},
+                    row_count: 0,
+                    quality_score: 0.85,
+                    status: "generating",
+                    user_id: userId,
+                  })
+                  .select()
+                  .single();
+                if (newDb2) databaseId = newDb2.id;
+              }
+            }
+          }
         }
       }
     }
 
-    // Add the final generation instruction
-    const totalRows = Object.values(body.rowCounts).reduce((sum, n) => sum + n, 0)
-    messages.push({
-      role: 'user',
-      content: `Generate the data now. ${totalRows} total rows across ${body.schema.length} tables. Begin with ###TABLE:${body.schema[0]?.name}###`,
-    })
+    const localeContext = extractLocaleFromHistory(
+      body.conversationHistory || [],
+    );
 
-    // ─── Call DeepSeek API with streaming ───
-    const deepseekResponse = await fetch(`${DEEPSEEK_API_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+    const originalTableData: Record<string, unknown[]> = {};
+
+    if (admin && databaseId) {
+      const { data: existingDataResponse, error: existingDataError } = await admin
+        .from("synthetic_databases")
+        .select("data_json")
+        .eq("id", databaseId)
+        .single();
+      if (!existingDataError && existingDataResponse?.data_json) {
+        Object.assign(
+          originalTableData,
+          existingDataResponse.data_json as Record<string, unknown[]>,
+        );
+      }
+    }
+
+    const schemaLookup = new Map<
+      string,
+      Array<{ name: string; type: string }>
+    >();
+    for (const table of body.schema) {
+      schemaLookup.set(table.name, table.columns);
+    }
+
+    const generationPrompt = buildGenerationPrompt(body, localeContext);
+
+    const messages: Array<{ role: string; content: string }> = [
+      { role: "system", content: generationPrompt },
+    ];
+
+    if (body.conversationHistory && body.conversationHistory.length > 0) {
+      const recentHistory = body.conversationHistory.slice(-6);
+      for (const msg of recentHistory) {
+        if (msg.role === "user" || msg.role === "assistant") {
+          messages.push({ role: msg.role, content: msg.content });
+        }
+      }
+    }
+
+    const totalRows = Object.values(body.rowCounts).reduce(
+      (sum, n) => sum + n,
+      0,
+    );
+    messages.push({
+      role: "user",
+      content: `Generate the data now. ${totalRows} total rows across ${body.schema.length} tables. Begin with ###TABLE:${body.schema[0]?.name}###`,
+    });
+
+    const deepseekResponse = await fetch(
+      `${DEEPSEEK_API_URL}/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "deepseek-reasoner",
+          messages,
+          stream: true,
+          max_tokens: 65536,
+          stream_options: { include_usage: true },
+        }),
       },
-      body: JSON.stringify({
-        model: 'deepseek-reasoner',
-        messages,
-        stream: true,
-        max_tokens: 65536,
-        stream_options: { include_usage: true },
-      }),
-    })
+    );
 
     if (!deepseekResponse.ok) {
-      const errorText = await deepseekResponse.text().catch(() => 'Unknown error')
-      console.error('[Generate-Stream] DeepSeek error:', deepseekResponse.status, errorText)
-      return new Response(JSON.stringify({ error: 'AI service error' }), {
+      const errorText = await deepseekResponse
+        .text()
+        .catch(() => "Unknown error");
+      console.error(
+        "[Generate-Stream] DeepSeek error:",
+        deepseekResponse.status,
+        errorText,
+      );
+
+      if (admin && databaseId) {
+        await markDatabaseStatus(admin, databaseId, "error");
+      }
+
+      return new Response(JSON.stringify({ error: "AI service error" }), {
         status: deepseekResponse.status,
-        headers: { 'Content-Type': 'application/json' },
-      })
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
-    // ─── Set up SSE stream ───
-    const encoder = new TextEncoder()
-    const reader = deepseekResponse.body?.getReader()
+    const encoder = new TextEncoder();
+    const reader = deepseekResponse.body?.getReader();
 
     if (!reader) {
-      return new Response(JSON.stringify({ error: 'No response stream' }), {
+      if (admin && databaseId) {
+        await markDatabaseStatus(admin, databaseId, "error");
+      }
+      return new Response(JSON.stringify({ error: "No response stream" }), {
         status: 500,
-        headers: { 'Content-Type': 'application/json' },
-      })
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
-    // ─── Data accumulation state ───
-    const allTableData: Record<string, unknown[]> = {}
-    let currentTable = ''
-    let insertQueue: unknown[] = []
-    let totalInserted = 0
-    let currentTableInserted = 0
-    let lastFlushTime = Date.now()
-    let malformedLines = 0
-    let validationSkippedRows = 0   // rows skipped due to validation failures
-    const allValidationFailures: Array<{ table: string; column: string; value: unknown; reason: string }> = []
+    const allTableData: Record<string, unknown[]> = {};
+    const primaryKeySets: Map<string, Set<string>> = new Map();
+    let currentTable = "";
+    let insertQueue: unknown[] = [];
+    let totalInserted = 0;
+    let currentTableInserted = 0;
+    let lastFlushTime = Date.now();
+    let malformedLines = 0;
+    const allValidationFailures: Array<{
+      table: string;
+      column: string;
+      value: unknown;
+      reason: string;
+    }> = [];
 
     const sendSSE = (event: SSEEvent): Uint8Array => {
-      return encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
+      return encoder.encode(`data: ${JSON.stringify(event)}\n\n`);
+    };
+
+    // FIX (Bug 2): separate flush-level lock from generation-level lock
+    // The generation lock serializes the entire generation across concurrent
+    // requests; the flush lock only serializes individual DB writes.
+    let generationLockRelease: (() => void) | null = null;
+    const flushLock = { release: null as (() => void) | null };
+
+    if (admin && databaseId) {
+      try {
+        generationLockRelease = await acquireDbLock(databaseId);
+      } catch {
+        generationLockRelease = null;
+      }
     }
 
-    // ─── Flush batch insert ───
-    const flushBatch = async (tableName: string, records: unknown[]): Promise<void> => {
-      if (records.length === 0) return
+    const flushBatch = async (
+      tableName: string,
+      records: unknown[],
+    ): Promise<void> => {
+      if (records.length === 0) return;
 
-      // Add to in-memory data
       if (!allTableData[tableName]) {
-        allTableData[tableName] = []
+        allTableData[tableName] = [];
       }
-      allTableData[tableName].push(...records)
+      allTableData[tableName].push(...records);
 
-      // Update database record periodically
       if (admin && databaseId) {
+        // FIX (Bug 2): always acquire the flush-level lock independently
+        let release: (() => void) | null = null;
         try {
-          const { data: db } = await admin
-            .from('synthetic_databases')
-            .select('data_json')
-            .eq('id', databaseId)
-            .single()
+          release = await acquireDbLock(`flush:${databaseId}`);
 
-          const existingData = (db?.data_json as Record<string, unknown[]>) || {}
+          const { data: db } = await admin
+            .from("synthetic_databases")
+            .select("data_json")
+            .eq("id", databaseId)
+            .single();
+
+          const existingData =
+            (db?.data_json as Record<string, unknown[]>) || {};
           if (!existingData[tableName]) {
-            existingData[tableName] = []
+            existingData[tableName] = [];
           }
-          existingData[tableName] = [...existingData[tableName], ...records]
+          existingData[tableName] = [...existingData[tableName], ...records];
 
           await admin
-            .from('synthetic_databases')
+            .from("synthetic_databases")
             .update({
               data_json: existingData,
               row_count: totalInserted + records.length,
             })
-            .eq('id', databaseId)
+            .eq("id", databaseId);
         } catch (err) {
-          console.warn('[Generate-Stream] DB update failed:', err)
+          console.warn("[Generate-Stream] DB update failed:", err);
+        } finally {
+          if (release) release();
         }
       }
 
-      totalInserted += records.length
-      currentTableInserted += records.length
-    }
+      totalInserted += records.length;
+      currentTableInserted += records.length;
+    };
 
-    // ─── Create the SSE ReadableStream ───
-    const stream = new ReadableStream({
-      async start(controller) {
-        const decoder = new TextDecoder()
-        let aiBuffer = ''
-        let contentBuffer = ''    // accumulated AI content (non-reasoning)
-        let closed = false
+    // ─── Helper: process a single NDJSON/marker line ───
+    const processLine = async (
+      line: string,
+      controller: ReadableStreamDefaultController,
+      closed: { value: boolean },
+    ) => {
+      const safeEnqueue = (data: Uint8Array) => {
+        if (closed.value) return;
+        try {
+          controller.enqueue(data);
+        } catch {
+          closed.value = true;
+        }
+      };
 
-        const safeEnqueue = (data: Uint8Array) => {
-          if (closed) return
-          try {
-            controller.enqueue(data)
-          } catch {
-            closed = true
-          }
+      if (!line) return;
+
+      const tableMarker = line.match(/^#{3}\s*TABLE\s*:\s*([^#]+?)\s*#{3}$/i);
+      if (tableMarker) {
+        if (insertQueue.length > 0 && currentTable) {
+          await flushBatch(currentTable, insertQueue.splice(0));
+          safeEnqueue(
+            sendSSE({
+              type: "progress",
+              table: currentTable,
+              rowsInserted: currentTableInserted,
+              totalInserted,
+              targetRows: body.rowCounts[currentTable] || 0,
+            }),
+          );
         }
 
-        // Send initial event with databaseId
-        safeEnqueue(sendSSE({
-          type: 'progress',
-          table: '',
-          message: `Generating database schema...`,
-          rowsInserted: 0,
-          totalInserted: 0,
-          targetRows: totalRows,
-        }))
+        currentTable = tableMarker[1].trim();
+        const existingRows =
+          originalTableData[currentTable] || allTableData[currentTable] || [];
+        const pkSet = new Set<string>();
+        for (const row of existingRows) {
+          const id = (row as Record<string, unknown>)["id"];
+          if (id != null) pkSet.add(String(id));
+        }
+        primaryKeySets.set(currentTable, pkSet);
+        currentTableInserted = existingRows.length;
 
-        // Send the databaseId so the frontend can track it
+        safeEnqueue(
+          sendSSE({
+            type: "progress",
+            table: currentTable,
+            rowsInserted: currentTableInserted,
+            totalInserted,
+            targetRows: body.rowCounts[currentTable] || 0,
+            message: `Streaming records into [${currentTable}]`,
+          }),
+        );
+        return;
+      }
+
+      if (!currentTable && line.trim().startsWith('{') && body.schema.length > 0) {
+        currentTable = body.schema[0].name;
+        const existingRows =
+          originalTableData[currentTable] || allTableData[currentTable] || [];
+        const pkSet = new Set<string>();
+        for (const row of existingRows) {
+          const id = (row as Record<string, unknown>)["id"];
+          if (id != null) pkSet.add(String(id));
+        }
+        primaryKeySets.set(currentTable, pkSet);
+        currentTableInserted = existingRows.length;
+
+        safeEnqueue(
+          sendSSE({
+            type: "progress",
+            table: currentTable,
+            rowsInserted: currentTableInserted,
+            totalInserted,
+            targetRows: body.rowCounts[currentTable] || 0,
+            message: `Streaming records into [${currentTable}]`,
+          }),
+        );
+      }
+
+      if (currentTable) {
+        try {
+          const rawRecord = JSON.parse(line);
+          if (
+            typeof rawRecord === "object" &&
+            rawRecord !== null &&
+            !Array.isArray(rawRecord)
+          ) {
+            const tableColumns = schemaLookup.get(currentTable);
+            if (tableColumns) {
+              const existingPKs =
+                primaryKeySets.get(currentTable) || new Set<string>();
+              const result = validateAndCleanRecord(
+                currentTable,
+                rawRecord as Record<string, unknown>,
+                tableColumns,
+                existingPKs,
+              );
+
+              // FIX (Bug 3): collect validation failures from result *after*
+              // the duplicate-ID check so all failures are captured together.
+              const idVal = String(result.cleanedRecord["id"] || "");
+              if (idVal) {
+                const pkSet =
+                  primaryKeySets.get(currentTable) || new Set<string>();
+                if (pkSet.has(idVal)) {
+                  // FIX (Bug 7): use safe generateUUID() instead of broken genHex
+                  const newId = generateUUID();
+                  result.failures.push({
+                    column: "id",
+                    value: idVal,
+                    reason: `Duplicate id auto-replaced: ${newId}`,
+                  });
+                  result.cleanedRecord["id"] = newId;
+                  pkSet.add(newId);
+                } else {
+                  pkSet.add(idVal);
+                }
+                primaryKeySets.set(currentTable, pkSet);
+              }
+
+              // Collect all failures (including the possible duplicate above)
+              for (const f of result.failures) {
+                allValidationFailures.push({ table: currentTable, ...f });
+                if (allValidationFailures.length <= 20) {
+                  console.warn(
+                    `[Generate-Stream] Validation failure in ${currentTable}: column=${f.column}, value=${String(f.value).substring(0, 50)}, reason=${f.reason}`,
+                  );
+                }
+              }
+
+              // ─── Foreign key checks: ensure *_id columns reference existing parent PKs ───
+              for (const [colName, colVal] of Object.entries(result.cleanedRecord)) {
+                if (!colName.endsWith('_id')) continue;
+                const fkVal = String(colVal || '');
+                if (!fkVal) continue;
+
+                // Heuristic: parent table is the column name without _id (try singular/plural)
+                const base = colName.slice(0, -3).toLowerCase();
+                const candidateTables = Array.from(schemaLookup.keys());
+                let parentTable: string | null = null;
+                for (const t of candidateTables) {
+                  const tn = t.toLowerCase();
+                  if (tn === base || tn === `${base}s` || tn === `${base}es`) {
+                    parentTable = t;
+                    break;
+                  }
+                }
+
+                if (!parentTable) continue;
+
+                const parentPKs = primaryKeySets.get(parentTable) || new Set<string>();
+                if (!parentPKs.has(fkVal)) {
+                  // If parent table already has some PKs, reuse one to maintain referential integrity
+                  if (parentPKs.size > 0) {
+                    const existingPk = parentPKs.values().next().value as string;
+                    result.failures.push({ column: colName, value: fkVal, reason: `Foreign key ${colName} did not match any known ${parentTable} id; replaced with existing id ${existingPk}` });
+                    result.cleanedRecord[colName] = existingPk;
+                  } else {
+                    // Create a placeholder parent PK and add a minimal record so FK can point to it
+                    const placeholder = generateUUID();
+                    parentPKs.add(placeholder);
+                    primaryKeySets.set(parentTable, parentPKs);
+                    if (!allTableData[parentTable]) allTableData[parentTable] = [];
+                    allTableData[parentTable].push({ id: placeholder });
+                    result.failures.push({ column: colName, value: fkVal, reason: `Foreign key ${colName} did not match any ${parentTable} id; created placeholder id ${placeholder}` });
+                    result.cleanedRecord[colName] = placeholder;
+                  }
+                }
+              }
+
+              insertQueue.push(result.cleanedRecord);
+            } else {
+              insertQueue.push(rawRecord);
+            }
+
+            const now = Date.now();
+            if (
+              insertQueue.length >= BATCH_SIZE ||
+              now - lastFlushTime >= FLUSH_INTERVAL_MS
+            ) {
+              await flushBatch(currentTable, insertQueue.splice(0));
+              lastFlushTime = now;
+
+              safeEnqueue(
+                sendSSE({
+                  type: "progress",
+                  table: currentTable,
+                  rowsInserted: currentTableInserted,
+                  totalInserted,
+                  targetRows: body.rowCounts[currentTable] || 0,
+                }),
+              );
+            }
+          }
+        } catch {
+          malformedLines++;
+          if (malformedLines <= 5) {
+            console.warn(
+              "[Generate-Stream] Malformed NDJSON line:",
+              line.substring(0, 100),
+            );
+          }
+        }
+      }
+    };
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        const decoder = new TextDecoder();
+        let aiBuffer = "";
+        let contentBuffer = "";
+        const closed = { value: false };
+
+        const safeEnqueue = (data: Uint8Array) => {
+          if (closed.value) return;
+          try {
+            controller.enqueue(data);
+          } catch {
+            closed.value = true;
+          }
+        };
+
+        safeEnqueue(
+          sendSSE({
+            type: "progress",
+            table: "",
+            message: `Generating database schema...`,
+            rowsInserted: 0,
+            totalInserted: 0,
+            targetRows: totalRows,
+          }),
+        );
+
         if (databaseId) {
-          safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'database_created', databaseId })}\n\n`))
+          safeEnqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({ type: "database_created", databaseId })}\n\n`,
+            ),
+          );
         }
 
         try {
           while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
+            const { done, value } = await reader.read();
+            if (done) break;
 
-            aiBuffer += decoder.decode(value, { stream: true })
-            const aiLines = aiBuffer.split('\n')
-            aiBuffer = aiLines.pop() || ''
+            aiBuffer += decoder.decode(value, { stream: true });
+            const aiLines = aiBuffer.split("\n");
+            aiBuffer = aiLines.pop() || "";
 
             for (const aiLine of aiLines) {
-              const trimmed = aiLine.trim()
-              if (!trimmed || !trimmed.startsWith('data: ')) continue
+              const trimmed = aiLine.trim();
+              if (!trimmed || !trimmed.startsWith("data: ")) continue;
 
-              const aiData = trimmed.slice(6)
-              if (aiData === '[DONE]') continue
+              const aiData = trimmed.slice(6);
+              if (aiData === "[DONE]") continue;
 
               try {
-                const parsed = JSON.parse(aiData)
-                const choice = parsed.choices?.[0]
-                if (!choice) continue
+                const parsed = JSON.parse(aiData);
+                const choice = parsed.choices?.[0];
+                if (!choice) continue;
 
-                const delta = choice.delta
+                const delta = choice.delta;
 
-                // Only process the main content (skip reasoning)
                 if (delta?.content) {
-                  contentBuffer += delta.content
+                  contentBuffer += delta.content;
 
-                  // Process the content buffer line by line for NDJSON
-                  const contentLines = contentBuffer.split('\n')
-                  contentBuffer = contentLines.pop() || ''
+                  const contentLines = contentBuffer.split("\n");
+                  contentBuffer = contentLines.pop() || "";
 
                   for (const contentLine of contentLines) {
-                    const line = contentLine.trim()
-                    if (!line) continue
-
-                    // Check for table marker
-                    const tableMarker = line.match(/^###TABLE:(.+?)###$/)
-                    if (tableMarker) {
-                      // Flush any pending records for the previous table
-                      if (insertQueue.length > 0 && currentTable) {
-                        await flushBatch(currentTable, insertQueue.splice(0))
-                        safeEnqueue(sendSSE({
-                          type: 'progress',
-                          table: currentTable,
-                          rowsInserted: currentTableInserted,
-                          totalInserted,
-                          targetRows: body.rowCounts[currentTable] || 0,
-                        }))
-                      }
-
-                      // Switch to new table
-                      currentTable = tableMarker[1]
-                      currentTableInserted = (allTableData[currentTable]?.length) || 0
-                      safeEnqueue(sendSSE({
-                        type: 'progress',
-                        table: currentTable,
-                        rowsInserted: 0,
-                        totalInserted,
-                        targetRows: body.rowCounts[currentTable] || 0,
-                        message: `Streaming records into [${currentTable}]`,
-                      }))
-                      continue
-                    }
-
-                    // Try to parse as NDJSON record
-                    if (currentTable) {
-                      try {
-                        const rawRecord = JSON.parse(line)
-                        if (typeof rawRecord === 'object' && rawRecord !== null && !Array.isArray(rawRecord)) {
-                          // ─── Validate and clean the record against the schema ───
-                          const tableColumns = schemaLookup.get(currentTable)
-                          if (tableColumns) {
-                            const existingPKs = new Set<string>() // populated from prior rows
-                            const result = validateAndCleanRecord(
-                              currentTable,
-                              rawRecord as Record<string, unknown>,
-                              tableColumns,
-                              existingPKs
-                            )
-
-                            // Log any validation failures
-                            if (result.failures.length > 0) {
-                              for (const f of result.failures) {
-                                allValidationFailures.push({ table: currentTable, ...f })
-                                if (allValidationFailures.length <= 20) {
-                                  console.warn(
-                                    `[Generate-Stream] Validation failure in ${currentTable}: column=${f.column}, value=${String(f.value).substring(0, 50)}, reason=${f.reason}`
-                                  )
-                                }
-                              }
-                            }
-
-                            // Use the cleaned record (extra fields removed, bad values nulled)
-                            insertQueue.push(result.cleanedRecord)
-                          } else {
-                            // No schema found for this table — insert as-is (backward compatible)
-                            insertQueue.push(rawRecord)
-                          }
-
-                          // Flush if batch is full or interval elapsed
-                          const now = Date.now()
-                          if (insertQueue.length >= BATCH_SIZE || now - lastFlushTime >= FLUSH_INTERVAL_MS) {
-                            await flushBatch(currentTable, insertQueue.splice(0))
-                            lastFlushTime = now
-
-                            safeEnqueue(sendSSE({
-                              type: 'progress',
-                              table: currentTable,
-                              rowsInserted: currentTableInserted,
-                              totalInserted,
-                              targetRows: body.rowCounts[currentTable] || 0,
-                            }))
-                          }
-                        }
-                      } catch {
-                        // Malformed line — skip and continue
-                        malformedLines++
-                        if (malformedLines <= 5) {
-                          console.warn('[Generate-Stream] Malformed NDJSON line:', line.substring(0, 100))
-                        }
-                      }
-                    }
+                    await processLine(contentLine.trim(), controller, closed);
                   }
                 }
 
-                // Handle finish
                 if (choice.finish_reason) {
-                  // Flush remaining records
-                  if (insertQueue.length > 0 && currentTable) {
-                    await flushBatch(currentTable, insertQueue.splice(0))
+                  // FIX (Bug 8): flush any remaining content in the buffer
+                  // before handling finish, since the last line may not have
+                  // a trailing newline.
+                  if (contentBuffer.trim()) {
+                    await processLine(contentBuffer.trim(), controller, closed);
+                    contentBuffer = "";
                   }
 
-                  // Mark current table complete
+                  if (insertQueue.length > 0 && currentTable) {
+                    await flushBatch(currentTable, insertQueue.splice(0));
+                  }
+
                   if (currentTable) {
-                    safeEnqueue(sendSSE({
-                      type: 'table_complete',
-                      table: currentTable,
-                      totalRows: currentTableInserted,
-                    }))
+                    safeEnqueue(
+                      sendSSE({
+                        type: "table_complete",
+                        table: currentTable,
+                        totalRows: currentTableInserted,
+                      }),
+                    );
                   }
                 }
               } catch {
@@ -671,105 +929,156 @@ export async function POST(request: NextRequest) {
             }
           }
         } catch (err) {
-          console.error('[Generate-Stream] Stream error:', err)
+          console.error("[Generate-Stream] Stream error:", err);
 
-          // Flush remaining records before reporting error
           if (insertQueue.length > 0 && currentTable) {
             try {
-              await flushBatch(currentTable, insertQueue.splice(0))
+              await flushBatch(currentTable, insertQueue.splice(0));
             } catch {
               // Best effort
             }
           }
 
-          safeEnqueue(sendSSE({
-            type: 'error',
-            message: err instanceof Error ? err.message : 'Stream interrupted',
-            recoverable: totalInserted > 0,
-          }))
+          safeEnqueue(
+            sendSSE({
+              type: "error",
+              message:
+                err instanceof Error ? err.message : "Stream interrupted",
+              recoverable: totalInserted > 0,
+            }),
+          );
         } finally {
-          // ─── Final flush ───
+          // Final flush for any stragglers
           if (insertQueue.length > 0 && currentTable) {
             try {
-              await flushBatch(currentTable, insertQueue.splice(0))
+              await flushBatch(currentTable, insertQueue.splice(0));
             } catch {
               // Best effort
             }
           }
 
-          // ─── Update database status ───
+          // FIX (Bug 8): flush any remaining content buffer in the finally block
+          if (contentBuffer.trim() && currentTable) {
+            try {
+              await processLine(contentBuffer.trim(), controller, closed);
+              if (insertQueue.length > 0) {
+                await flushBatch(currentTable, insertQueue.splice(0));
+              }
+            } catch {
+              // Best effort
+            }
+          }
+
           if (admin && databaseId) {
             try {
+              // Build final data: start with original data for tables NOT
+              // being regenerated, then overlay allTableData for generated
+              // tables. allTableData is the source of truth — flushBatch
+              // already wrote these rows incrementally so we must NOT
+              // re-append them on top of flushed data.
+              const finalDataJson: Record<string, unknown[]> = {};
+
+              // Preserve original data for tables not in this generation
+              for (const [tableName, rows] of Object.entries(originalTableData)) {
+                if (!allTableData[tableName]) {
+                  finalDataJson[tableName] = rows;
+                }
+              }
+
+              // Use allTableData as-is for generated tables (already complete)
+              for (const [tableName, rows] of Object.entries(allTableData)) {
+                finalDataJson[tableName] = rows;
+              }
+
               await admin
-                .from('synthetic_databases')
+                .from("synthetic_databases")
                 .update({
-                  status: 'ready',
-                  data_json: allTableData,
+                  status: "ready",
+                  data_json: finalDataJson,
                   schema_json: body.schema,
                   row_count: totalInserted,
                   quality_score: 0.85,
                 })
-                .eq('id', databaseId)
+                .eq("id", databaseId);
             } catch (err) {
-              console.warn('[Generate-Stream] Final DB update failed:', err)
+              console.warn("[Generate-Stream] Final DB update failed:", err);
             }
           }
 
-          // ─── Log validation summary ───
+          try {
+            if (generationLockRelease) {
+              generationLockRelease();
+              generationLockRelease = null;
+            }
+          } catch {}
+
           if (allValidationFailures.length > 0) {
             console.warn(
-              `[Generate-Stream] Total validation failures: ${allValidationFailures.length} across ${new Set(allValidationFailures.map(f => f.table)).size} tables`
-            )
+              `[Generate-Stream] Total validation failures: ${allValidationFailures.length} across ${new Set(allValidationFailures.map((f) => f.table)).size} tables`,
+            );
           }
           if (malformedLines > 0) {
-            console.warn(`[Generate-Stream] Total malformed NDJSON lines: ${malformedLines}`)
+            console.warn(
+              `[Generate-Stream] Total malformed NDJSON lines: ${malformedLines}`,
+            );
           }
 
-          const durationMs = Date.now() - startTime
-          const tablesGenerated = Object.keys(allTableData).length
+          const durationMs = Date.now() - startTime;
+          const tablesGenerated = Object.keys(allTableData).length;
 
-          // Mark any tables with data as complete
+          // FIX (Bug 6): emit table_complete for ALL tables, not just those
+          // that differ from currentTable. Use a Set to avoid double-emitting
+          // for the last table (already emitted on finish_reason above).
+          const completedTables = new Set<string>();
+          // currentTable was already emitted on finish_reason; mark it done.
+          if (currentTable) completedTables.add(currentTable);
+
           for (const tableName of Object.keys(allTableData)) {
-            if (tableName !== currentTable) {
-              safeEnqueue(sendSSE({
-                type: 'table_complete',
-                table: tableName,
-                totalRows: allTableData[tableName].length,
-              }))
+            if (!completedTables.has(tableName)) {
+              safeEnqueue(
+                sendSSE({
+                  type: "table_complete",
+                  table: tableName,
+                  totalRows: allTableData[tableName].length,
+                }),
+              );
+              completedTables.add(tableName);
             }
           }
 
-          safeEnqueue(sendSSE({
-            type: 'complete',
-            tablesGenerated,
-            totalRows: totalInserted,
-            durationMs,
-          }))
+          safeEnqueue(
+            sendSSE({
+              type: "complete",
+              tablesGenerated,
+              totalRows: totalInserted,
+              durationMs,
+            }),
+          );
 
-          if (!closed) {
+          if (!closed.value) {
             try {
-              controller.close()
+              controller.close();
             } catch {
               // Already closed
             }
           }
         }
       },
-    })
+    });
 
     return new Response(stream, {
       headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache, no-transform',
-        'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no',
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
       },
-    })
+    });
   } catch (err) {
-    console.error('[Generate-Stream] Unhandled error:', err)
-    return new Response(JSON.stringify({ error: 'Internal server error' }), {
+    console.error("[Generate-Stream] Unhandled error:", err);
+    return new Response(JSON.stringify({ error: "Internal server error" }), {
       status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    })
+      headers: { "Content-Type": "application/json" },
+    });
   }
 }
