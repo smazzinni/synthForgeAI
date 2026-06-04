@@ -182,6 +182,9 @@ function extractLocaleFromHistory(
   const localeParts: string[] = [];
 
   for (const msg of history) {
+    if (!msg || typeof msg.content !== "string" || !msg.content.trim()) {
+      continue;
+    }
     const lower = msg.content.toLowerCase();
     for (const keyword of localeKeywords) {
       if (lower.includes(keyword)) {
@@ -478,8 +481,15 @@ export async function POST(request: NextRequest) {
     if (body.conversationHistory && body.conversationHistory.length > 0) {
       const recentHistory = body.conversationHistory.slice(-6);
       for (const msg of recentHistory) {
-        if (msg.role === "user" || msg.role === "assistant") {
-          messages.push({ role: msg.role, content: msg.content });
+        if (
+          (msg.role === "user" || msg.role === "assistant") &&
+          typeof msg.content === "string" &&
+          msg.content.length > 0
+        ) {
+          messages.push({
+            role: msg.role,
+            content: msg.content.slice(0, 32000),
+          });
         }
       }
     }

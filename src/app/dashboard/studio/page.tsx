@@ -132,6 +132,32 @@ interface Message {
   tables?: Record<string, unknown[]> | null;
 }
 
+/** Aligns with /api/chat `recentHistory` slice; keeps POST body under limits */
+const CHAT_API_HISTORY_LIMIT = 10;
+const CHAT_API_MAX_CONTENT = 12000;
+const GENERATION_HISTORY_LIMIT = 12;
+
+function buildApiChatHistory(
+  messages: Message[],
+): Array<{ role: "user" | "assistant"; content: string }> {
+  return messages
+    .filter(
+      (m): m is Message & { role: "user" | "assistant" } =>
+        (m.role === "user" || m.role === "assistant") &&
+        typeof m.content === "string",
+    )
+    .map((m) => {
+      const c = m.content;
+      return {
+        role: m.role,
+        content:
+          c.length > CHAT_API_MAX_CONTENT
+            ? `${c.slice(0, CHAT_API_MAX_CONTENT)}\n…[truncated for API]`
+            : c,
+      };
+    })
+    .slice(-CHAT_API_HISTORY_LIMIT);
+}
 
 
 interface StudioPageProps {
@@ -441,6 +467,7 @@ function StudioPageInner({
   async function startStreamingGeneration(
     signal: BeginGenerationSignal,
     assistantId: string,
+    conversationHistoryOverride?: Array<{ role: string; content: string }>,
   ) {
     console.debug("[Studio] startStreamingGeneration called", {
       signal,
@@ -508,9 +535,16 @@ function StudioPageInner({
         },
       ]);
 
-      const history = messagesRef.current
-        .filter((m) => m.role === "user" || m.role === "assistant")
-        .map((m) => ({ role: m.role, content: m.content }));
+      const history =
+        conversationHistoryOverride && conversationHistoryOverride.length > 0
+          ? conversationHistoryOverride.map((m) => ({
+              role: m.role,
+              content:
+                typeof m.content === "string"
+                  ? m.content.slice(0, CHAT_API_MAX_CONTENT)
+                  : "",
+            }))
+          : buildApiChatHistory(messagesRef.current);
 
       const response = await fetch("/api/generate-stream", {
         method: "POST",
@@ -864,6 +898,9 @@ function StudioPageInner({
         timestamp: new Date(),
       };
 
+      /** Captured before optimistic updates — `messagesRef` lags behind `setMessages` */
+      const historyBeforeThisTurn = buildApiChatHistory(messagesRef.current);
+
       const assistantId = (Date.now() + 1).toString();
       const assistantMessage: Message = {
         id: assistantId,
@@ -886,9 +923,7 @@ function StudioPageInner({
       abortRef.current = controller;
 
       try {
-        const history = messagesRef.current
-          .filter((m) => m.role === "user" || m.role === "assistant")
-          .map((m) => ({ role: m.role, content: m.content }));
+        const history = historyBeforeThisTurn;
 
         // Truncate currentData if too large (> 20KB send only summary)
         let dataToSend: Record<string, unknown[]> | undefined = hasGeneratedData
@@ -928,7 +963,17 @@ function StudioPageInner({
         });
 
         if (!response.ok) {
-          throw new Error(`API error: ${response.status}`);
+          const errBody = await response.text().catch(() => "");
+          let detail = errBody.trim() || response.statusText;
+          try {
+            const j = JSON.parse(errBody) as { error?: string; content?: string };
+            detail = j.error || j.content || detail;
+          } catch {
+            /* plain text body */
+          }
+          throw new Error(
+            `API error: ${response.status}${detail ? ` — ${detail}` : ""}`.slice(0, 800),
+          );
         }
 
         const reader = response.body?.getReader();
@@ -1121,8 +1166,30 @@ function StudioPageInner({
           setReasoningVisible(false);
           setCurrentReasoning("");
 
+          // Persist this turn immediately (BEGIN path returns before the generic save below)
+          void saveConversation(undefined, undefined, undefined, [
+            { role: "user", content: userMessage.content },
+            {
+              role: "assistant",
+              content: cleanText || "Starting database generation...",
+              agentName: "Orchestrator",
+            },
+          ]);
+
+          const generationHistory = [
+            ...historyBeforeThisTurn,
+            { role: "user" as const, content: userMessage.content },
+            {
+              role: "assistant" as const,
+              content: (cleanText || "Starting database generation...").slice(
+                0,
+                CHAT_API_MAX_CONTENT,
+              ),
+            },
+          ].slice(-GENERATION_HISTORY_LIMIT);
+
           // Start streaming generation in the background
-          startStreamingGeneration(beginGenSignal, assistantId);
+          startStreamingGeneration(beginGenSignal, assistantId, generationHistory);
           return;
         }
 
@@ -1412,15 +1479,25 @@ function StudioPageInner({
             );
           }
 
-          // Save conversation — include recent messages (user, assistant, and any system messages)
-          const recent = messagesRef.current
-            .slice(-8)
-            .map((m) => ({
+          // Save conversation — explicit current turn (ref can lag behind React state)
+          const assistantPersist =
+            displayText && displayText.trim()
+              ? displayText
+              : fullContent.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
+
+          const msgsForSave = [
+            ...historyBeforeThisTurn.map((m) => ({
               role: m.role,
               content: m.content,
-              agentName: m.agentName,
-            }));
-          saveConversation(undefined, undefined, undefined, recent);
+            })),
+            { role: "user", content: userMessage.content },
+            {
+              role: "assistant",
+              content: assistantPersist,
+              agentName: lastAgentName,
+            },
+          ].slice(-GENERATION_HISTORY_LIMIT);
+          saveConversation(undefined, undefined, undefined, msgsForSave);
         }
 
         setLoading(false);
