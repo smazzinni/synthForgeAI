@@ -72,9 +72,123 @@ function extractJsonObject(content: string, startIndex: number): string | null {
 }
 
 /**
+ * Find a balanced JSON object in `content` that contains `marker` (used for questionnaire blocks).
+ */
+function findJsonBlockWithMarker(
+  content: string,
+  marker: string
+): { jsonStr: string; startIndex: number } | null {
+  let pos = 0
+  while (true) {
+    const markerIdx = content.indexOf(marker, pos)
+    if (markerIdx === -1) break
+
+    let braceIdx = content.lastIndexOf('{', markerIdx)
+    while (braceIdx !== -1) {
+      const jsonStr = extractJsonObject(content, braceIdx)
+      if (jsonStr && jsonStr.includes(marker)) {
+        try {
+          JSON.parse(jsonStr)
+          return { jsonStr, startIndex: braceIdx }
+        } catch {
+          // try an earlier '{'
+        }
+      }
+      braceIdx = content.lastIndexOf('{', braceIdx - 1)
+    }
+    pos = markerIdx + marker.length
+  }
+  return null
+}
+
+function mapRawQuestionsArray(raw: unknown[]): Question[] {
+  const allowed: Question['type'][] = [
+    'single_choice',
+    'multi_choice',
+    'text_input',
+    'number_input',
+    'date_input',
+  ]
+
+  return raw
+    .map((q: unknown, qIdx: number) => {
+      const o = q as Record<string, unknown>
+      const t = String(o.type || 'single_choice')
+      const type = (allowed.includes(t as Question['type'])
+        ? (t as Question['type'])
+        : 'single_choice') as Question['type']
+
+      return {
+        id: String(o.id || `q_${qIdx}`),
+        text: String(o.Question || o.question || o.text || ''),
+        type,
+        options: Array.isArray(o.Options || o.options || o.choices)
+          ? ((o.Options || o.options || o.choices) as unknown[]).map(
+              normalizeChoice,
+            )
+          : undefined,
+        required: o.required !== false,
+        skipOption: Boolean(o.skipOption || o.Skip),
+        customAnswerAllowed: Boolean(o.customAnswerAllowed || o.CustomAnswer),
+        note: o.note || o.Note ? String(o.Note || o.note) : undefined,
+      }
+    })
+    .filter((q) => q.text.length > 0)
+}
+
+/**
+ * Prefer a single wizard intake object: type "questionnaire".
+ */
+function tryParseQuestionnaireFromContent(
+  content: string
+): { questions: Question[]; flowTitle?: string } | null {
+  const fenceRegex = /```(?:json)?\s*\n?([\s\S]*?)```/gi
+  let match: RegExpExecArray | null
+  while ((match = fenceRegex.exec(content)) !== null) {
+    const inner = match[1].trim()
+    if (!inner.startsWith('{')) continue
+    try {
+      const parsed = JSON.parse(inner) as Record<string, unknown>
+      if (parsed?.type === 'questionnaire' && Array.isArray(parsed.questions)) {
+        const questions = mapRawQuestionsArray(parsed.questions)
+        if (questions.length > 0) {
+          return {
+            questions,
+            flowTitle: (parsed.title || parsed.flowTitle) as string | undefined,
+          }
+        }
+      }
+    } catch {
+      // try next fence
+    }
+  }
+
+  for (const marker of ['"type":"questionnaire"', '"type": "questionnaire"']) {
+    const block = findJsonBlockWithMarker(content, marker)
+    if (!block) continue
+    try {
+      const parsed = JSON.parse(block.jsonStr) as Record<string, unknown>
+      if (parsed?.type === 'questionnaire' && Array.isArray(parsed.questions)) {
+        const questions = mapRawQuestionsArray(parsed.questions)
+        if (questions.length > 0) {
+          return {
+            questions,
+            flowTitle: (parsed.title || parsed.flowTitle) as string | undefined,
+          }
+        }
+      }
+    } catch {
+      // continue
+    }
+  }
+
+  return null
+}
+
+/**
  * Normalize a single choice entry into {label, value}.
  */
-function normalizeChoice(c: any): { label: string; value: string } {
+function normalizeChoice(c: unknown): { label: string; value: string } {
   if (typeof c === 'string') {
     return { label: c, value: c }
   }
@@ -82,8 +196,9 @@ function normalizeChoice(c: any): { label: string; value: string } {
     return { label: String(c), value: String(c) }
   }
   if (c && typeof c === 'object') {
-    const label = String(c.Label || c.label || c.value || c.Value || c.text || c.Text || '')
-    const value = String(c.Value || c.value || c.Label || c.label || c.text || c.Text || '')
+    const obj = c as Record<string, unknown>
+    const label = String(obj.Label || obj.label || obj.value || obj.Value || obj.text || obj.Text || '')
+    const value = String(obj.Value || obj.value || obj.Label || obj.label || obj.text || obj.Text || '')
     return { label, value }
   }
   return { label: '', value: '' }
@@ -99,6 +214,11 @@ function normalizeChoice(c: any): { label: string; value: string } {
 export function parseQuestionsFromResponse(
   content: string
 ): { questions: Question[]; flowTitle?: string } | null {
+  const fromQuestionnaire = tryParseQuestionnaireFromContent(content)
+  if (fromQuestionnaire && fromQuestionnaire.questions.length > 0) {
+    return fromQuestionnaire
+  }
+
   let pos = 0
   while (pos < content.length) {
     const braceIdx = content.indexOf('{', pos)
@@ -122,18 +242,7 @@ export function parseQuestionsFromResponse(
 
         // Check if it's a question flow object
         if (parsed?.questions && Array.isArray(parsed.questions)) {
-          const questions: Question[] = parsed.questions.map((q: any, qIdx: number) => ({
-            id: q.id || `q_${qIdx}`,
-            text: q.Question || q.question || q.text || '',
-            type: q.type || 'single_choice',
-            options: Array.isArray(q.Options || q.options || q.choices)
-              ? (q.Options || q.options || q.choices).map(normalizeChoice)
-              : undefined,
-            required: q.required !== false,
-            skipOption: q.skipOption || q.Skip,
-            customAnswerAllowed: q.customAnswerAllowed || q.CustomAnswer,
-            note: q.Note || q.note,
-          }))
+          const questions = mapRawQuestionsArray(parsed.questions)
 
           return {
             questions,
@@ -143,35 +252,13 @@ export function parseQuestionsFromResponse(
 
         // Check if it's a single question
         if (parsed?.Question || parsed?.question) {
-          const q: Question = {
-            id: parsed.id || 'q_0',
-            text: parsed.Question || parsed.question || '',
-            type: parsed.type || 'single_choice',
-            options: Array.isArray(parsed.Options || parsed.options || parsed.choices)
-              ? (parsed.Options || parsed.options || parsed.choices).map(normalizeChoice)
-              : undefined,
-            required: parsed.required !== false,
-            skipOption: parsed.skipOption || parsed.Skip,
-            customAnswerAllowed: parsed.customAnswerAllowed || parsed.CustomAnswer,
-            note: parsed.Note || parsed.note,
-          }
-          return { questions: [q] }
+          const questions = mapRawQuestionsArray([parsed])
+          if (questions.length > 0) return { questions }
         }
 
         // Check if it's an array of questions
-        if (Array.isArray(parsed) && parsed.length > 0 && parsed[0]?.Question) {
-          const questions: Question[] = parsed.map((q: any, qIdx: number) => ({
-            id: q.id || `q_${qIdx}`,
-            text: q.Question || q.question || '',
-            type: q.type || 'single_choice',
-            options: Array.isArray(q.Options || q.options || q.choices)
-              ? (q.Options || q.options || q.choices).map(normalizeChoice)
-              : undefined,
-            required: q.required !== false,
-            skipOption: q.Skip || q.skipOption,
-            customAnswerAllowed: q.CustomAnswer || q.customAnswerAllowed,
-            note: q.Note || q.note,
-          }))
+        if (Array.isArray(parsed) && parsed.length > 0 && (parsed[0]?.Question || parsed[0]?.question)) {
+          const questions = mapRawQuestionsArray(parsed)
           return { questions }
         }
       } catch {

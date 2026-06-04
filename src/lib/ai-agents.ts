@@ -415,6 +415,8 @@ export function cleanDisplayText(content: string): string {
   const markersToRemove = [
     '"agent_status"',
     '"options"',
+    // Whole intake JSON (must run before generic "question" removal)
+    '"questionnaire"',
     '"follow_up"',
     '"recommendation"',
     '"BEGIN_GENERATION"',

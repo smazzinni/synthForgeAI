@@ -1,6 +1,20 @@
 import type { NextConfig } from "next";
 
+// Expose URL + anon key to the browser when only SUPABASE_* is set in .env
+const supabaseUrl =
+  process.env.NEXT_PUBLIC_SUPABASE_URL?.trim() ||
+  process.env.SUPABASE_URL?.trim() ||
+  "";
+const supabaseAnonKey =
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim() ||
+  process.env.SUPABASE_ANON_KEY?.trim() ||
+  "";
+
 const nextConfig: NextConfig = {
+  env: {
+    NEXT_PUBLIC_SUPABASE_URL: supabaseUrl,
+    NEXT_PUBLIC_SUPABASE_ANON_KEY: supabaseAnonKey,
+  },
   serverExternalPackages: ['@tailwindcss/oxide'],
   typescript: {
     ignoreBuildErrors: true,

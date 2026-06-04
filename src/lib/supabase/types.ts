@@ -36,6 +36,7 @@ export interface Database {
           role?: string
           updated_at?: string
         }
+        Relationships: []
       }
       synthetic_databases: {
         Row: {
@@ -72,6 +73,7 @@ export interface Database {
           status?: string
           updated_at?: string
         }
+        Relationships: []
       }
       conversations: {
         Row: {
@@ -99,6 +101,7 @@ export interface Database {
           status?: string
           updated_at?: string
         }
+        Relationships: []
       }
       messages: {
         Row: {
@@ -133,6 +136,7 @@ export interface Database {
           options?: Json | null
           metadata?: Json
         }
+        Relationships: []
       }
       datasets: {
         Row: {
@@ -158,6 +162,16 @@ export interface Database {
           row_count?: number
           quality_score?: number | null
         }
+        Update: {
+          name?: string
+          version?: number
+          format?: string
+          data_json?: Json
+          schema_json?: Json
+          row_count?: number
+          quality_score?: number | null
+        }
+        Relationships: []
       }
       api_keys: {
         Row: {
@@ -180,6 +194,16 @@ export interface Database {
           permissions?: Json
           expires_at?: string | null
         }
+        Update: {
+          user_id?: string | null
+          name?: string
+          key_hash?: string
+          key_prefix?: string
+          permissions?: Json
+          last_used_at?: string | null
+          expires_at?: string | null
+        }
+        Relationships: []
       }
     }
     Views: Record<string, never>

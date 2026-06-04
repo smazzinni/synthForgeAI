@@ -1,5 +1,7 @@
 import { NextRequest } from "next/server";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { getSupabaseAdmin } from "@/lib/supabase/admin";
+import type { Database, Json } from "@/lib/supabase/types";
 import { validateAndCleanRecord } from "@/lib/record-validation";
 
 // ─── Streaming Database Generation API ───
@@ -19,12 +21,12 @@ const STALE_GENERATION_TIMEOUT_MS = 5 * 60 * 1000;
 const dbLocks: Map<string, Promise<void>> = new Map();
 
 async function markDatabaseStatus(
-  admin: ReturnType<typeof getSupabaseAdmin>,
+  client: SupabaseClient<Database>,
   databaseId: string,
   status: "generating" | "ready" | "error",
 ) {
   try {
-    await admin
+    await client
       .from("synthetic_databases")
       .update({ status })
       .eq("id", databaseId);
@@ -52,14 +54,13 @@ async function acquireDbLock(id: string) {
   const next = new Promise<void>((res) => {
     resolveFn = res;
   });
-  dbLocks.set(
-    id,
-    prev.then(() => next),
-  );
+  // Chain waiters; compare this tail on release (not `next`) or delete never runs.
+  const tail = prev.then(() => next);
+  dbLocks.set(id, tail);
   await prev;
   return () => {
     resolveFn();
-    if (dbLocks.get(id) === next) dbLocks.delete(id);
+    if (dbLocks.get(id) === tail) dbLocks.delete(id);
   };
 }
 
@@ -297,12 +298,12 @@ export async function POST(request: NextRequest) {
     const startTime = Date.now();
 
     let databaseId = body.databaseId;
-    const admin = getSupabaseAdmin();
+    const supabaseRaw = getSupabaseAdmin();
 
     // If Supabase admin client isn't configured, fail fast so frontend can
     // surface a clear error instead of silently accumulating in-memory data
     // and never writing to the user's database.
-    if (!admin) {
+    if (!supabaseRaw) {
       console.warn('[Generate-Stream] Supabase admin client not configured');
       return new Response(JSON.stringify({ error: 'Database service not configured' }), {
         status: 503,
@@ -310,9 +311,10 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    if (admin) {
-      if (databaseId) {
-        const { data: existingDb, error: selectError } = await admin
+    const supabase: SupabaseClient<Database> = supabaseRaw;
+
+    if (databaseId) {
+        const { data: existingDb, error: selectError } = await supabase
           .from("synthetic_databases")
           .select("status, updated_at")
           .eq("id", databaseId)
@@ -343,7 +345,7 @@ export async function POST(request: NextRequest) {
           );
         }
 
-        await admin
+        await supabase
           .from("synthetic_databases")
           .update({ status: "generating" })
           .eq("id", databaseId);
@@ -351,7 +353,7 @@ export async function POST(request: NextRequest) {
         const dbName =
           body.databaseName || body.schema[0]?.name || "synthetic_db";
 
-        const { data: existingDb, error: selectError } = await admin
+        const { data: existingDb, error: selectError } = await supabase
           .from("synthetic_databases")
           .select("id, status, updated_at")
           .eq("user_id", userId)
@@ -376,18 +378,18 @@ export async function POST(request: NextRequest) {
           }
 
           databaseId = existingDb.id;
-          await admin
+          await supabase
             .from("synthetic_databases")
             .update({ status: "generating" })
             .eq("id", databaseId);
         } else {
-          const { data: newDb, error: dbError } = await admin
+          const { data: newDb, error: dbError } = await supabase
             .from("synthetic_databases")
             .insert({
               name: dbName,
               db_type: "postgresql",
-              schema_json: body.schema,
-              data_json: {},
+              schema_json: body.schema as unknown as Json,
+              data_json: {} as Json,
               row_count: 0,
               quality_score: 0.85,
               status: "generating",
@@ -403,7 +405,7 @@ export async function POST(request: NextRequest) {
               dbError.code === "23505" ||
               dbError.message?.includes("unique")
             ) {
-              const { data: fallbackDb } = await admin
+              const { data: fallbackDb } = await supabase
                 .from("synthetic_databases")
                 .select("id")
                 .eq("user_id", userId)
@@ -412,19 +414,19 @@ export async function POST(request: NextRequest) {
 
               if (fallbackDb) {
                 databaseId = fallbackDb.id;
-                await admin
+                await supabase
                   .from("synthetic_databases")
                   .update({ status: "generating" })
                   .eq("id", databaseId);
               } else {
                 const uniqueName = `${dbName}_${Date.now()}`;
-                const { data: newDb2 } = await admin
+                const { data: newDb2 } = await supabase
                   .from("synthetic_databases")
                   .insert({
                     name: uniqueName,
                     db_type: "postgresql",
-                    schema_json: body.schema,
-                    data_json: {},
+                    schema_json: body.schema as unknown as Json,
+                    data_json: {} as Json,
                     row_count: 0,
                     quality_score: 0.85,
                     status: "generating",
@@ -437,7 +439,6 @@ export async function POST(request: NextRequest) {
             }
           }
         }
-      }
     }
 
     const localeContext = extractLocaleFromHistory(
@@ -446,8 +447,8 @@ export async function POST(request: NextRequest) {
 
     const originalTableData: Record<string, unknown[]> = {};
 
-    if (admin && databaseId) {
-      const { data: existingDataResponse, error: existingDataError } = await admin
+    if (databaseId) {
+      const { data: existingDataResponse, error: existingDataError } = await supabase
         .from("synthetic_databases")
         .select("data_json")
         .eq("id", databaseId)
@@ -492,23 +493,57 @@ export async function POST(request: NextRequest) {
       content: `Generate the data now. ${totalRows} total rows across ${body.schema.length} tables. Begin with ###TABLE:${body.schema[0]?.name}###`,
     });
 
-    const deepseekResponse = await fetch(
-      `${DEEPSEEK_API_URL}/chat/completions`,
-      {
+    // Use chat (not reasoner) for NDJSON: reasoner spends long stretches in
+    // internal reasoning before emitting content, which looks like a hung UI.
+    const generationModel =
+      process.env.DEEPSEEK_GENERATION_MODEL?.trim() || "deepseek-chat";
+
+    const upstreamAbort = new AbortController();
+    const upstreamTimeoutRaw = Number(process.env.DEEPSEEK_GENERATION_TIMEOUT_MS);
+    const upstreamTimeoutMs = Math.min(
+      Math.max(
+        Number.isFinite(upstreamTimeoutRaw) && upstreamTimeoutRaw > 0
+          ? upstreamTimeoutRaw
+          : 720_000,
+        60_000,
+      ),
+      1_800_000,
+    );
+    const upstreamTimer = setTimeout(() => {
+      upstreamAbort.abort();
+    }, upstreamTimeoutMs);
+
+    let deepseekResponse: Response;
+    try {
+      deepseekResponse = await fetch(`${DEEPSEEK_API_URL}/chat/completions`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
         },
         body: JSON.stringify({
-          model: "deepseek-reasoner",
+          model: generationModel,
           messages,
           stream: true,
           max_tokens: 65536,
           stream_options: { include_usage: true },
         }),
-      },
-    );
+        signal: upstreamAbort.signal,
+      });
+    } catch (fetchErr) {
+      console.error("[Generate-Stream] DeepSeek fetch failed:", fetchErr);
+      if (databaseId) {
+        await markDatabaseStatus(supabase, databaseId, "error");
+      }
+      const msg =
+        fetchErr instanceof Error ? fetchErr.message : "AI request failed";
+      return new Response(
+        JSON.stringify({ error: "AI request failed", message: msg }),
+        { status: 504, headers: { "Content-Type": "application/json" } },
+      );
+    } finally {
+      clearTimeout(upstreamTimer);
+    }
 
     if (!deepseekResponse.ok) {
       const errorText = await deepseekResponse
@@ -520,8 +555,8 @@ export async function POST(request: NextRequest) {
         errorText,
       );
 
-      if (admin && databaseId) {
-        await markDatabaseStatus(admin, databaseId, "error");
+      if (databaseId) {
+        await markDatabaseStatus(supabase, databaseId, "error");
       }
 
       return new Response(JSON.stringify({ error: "AI service error" }), {
@@ -534,8 +569,8 @@ export async function POST(request: NextRequest) {
     const reader = deepseekResponse.body?.getReader();
 
     if (!reader) {
-      if (admin && databaseId) {
-        await markDatabaseStatus(admin, databaseId, "error");
+      if (databaseId) {
+        await markDatabaseStatus(supabase, databaseId, "error");
       }
       return new Response(JSON.stringify({ error: "No response stream" }), {
         status: 500,
@@ -568,7 +603,7 @@ export async function POST(request: NextRequest) {
     let generationLockRelease: (() => void) | null = null;
     const flushLock = { release: null as (() => void) | null };
 
-    if (admin && databaseId) {
+    if (databaseId) {
       try {
         generationLockRelease = await acquireDbLock(databaseId);
       } catch {
@@ -587,13 +622,13 @@ export async function POST(request: NextRequest) {
       }
       allTableData[tableName].push(...records);
 
-      if (admin && databaseId) {
+      if (databaseId) {
         // FIX (Bug 2): always acquire the flush-level lock independently
         let release: (() => void) | null = null;
         try {
           release = await acquireDbLock(`flush:${databaseId}`);
 
-          const { data: db } = await admin
+          const { data: db } = await supabase
             .from("synthetic_databases")
             .select("data_json")
             .eq("id", databaseId)
@@ -606,10 +641,10 @@ export async function POST(request: NextRequest) {
           }
           existingData[tableName] = [...existingData[tableName], ...records];
 
-          await admin
+          await supabase
             .from("synthetic_databases")
             .update({
-              data_json: existingData,
+              data_json: existingData as unknown as Json,
               row_count: totalInserted + records.length,
             })
             .eq("id", databaseId);
@@ -969,7 +1004,7 @@ export async function POST(request: NextRequest) {
             }
           }
 
-          if (admin && databaseId) {
+          if (databaseId) {
             try {
               // Build final data: start with original data for tables NOT
               // being regenerated, then overlay allTableData for generated
@@ -990,12 +1025,12 @@ export async function POST(request: NextRequest) {
                 finalDataJson[tableName] = rows;
               }
 
-              await admin
+              await supabase
                 .from("synthetic_databases")
                 .update({
                   status: "ready",
-                  data_json: finalDataJson,
-                  schema_json: body.schema,
+                  data_json: finalDataJson as unknown as Json,
+                  schema_json: body.schema as unknown as Json,
                   row_count: totalInserted,
                   quality_score: 0.85,
                 })

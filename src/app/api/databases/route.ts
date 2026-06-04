@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import type { InsertTables, Json, UpdateTables } from '@/lib/supabase/types'
 
 // ─── Default user ID for fallback when auth is not available ───
 const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
@@ -218,12 +219,12 @@ export async function POST(request: NextRequest) {
 
     const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
 
-    const insertData: Record<string, unknown> = {
+    const insertData: InsertTables<'synthetic_databases'> = {
       name,
       db_type,
       status,
-      schema_json,
-      data_json,
+      schema_json: schema_json as Json,
+      data_json: data_json as Json,
       row_count: row_count || 0,
       quality_score,
       user_id: userId,
@@ -288,9 +289,9 @@ export async function PATCH(request: NextRequest) {
       return NextResponse.json({ error: 'Database service not configured' }, { status: 503 })
     }
 
-    const updateData: Record<string, unknown> = {}
-    if (data_json !== undefined) updateData.data_json = data_json
-    if (schema_json !== undefined) updateData.schema_json = schema_json
+    const updateData: UpdateTables<'synthetic_databases'> = {}
+    if (data_json !== undefined) updateData.data_json = data_json as Json
+    if (schema_json !== undefined) updateData.schema_json = schema_json as Json
     if (row_count !== undefined) updateData.row_count = row_count
     if (quality_score !== undefined) updateData.quality_score = quality_score
     if (status !== undefined) updateData.status = status

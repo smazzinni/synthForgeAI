@@ -16,11 +16,13 @@ export function getSupabaseBrowserClient() {
     return null
   }
 
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL
-  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim()
+  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim()
 
   if (!url || !key) {
-    console.warn('[Supabase] Missing env vars - client not initialized')
+    console.warn(
+      '[Supabase] Missing URL or anon key — set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in .env.local (or SUPABASE_URL + SUPABASE_ANON_KEY), then restart `bun run dev`.'
+    )
     return null
   }
 

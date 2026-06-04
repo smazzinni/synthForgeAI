@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback, Suspense } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo, useTransition, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -15,6 +15,8 @@ import {
   exportAsSQL,
   parseAIResponse,
   extractSchema,
+  humanizeColumnName,
+  columnPlainEnglishHint,
   type SchemaTable,
 } from "./helpers";
 
@@ -32,6 +34,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
 import {
   Send,
   Loader2,
@@ -61,11 +64,15 @@ import {
   ZoomOut,
   Move,
   AlertTriangle,
-  CheckCircle2,
   Shield,
+  KeyRound,
+  Link2,
+  Layers,
+  MousePointerClick,
   Wand2,
 } from "lucide-react";
 import { toast } from "sonner";
+import { cn } from "@/lib/utils";
 import {
   apiPost,
   apiPatch,
@@ -139,6 +146,16 @@ interface StudioPageProps {
 // Components and helpers live in separate modules under ./helpers and ./components
 import AgentIcon from './components/AgentIcon'
 import ShowMoreText from './components/ShowMoreText'
+import { GenerationProgressView } from './components/GenerationProgressView'
+
+type DataColumnKind = 'pk' | 'fk' | 'regular'
+
+/** Heuristic column roles for styling (id = PK, *_id = FK). */
+function getDataColumnKind(columnName: string): DataColumnKind {
+  if (columnName === 'id') return 'pk'
+  if (columnName.endsWith('_id') && columnName !== 'id') return 'fk'
+  return 'regular'
+}
 
 // ─── Main Studio Page Component ───
 function StudioPageInner({
@@ -151,6 +168,7 @@ function StudioPageInner({
 }: StudioPageProps) {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const [, startGenTransition] = useTransition();
 
   // ─── State ───
   const [currentDatabaseId, setCurrentDatabaseId] = useState<
@@ -164,8 +182,8 @@ function StudioPageInner({
             id: "1",
             role: "assistant",
             content: databaseId
-              ? `You're editing database **"${initialName || databaseId}"**. Describe changes or ask me to add more data.`
-              : 'Welcome to **SynthForge AI Studio**! I can help you generate synthetic data.\n\nDescribe the database you need, and I\'ll design the schema, generate realistic data, and ensure quality compliance.\n\nFor example: "Generate an e-commerce database with users, orders, and products"',
+              ? `You’re in **${initialName || databaseId}**. Say what to change or add.`
+              : "Hi — what are you building? A single sentence is plenty to start.",
             agentName: "Orchestrator",
             timestamp: new Date(),
           },
@@ -205,6 +223,9 @@ function StudioPageInner({
   >([]);
   const [sqlConfirmOpen, setSqlConfirmOpen] = useState(false);
   const [sqlConfirmQuery, setSqlConfirmQuery] = useState("");
+  const [deleteDbConfirmOpen, setDeleteDbConfirmOpen] = useState(false);
+  const [saveQueryDialogOpen, setSaveQueryDialogOpen] = useState(false);
+  const [saveQueryName, setSaveQueryName] = useState("");
 
   // Explorer state
   const [favoriteTables, setFavoriteTables] = useState<Set<string>>(new Set());
@@ -235,6 +256,11 @@ function StudioPageInner({
       statusMessages: [],
     });
   const generationAbortRef = useRef<AbortController | null>(null);
+  const genDoneBannerTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+
+  const [rightGenBanner, setRightGenBanner] = useState<string | null>(null);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
@@ -247,6 +273,15 @@ function StudioPageInner({
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  useEffect(() => {
+    return () => {
+      if (genDoneBannerTimeoutRef.current) {
+        clearTimeout(genDoneBannerTimeoutRef.current);
+        genDoneBannerTimeoutRef.current = null;
+      }
+    };
+  }, []);
 
   const hasGeneratedData =
     generatedSchema.length > 0 || Object.keys(generatedData).length > 0;
@@ -419,11 +454,25 @@ function StudioPageInner({
     generationLock = true;
     const genProgressId = (Date.now() + 2).toString();
 
+    setActiveTab("data");
+    setRightGenBanner(null);
+    if (genDoneBannerTimeoutRef.current) {
+      clearTimeout(genDoneBannerTimeoutRef.current);
+      genDoneBannerTimeoutRef.current = null;
+    }
+
     let createdDatabaseId: string | undefined;
+
+    let genFetchTimeoutId: number | undefined;
 
     try {
       const controller = new AbortController();
       generationAbortRef.current = controller;
+
+      const clientGenDeadlineMs = 780_000;
+      genFetchTimeoutId = window.setTimeout(() => {
+        controller.abort();
+      }, clientGenDeadlineMs);
 
       setGenerationProgress({
         isGenerating: true,
@@ -512,11 +561,13 @@ function StudioPageInner({
 
             if (event.type === "database_created" && event.databaseId) {
               createdDatabaseId = event.databaseId;
-              setCurrentDatabaseId(event.databaseId);
-              setGenerationProgress((prev) => ({
-                ...prev,
-                databaseId: event.databaseId,
-              }));
+              startGenTransition(() => {
+                setCurrentDatabaseId(event.databaseId);
+                setGenerationProgress((prev) => ({
+                  ...prev,
+                  databaseId: event.databaseId,
+                }));
+              });
             }
 
             if (event.type === "progress") {
@@ -526,36 +577,42 @@ function StudioPageInner({
                   ? `Streaming records into [${event.table}] — ${event.totalInserted || 0} rows`
                   : `${event.totalInserted || 0} rows inserted`);
 
-              setGenerationProgress((prev) => ({
-                ...prev,
-                currentTable: event.table || prev.currentTable,
-                rowsInserted: event.rowsInserted || 0,
-                totalInserted: event.totalInserted || prev.totalInserted,
-                targetRows: event.targetRows || prev.targetRows,
-                statusMessages: [...prev.statusMessages.slice(-5), statusMsg],
-              }));
+              startGenTransition(() => {
+                if (event.table) {
+                  setSelectedTable(String(event.table));
+                }
 
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === genProgressId
-                    ? {
-                        ...m,
-                        generationProgress: {
-                          isGenerating: true,
-                          currentTable: event.table || "",
-                          rowsInserted: event.rowsInserted || 0,
-                          totalInserted: event.totalInserted || 0,
-                          targetRows: event.targetRows || 0,
-                          tablesGenerated: 0,
-                          statusMessages: [
-                            ...(m.generationProgress?.statusMessages || []).slice(-5),
-                            statusMsg,
-                          ],
-                        },
-                      }
-                    : m,
-                ),
-              );
+                setGenerationProgress((prev) => ({
+                  ...prev,
+                  currentTable: event.table || prev.currentTable,
+                  rowsInserted: event.rowsInserted || 0,
+                  totalInserted: event.totalInserted || prev.totalInserted,
+                  targetRows: event.targetRows || prev.targetRows,
+                  statusMessages: [...prev.statusMessages.slice(-5), statusMsg],
+                }));
+
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === genProgressId
+                      ? {
+                          ...m,
+                          generationProgress: {
+                            isGenerating: true,
+                            currentTable: event.table || "",
+                            rowsInserted: event.rowsInserted || 0,
+                            totalInserted: event.totalInserted || 0,
+                            targetRows: event.targetRows || 0,
+                            tablesGenerated: 0,
+                            statusMessages: [
+                              ...(m.generationProgress?.statusMessages || []).slice(-5),
+                              statusMsg,
+                            ],
+                          },
+                        }
+                      : m,
+                  ),
+                );
+              });
             }
 
             if (event.type === "table_complete") {
@@ -565,40 +622,42 @@ function StudioPageInner({
               const tableSchema = signal.schema.find(
                 (s) => s.name === tableName,
               );
-              if (tableSchema && !accumulatedData[tableName]) {
-                setGeneratedSchema((prev) => {
-                  const existing = prev.find((t) => t.name === tableName);
-                  if (!existing) return [...prev, tableSchema];
-                  return prev;
-                });
-              }
+              startGenTransition(() => {
+                if (tableSchema && !accumulatedData[tableName]) {
+                  setGeneratedSchema((prev) => {
+                    const existing = prev.find((t) => t.name === tableName);
+                    if (!existing) return [...prev, tableSchema];
+                    return prev;
+                  });
+                }
 
-              const completeMsg = `[${tableName}] — ${tableRows.toLocaleString()} rows inserted`;
+                const completeMsg = `[${tableName}] — ${tableRows.toLocaleString()} rows inserted`;
 
-              setGenerationProgress((prev) => ({
-                ...prev,
-                tablesGenerated: prev.tablesGenerated + 1,
-                statusMessages: [...prev.statusMessages.slice(-5), completeMsg],
-              }));
+                setGenerationProgress((prev) => ({
+                  ...prev,
+                  tablesGenerated: prev.tablesGenerated + 1,
+                  statusMessages: [...prev.statusMessages.slice(-5), completeMsg],
+                }));
 
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === genProgressId
-                    ? {
-                        ...m,
-                        generationProgress: {
-                          ...m.generationProgress!,
-                          tablesGenerated:
-                            (m.generationProgress?.tablesGenerated || 0) + 1,
-                          statusMessages: [
-                            ...(m.generationProgress?.statusMessages || []).slice(-5),
-                            completeMsg,
-                          ],
-                        },
-                      }
-                    : m,
-                ),
-              );
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === genProgressId
+                      ? {
+                          ...m,
+                          generationProgress: {
+                            ...m.generationProgress!,
+                            tablesGenerated:
+                              (m.generationProgress?.tablesGenerated || 0) + 1,
+                            statusMessages: [
+                              ...(m.generationProgress?.statusMessages || []).slice(-5),
+                              completeMsg,
+                            ],
+                          },
+                        }
+                      : m,
+                  ),
+                );
+              });
             }
 
             if (event.type === "complete") {
@@ -666,10 +725,29 @@ function StudioPageInner({
                 `Database generated: ${totalRows.toLocaleString()} rows across ${tablesGen} tables`,
               );
               invalidateCache("/api/databases");
+
+              const doneLine = `${totalRows.toLocaleString()} rows · ${tablesGen} table${tablesGen === 1 ? "" : "s"} · ${durationSec}s`;
+              setRightGenBanner(doneLine);
+              if (genDoneBannerTimeoutRef.current) {
+                clearTimeout(genDoneBannerTimeoutRef.current);
+              }
+              genDoneBannerTimeoutRef.current = setTimeout(() => {
+                setRightGenBanner(null);
+                genDoneBannerTimeoutRef.current = null;
+              }, 12000);
             }
 
             if (event.type === "error") {
               const errorMsg = event.message || "Generation failed";
+
+              setRightGenBanner(`Could not finish · ${errorMsg}`);
+              if (genDoneBannerTimeoutRef.current) {
+                clearTimeout(genDoneBannerTimeoutRef.current);
+              }
+              genDoneBannerTimeoutRef.current = setTimeout(() => {
+                setRightGenBanner(null);
+                genDoneBannerTimeoutRef.current = null;
+              }, 14000);
 
               setGenerationProgress((prev) => ({
                 ...prev,
@@ -710,9 +788,37 @@ function StudioPageInner({
 
       setGenerationProgress((prev) => ({ ...prev, isGenerating: false }));
     } catch (err) {
-      if ((err as Error).name === "AbortError") return;
+      if ((err as Error).name === "AbortError") {
+        setGenerationProgress((prev) => ({ ...prev, isGenerating: false }));
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === genProgressId
+              ? {
+                  ...m,
+                  content:
+                    m.content?.trim() ||
+                    "Generation stopped (timeout or cancelled).",
+                  generationProgress: m.generationProgress
+                    ? { ...m.generationProgress, isGenerating: false }
+                    : null,
+                }
+              : m,
+          ),
+        );
+        toast.warning("Generation stopped (timeout or cancelled).");
+        return;
+      }
 
       const errorMsg = err instanceof Error ? err.message : "Generation failed";
+
+      setRightGenBanner(`Could not finish · ${errorMsg}`);
+      if (genDoneBannerTimeoutRef.current) {
+        clearTimeout(genDoneBannerTimeoutRef.current);
+      }
+      genDoneBannerTimeoutRef.current = setTimeout(() => {
+        setRightGenBanner(null);
+        genDoneBannerTimeoutRef.current = null;
+      }, 14000);
 
       setGenerationProgress((prev) => ({
         ...prev,
@@ -736,6 +842,7 @@ function StudioPageInner({
 
       toast.error(`Generation failed: ${errorMsg}`);
     } finally {
+      if (genFetchTimeoutId) window.clearTimeout(genFetchTimeoutId);
       generationLock = false;
     }
   }
@@ -1272,11 +1379,13 @@ function StudioPageInner({
           } = parseAIResponse(fullContent);
 
           if (tables) {
+            setActiveTab("data");
             const schema = extractSchema(tables);
             setGeneratedSchema(schema);
             setGeneratedData(tables);
             if (parsedName) setDatabaseName(parsedName);
             autoSaveData(tables, schema, parsedName);
+            toast.success("Right panel updated from your request.");
           }
 
           // Update the message with cleaned display text — preserve interactiveOptions
@@ -1427,22 +1536,40 @@ function StudioPageInner({
   };
 
   // ─── Delete database ───
-  const deleteDatabase = async () => {
+  const performDeleteDatabase = async () => {
     if (!currentDatabaseId) return;
-    if (
-      !confirm(
-        "Are you sure you want to delete this database? This cannot be undone.",
-      )
-    )
-      return;
     try {
       await apiDelete(`/api/databases?id=${currentDatabaseId}`);
       invalidateCache("/api/databases");
       toast.success("Database deleted");
+      setDeleteDbConfirmOpen(false);
       router.push("/dashboard");
     } catch {
       toast.error("Failed to delete database");
     }
+  };
+
+  const openSaveQueryDialog = () => {
+    if (!sqlEditor.trim()) {
+      toast.message("Nothing to save", {
+        description: "Add SQL in the editor first.",
+      });
+      return;
+    }
+    setSaveQueryName(`Saved query ${savedQueries.length + 1}`);
+    setSaveQueryDialogOpen(true);
+  };
+
+  const commitSaveQuery = () => {
+    const trimmed = saveQueryName.trim();
+    if (!trimmed) {
+      toast.error("Enter a name for this query");
+      return;
+    }
+    if (!sqlEditor.trim()) return;
+    setSavedQueries((prev) => [...prev, { name: trimmed, sql: sqlEditor }]);
+    toast.success("Query saved!");
+    setSaveQueryDialogOpen(false);
   };
 
   // ─── New chat ───
@@ -1452,8 +1579,8 @@ function StudioPageInner({
         id: Date.now().toString(),
         role: "assistant",
         content: hasGeneratedData
-          ? `You're still working on **"${databaseName}"**. What would you like to do next?`
-          : "Welcome to **SynthForge AI Studio**! Describe the database you need.",
+          ? `Still on **${databaseName}** — what next?`
+          : "Hi — what are you building? A single sentence is plenty to start.",
         agentName: "Orchestrator",
         timestamp: new Date(),
       },
@@ -1583,90 +1710,11 @@ function StudioPageInner({
 
     // ─── Render generation progress UI ───
     if (message.generationProgress) {
-      const gp = message.generationProgress;
-      const progressPercent =
-        gp.targetRows > 0
-          ? Math.min(100, Math.round((gp.totalInserted / gp.targetRows) * 100))
-          : 0;
-
       return (
-        <div className="space-y-2">
-          {/* Progress bar */}
-          <div className="flex items-center gap-2">
-            {gp.isGenerating && (
-              <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-500 shrink-0" />
-            )}
-            {!gp.isGenerating && gp.totalInserted > 0 && (
-              <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500 shrink-0" />
-            )}
-            <div className="flex-1">
-              <div className="flex items-center justify-between mb-0.5">
-                <span className="text-[10px] font-medium text-foreground">
-                  {gp.isGenerating ? "Generating..." : "Complete"}
-                </span>
-                <span className="text-[9px] text-muted-foreground">
-                  {progressPercent}%
-                </span>
-              </div>
-              <div className="w-full h-1.5 bg-muted rounded-full overflow-hidden">
-                <div
-                  className={`h-full rounded-full transition-all duration-500 ${gp.isGenerating ? "bg-emerald-500" : "bg-emerald-600"}`}
-                  style={{ width: `${progressPercent}%` }}
-                />
-              </div>
-            </div>
-          </div>
-
-          {/* Current table */}
-          {gp.currentTable && gp.isGenerating && (
-            <div className="flex items-center gap-1.5 text-[9px]">
-              <div className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
-              <span className="text-muted-foreground">Streaming into</span>
-              <span className="font-mono font-semibold text-emerald-600 dark:text-emerald-400">
-                [{gp.currentTable}]
-              </span>
-              <span className="text-muted-foreground">—</span>
-              <span className="font-mono">
-                {gp.totalInserted.toLocaleString()}
-              </span>
-              <span className="text-muted-foreground">
-                / {gp.targetRows.toLocaleString()} rows
-              </span>
-            </div>
-          )}
-
-          {/* Status messages */}
-          {gp.statusMessages.length > 0 && (
-            <div className="space-y-0.5 pl-1">
-              {gp.statusMessages.slice(-5).map((msg, i) => (
-                <div key={i} className="text-[9px] flex items-center gap-1">
-                  {msg.startsWith("[") && msg.includes("rows inserted") ? (
-                    <span className="text-emerald-600 dark:text-emerald-400 font-medium">
-                      {msg}
-                    </span>
-                  ) : msg.startsWith("Error") ? (
-                    <span className="text-destructive font-medium">{msg}</span>
-                  ) : msg.startsWith("Generation complete") ? (
-                    <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
-                      {msg}
-                    </span>
-                  ) : (
-                    <span className="text-muted-foreground">{msg}</span>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-
-          {/* Summary when complete */}
-          {!gp.isGenerating && gp.tablesGenerated > 0 && (
-            <div className="flex items-center gap-2 text-[9px] text-muted-foreground pt-0.5 border-t border-border/50">
-              <span>{gp.tablesGenerated} tables</span>
-              <span>·</span>
-              <span>{gp.totalInserted.toLocaleString()} rows</span>
-            </div>
-          )}
-        </div>
+        <GenerationProgressView
+          gp={message.generationProgress}
+          variant="compact"
+        />
       );
     }
 
@@ -1771,17 +1819,41 @@ function StudioPageInner({
 
   const handleAddRow = () => {
     if (!selectedTable) return;
+    const existing = (generatedData[selectedTable] || []) as Record<
+      string,
+      unknown
+    >[];
     const schema = generatedSchema.find((t) => t.name === selectedTable);
-    const emptyRow: Record<string, unknown> = {};
-    if (schema) {
-      for (const col of schema.columns) {
-        emptyRow[col.name] = col.name === "id" ? crypto.randomUUID() : null;
+
+    const schemaCols = schema?.columns?.map((c) => c.name) ?? [];
+    const dataKeys =
+      existing.length > 0
+        ? [...new Set(existing.flatMap((r) => Object.keys(r)))]
+        : [];
+
+    const colNames: string[] = [];
+    if (schemaCols.length > 0) {
+      for (const name of schemaCols) colNames.push(name);
+      for (const k of dataKeys) {
+        if (!colNames.includes(k)) colNames.push(k);
       }
+    } else if (dataKeys.length > 0) {
+      colNames.push(...dataKeys);
+    } else {
+      colNames.push("id");
     }
+
+    const emptyRow: Record<string, unknown> = {};
+    for (const name of colNames) {
+      emptyRow[name] = name === "id" ? crypto.randomUUID() : null;
+    }
+
+    const newLength = existing.length + 1;
     setGeneratedData((prev) => ({
       ...prev,
       [selectedTable]: [...(prev[selectedTable] || []), emptyRow],
     }));
+    setVisibleRows((v) => Math.max(v, newLength));
     toast.success("Row added");
   };
 
@@ -1815,34 +1887,58 @@ function StudioPageInner({
   const currentTableData = selectedTable
     ? generatedData[selectedTable] || []
     : [];
-  const currentTableColumns =
-    currentTableData.length > 0
-      ? Object.keys(currentTableData[0] as Record<string, unknown>)
-      : [];
+  const currentTableColumns = useMemo(() => {
+    if (!selectedTable) return [];
+    const schema = generatedSchema.find((t) => t.name === selectedTable);
+    if (currentTableData.length === 0) {
+      if (schema?.columns?.length)
+        return schema.columns.map((c) => c.name);
+      return [];
+    }
+    const fromData = Object.keys(
+      currentTableData[0] as Record<string, unknown>,
+    );
+    if (schema?.columns?.length) {
+      const dataSet = new Set(fromData);
+      const ordered: string[] = [];
+      for (const c of schema.columns) {
+        if (dataSet.has(c.name)) ordered.push(c.name);
+      }
+      for (const k of fromData) {
+        if (!ordered.includes(k)) ordered.push(k);
+      }
+      return ordered;
+    }
+    return fromData;
+  }, [currentTableData, selectedTable, generatedSchema]);
   const displayedRows = currentTableData.slice(0, visibleRows);
   const hasMoreRows = currentTableData.length > visibleRows;
 
-  // ─── ER Diagram Layout ───
-  const computeERLayout = () => {
+  const { erLayout, svgWidth, svgHeight } = useMemo(() => {
+    const empty = {
+      erLayout: { nodes: [] as Array<{
+        name: string;
+        x: number;
+        y: number;
+        schema: SchemaTable;
+        rows: number;
+      }>, edges: [] as Array<{
+        from: string;
+        to: string;
+        fromCol: string;
+        toCol: string;
+        type: string;
+      }> },
+      svgWidth: 600,
+      svgHeight: 400,
+    };
+
     const tableNames = Object.keys(generatedData);
-    if (tableNames.length === 0) return { nodes: [], edges: [] };
+    if (tableNames.length === 0) return empty;
 
-    const nodes: Array<{
-      name: string;
-      x: number;
-      y: number;
-      schema: SchemaTable;
-      rows: number;
-    }> = [];
-    const edges: Array<{
-      from: string;
-      to: string;
-      fromCol: string;
-      toCol: string;
-      type: string;
-    }> = [];
+    const nodes: typeof empty.erLayout.nodes = [];
+    const edges: typeof empty.erLayout.edges = [];
 
-    // Hierarchical layout
     const colWidth = 220;
     const rowHeight = 200;
     const cols = Math.ceil(Math.sqrt(tableNames.length));
@@ -1861,16 +1957,15 @@ function StudioPageInner({
         rows,
       });
 
-      // Find FK relationships
       if (schema) {
-        for (const col of schema.columns) {
-          if (col.name.endsWith("_id") && col.name !== "id") {
-            const targetTable = col.name.replace("_id", "");
+        for (const colDef of schema.columns) {
+          if (colDef.name.endsWith("_id") && colDef.name !== "id") {
+            const targetTable = colDef.name.replace("_id", "");
             if (tableNames.includes(targetTable)) {
               edges.push({
                 from: name,
                 to: targetTable,
-                fromCol: col.name,
+                fromCol: colDef.name,
                 toCol: "id",
                 type: "1:N",
               });
@@ -1880,25 +1975,33 @@ function StudioPageInner({
       }
     });
 
-    return { nodes, edges };
-  };
+    const erLayout = { nodes, edges };
+    const svgWidth = Math.max(
+      600,
+      nodes.length > 0 ? Math.max(...nodes.map((n) => n.x)) + 280 : 600,
+    );
+    const svgHeight = Math.max(
+      400,
+      nodes.length > 0 ? Math.max(...nodes.map((n) => n.y)) + 250 : 400,
+    );
 
-  const erLayout = hasGeneratedData
-    ? computeERLayout()
-    : { nodes: [], edges: [] };
+    return { erLayout, svgWidth, svgHeight };
+  }, [generatedSchema, generatedData]);
 
-  // SVG dimensions based on layout
-  const svgWidth = Math.max(
-    600,
-    erLayout.nodes.length > 0
-      ? Math.max(...erLayout.nodes.map((n) => n.x)) + 280
-      : 600,
-  );
-  const svgHeight = Math.max(
-    400,
-    erLayout.nodes.length > 0
-      ? Math.max(...erLayout.nodes.map((n) => n.y)) + 250
-      : 400,
+  /** Explorer sidebar: favorites first, then alphabetical. */
+  const explorerSortedTables = useMemo(() => {
+    const list = [...generatedSchema];
+    list.sort((a, b) => {
+      const af = favoriteTables.has(a.name) ? 0 : 1;
+      const bf = favoriteTables.has(b.name) ? 0 : 1;
+      if (af !== bf) return af - bf;
+      return a.name.localeCompare(b.name);
+    });
+    return list;
+  }, [generatedSchema, favoriteTables]);
+
+  const rightGenBannerIsError = Boolean(
+    rightGenBanner?.startsWith("Could not"),
   );
 
   return (
@@ -2268,6 +2371,17 @@ function StudioPageInner({
         {/* Upload Panel - for importing databases */}
         <UploadPanel onUpload={handleUpload} />
 
+        {(generationProgress.isGenerating || rightGenBanner !== null) && (
+          <div className="mx-3 mt-2 mb-1 shrink-0">
+            <GenerationProgressView
+              gp={generationProgress}
+              doneLine={rightGenBanner}
+              doneIsError={rightGenBannerIsError}
+              variant="card"
+            />
+          </div>
+        )}
+
         {/* Panel Header */}
         <div className="px-3 py-2 border-b flex items-center justify-between bg-card shrink-0">
           <div className="flex items-center gap-2">
@@ -2379,7 +2493,7 @@ function StudioPageInner({
                     variant="outline"
                     size="sm"
                     className="h-6 text-[10px] gap-1 text-destructive hover:text-destructive"
-                    onClick={deleteDatabase}
+                    onClick={() => setDeleteDbConfirmOpen(true)}
                   >
                     <Trash2 className="h-2.5 w-2.5" />
                     Delete
@@ -2409,9 +2523,15 @@ function StudioPageInner({
                 <TabsTrigger
                   value="explorer"
                   className="text-[11px] gap-1 px-2.5"
+                  title="Schema overview and ER diagram"
                 >
                   <GitBranch className="h-3 w-3" />
                   Explorer
+                  {generatedSchema.length > 0 && (
+                    <span className="ml-0.5 inline-flex min-w-[1rem] items-center justify-center rounded-full bg-muted px-1 text-[9px] font-semibold tabular-nums text-muted-foreground">
+                      {generatedSchema.length}
+                    </span>
+                  )}
                 </TabsTrigger>
               </TabsList>
             </div>
@@ -2420,11 +2540,17 @@ function StudioPageInner({
             <TabsContent value="data" className="flex-1 overflow-hidden m-0">
               <div className="flex h-full">
                 {/* Table selector sidebar */}
-                <div className="w-40 border-r bg-muted/30 flex flex-col shrink-0">
-                  <div className="px-2 py-1.5 border-b flex items-center justify-between">
-                    <p className="text-[9px] font-semibold text-muted-foreground uppercase tracking-wider">
-                      Tables
-                    </p>
+                <div className="w-44 border-r bg-muted/25 flex flex-col shrink-0">
+                  <div className="px-2.5 py-2 border-b flex items-center justify-between gap-1">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <Layers
+                        className="h-3.5 w-3.5 shrink-0 text-primary"
+                        aria-hidden
+                      />
+                      <span className="text-[11px] font-medium text-foreground truncate">
+                        Tables
+                      </span>
+                    </div>
                     <Button
                       variant="ghost"
                       size="sm"
@@ -2464,19 +2590,33 @@ function StudioPageInner({
 
                 {/* Data grid */}
                 <div className="flex-1 flex flex-col min-w-0">
-                  {selectedTable && currentTableData.length > 0 ? (
+                  {selectedTable ? (
+                    currentTableColumns.length > 0 ? (
                     <>
-                      <div className="px-2.5 py-1.5 border-b flex items-center justify-between shrink-0">
-                        <div className="flex items-center gap-1.5">
-                          <Table2 className="h-3 w-3 text-amber-600" />
-                          <span className="text-xs font-medium">
-                            {selectedTable}
-                          </span>
-                          <Badge variant="outline" className="text-[9px]">
-                            {currentTableData.length} rows
-                          </Badge>
+                      <div className="px-2.5 py-2 border-b flex flex-wrap items-center justify-between gap-2 shrink-0 bg-muted/20">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <Table2
+                            className="h-3.5 w-3.5 shrink-0 text-primary"
+                            aria-hidden
+                          />
+                          <div className="min-w-0 flex flex-col gap-0.5">
+                            <span className="text-xs font-semibold text-foreground truncate">
+                              {selectedTable}
+                            </span>
+                            <span className="text-[10px] text-muted-foreground">
+                              {currentTableData.length.toLocaleString()} row
+                              {currentTableData.length === 1 ? "" : "s"}
+                            </span>
+                          </div>
                         </div>
-                        <div className="flex items-center gap-0.5">
+                        <div className="flex items-center gap-1 flex-wrap justify-end">
+                          <span className="hidden sm:inline-flex items-center gap-1 rounded-md bg-background/80 px-1.5 py-0.5 text-[10px] text-muted-foreground border border-border/60">
+                            <MousePointerClick
+                              className="h-3 w-3 shrink-0 text-primary"
+                              aria-hidden
+                            />
+                            Double-click a cell to edit
+                          </span>
                           <Button
                             variant="ghost"
                             size="sm"
@@ -2563,40 +2703,93 @@ function StudioPageInner({
                               <th className="text-left py-1.5 px-2 font-medium text-muted-foreground bg-muted/50 border-r w-8">
                                 #
                               </th>
-                              {currentTableColumns.map((col) => (
-                                <th
-                                  key={col}
-                                  className="text-left py-1.5 px-2 font-medium text-muted-foreground bg-muted/50 whitespace-nowrap border-r last:border-r-0 min-w-[90px]"
-                                >
-                                  <div className="flex items-center gap-1">
-                                    <span className="font-mono text-[10px]">
-                                      {col}
-                                    </span>
-                                    {generatedSchema
-                                      .find((t) => t.name === selectedTable)
-                                      ?.columns.find((c) => c.name === col) && (
-                                      <Badge
-                                        variant="secondary"
-                                        className="text-[7px] px-0.5 py-0 font-mono"
-                                      >
-                                        {
-                                          generatedSchema
-                                            .find(
-                                              (t) => t.name === selectedTable,
-                                            )
-                                            ?.columns.find(
-                                              (c) => c.name === col,
-                                            )?.type
-                                        }
-                                      </Badge>
+                              {currentTableColumns.map((col) => {
+                                const kind = getDataColumnKind(col);
+                                const colMeta = generatedSchema
+                                  .find((t) => t.name === selectedTable)
+                                  ?.columns.find((c) => c.name === col);
+                                return (
+                                  <th
+                                    key={col}
+                                    className={cn(
+                                      "text-left py-2 px-2 align-bottom whitespace-nowrap border-r border-border/70 last:border-r-0 min-w-[104px]",
+                                      kind === "pk" &&
+                                        "bg-primary/10 text-foreground border-b-2 border-b-primary",
+                                      kind === "fk" &&
+                                        "bg-sky-500/10 dark:bg-sky-950/35 text-foreground border-b-2 border-b-sky-500/55",
+                                      kind === "regular" &&
+                                        "bg-muted/40 text-muted-foreground border-b border-border",
                                     )}
-                                  </div>
-                                </th>
-                              ))}
+                                  >
+                                    <div className="flex flex-col gap-1.5">
+                                      <div className="flex flex-wrap items-center gap-1">
+                                        {kind === "pk" && (
+                                          <span
+                                            className="inline-flex items-center gap-0.5 rounded-md bg-primary/20 px-1 py-0.5 text-[8px] font-bold uppercase tracking-wide text-primary"
+                                            title="Primary key"
+                                          >
+                                            <KeyRound
+                                              className="h-2.5 w-2.5"
+                                              aria-hidden
+                                            />
+                                            PK
+                                          </span>
+                                        )}
+                                        {kind === "fk" && (
+                                          <span
+                                            className="inline-flex items-center gap-0.5 rounded-md bg-sky-500/20 dark:bg-sky-400/15 px-1 py-0.5 text-[8px] font-bold uppercase tracking-wide text-sky-800 dark:text-sky-200"
+                                            title="Foreign key — points to another table"
+                                          >
+                                            <Link2
+                                              className="h-2.5 w-2.5"
+                                              aria-hidden
+                                            />
+                                            FK
+                                          </span>
+                                        )}
+                                      </div>
+                                      <span className="text-[11px] font-semibold text-foreground leading-tight">
+                                        {humanizeColumnName(col)}
+                                      </span>
+                                      <span className="text-[9px] font-mono text-muted-foreground">
+                                        {col}
+                                      </span>
+                                      {colMeta && (
+                                        <Badge
+                                          variant="outline"
+                                          className="w-fit text-[8px] px-1 py-0 font-mono font-normal text-muted-foreground border-muted-foreground/30"
+                                        >
+                                          {colMeta.type}
+                                        </Badge>
+                                      )}
+                                      {columnPlainEnglishHint(col) && (
+                                        <span className="text-[9px] text-muted-foreground leading-snug">
+                                          {columnPlainEnglishHint(col)}
+                                        </span>
+                                      )}
+                                    </div>
+                                  </th>
+                                );
+                              })}
                             </tr>
                           </thead>
                           <tbody>
-                            {displayedRows.map((row, i) => (
+                            {displayedRows.length === 0 ? (
+                              <tr>
+                                <td
+                                  colSpan={2 + currentTableColumns.length}
+                                  className="py-8 px-4 text-center text-xs text-muted-foreground"
+                                >
+                                  No rows in this table yet. Click{" "}
+                                  <span className="font-semibold text-foreground">
+                                    Row
+                                  </span>{" "}
+                                  above to add one, then double-click a cell to
+                                  edit.
+                                </td>
+                              </tr>
+                            ) : (
+                            displayedRows.map((row, i) => (
                               <tr
                                 key={i}
                                 className={`border-b hover:bg-muted/30 transition-colors ${selectedRows.has(i) ? "bg-amber-50 dark:bg-amber-950/20" : ""}`}
@@ -2619,69 +2812,81 @@ function StudioPageInner({
                                 <td className="py-1 px-2 text-muted-foreground font-mono text-[9px] border-r bg-muted/20">
                                   {i + 1}
                                 </td>
-                                {Object.entries(
-                                  row as Record<string, unknown>,
-                                ).map(([colName, val], j) => (
-                                  <td
-                                    key={j}
-                                    className="py-1 px-2 font-mono text-[10px] whitespace-nowrap max-w-[180px] truncate border-r last:border-r-0"
-                                    onDoubleClick={() => {
-                                      setEditingCell({ row: i, col: colName });
-                                      setEditingCellValue(
-                                        val === null ? "" : String(val),
-                                      );
-                                    }}
-                                  >
-                                    {editingCell?.row === i &&
-                                    editingCell?.col === colName ? (
-                                      <input
-                                        type="text"
-                                        className="w-full h-5 text-[10px] font-mono px-1 border border-amber-400 rounded bg-background focus:outline-none"
-                                        value={editingCellValue}
-                                        autoFocus
-                                        onChange={(e) =>
-                                          setEditingCellValue(e.target.value)
-                                        }
-                                        onBlur={() =>
-                                          handleCellEdit(
-                                            i,
-                                            colName,
-                                            editingCellValue,
-                                          )
-                                        }
-                                        onKeyDown={(e) => {
-                                          if (e.key === "Enter")
+                                {currentTableColumns.map((colName) => {
+                                  const r = row as Record<string, unknown>;
+                                  const val = r[colName];
+                                  const kind = getDataColumnKind(colName);
+                                  return (
+                                    <td
+                                      key={colName}
+                                      className={cn(
+                                        "py-1.5 px-2 font-mono text-[10px] whitespace-nowrap max-w-[200px] truncate border-r border-border/50 last:border-r-0 transition-colors",
+                                        kind === "pk" &&
+                                          "bg-primary/[0.07] text-foreground",
+                                        kind === "fk" &&
+                                          "bg-sky-500/[0.08] dark:bg-sky-950/25",
+                                      )}
+                                      onDoubleClick={() => {
+                                        setEditingCell({ row: i, col: colName });
+                                        setEditingCellValue(
+                                          val === null ? "" : String(val),
+                                        );
+                                      }}
+                                    >
+                                      {editingCell?.row === i &&
+                                      editingCell?.col === colName ? (
+                                        <input
+                                          type="text"
+                                          className="w-full h-5 text-[10px] font-mono px-1 border border-primary/60 rounded bg-background focus:outline-none focus:ring-1 focus:ring-primary"
+                                          value={editingCellValue}
+                                          autoFocus
+                                          onChange={(e) =>
+                                            setEditingCellValue(e.target.value)
+                                          }
+                                          onBlur={() =>
                                             handleCellEdit(
                                               i,
                                               colName,
                                               editingCellValue,
-                                            );
-                                          if (e.key === "Escape")
-                                            setEditingCell(null);
-                                        }}
-                                      />
-                                    ) : val === null ? (
-                                      <span className="text-muted-foreground italic">
-                                        NULL
-                                      </span>
-                                    ) : typeof val === "boolean" ? (
-                                      <Badge
-                                        variant={val ? "default" : "secondary"}
-                                        className="text-[8px] px-1 py-0"
-                                      >
-                                        {String(val)}
-                                      </Badge>
-                                    ) : typeof val === "number" ? (
-                                      <span className="text-blue-600 dark:text-blue-400">
-                                        {String(val)}
-                                      </span>
-                                    ) : (
-                                      String(val ?? "")
-                                    )}
-                                  </td>
-                                ))}
+                                            )
+                                          }
+                                          onKeyDown={(e) => {
+                                            if (e.key === "Enter")
+                                              handleCellEdit(
+                                                i,
+                                                colName,
+                                                editingCellValue,
+                                              );
+                                            if (e.key === "Escape")
+                                              setEditingCell(null);
+                                          }}
+                                        />
+                                      ) : val === null ? (
+                                        <span className="text-muted-foreground italic">
+                                          NULL
+                                        </span>
+                                      ) : typeof val === "boolean" ? (
+                                        <Badge
+                                          variant={
+                                            val ? "default" : "secondary"
+                                          }
+                                          className="text-[8px] px-1 py-0"
+                                        >
+                                          {String(val)}
+                                        </Badge>
+                                      ) : typeof val === "number" ? (
+                                        <span className="text-blue-600 dark:text-blue-400 tabular-nums">
+                                          {String(val)}
+                                        </span>
+                                      ) : (
+                                        String(val ?? "")
+                                      )}
+                                    </td>
+                                  );
+                                })}
                               </tr>
-                            ))}
+                            ))
+                            )}
                           </tbody>
                         </table>
                       </div>
@@ -2701,8 +2906,54 @@ function StudioPageInner({
                       )}
                     </>
                   ) : (
-                    <div className="flex-1 flex items-center justify-center text-muted-foreground">
-                      <p className="text-xs">Select a table to view data</p>
+                    <div className="flex-1 flex flex-col items-center justify-center gap-3 p-8 text-center border-t">
+                      <div className="rounded-full bg-muted p-4">
+                        <Table2
+                          className="h-8 w-8 text-muted-foreground"
+                          aria-hidden
+                        />
+                      </div>
+                      <div className="space-y-1 max-w-sm">
+                        <p className="text-sm font-medium text-foreground">
+                          No columns in this table yet
+                        </p>
+                        <p className="text-xs text-muted-foreground leading-relaxed">
+                          Use{" "}
+                          <span className="font-semibold text-foreground">
+                            Col
+                          </span>{" "}
+                          above to add fields. After that you can add rows and
+                          double-click cells to edit.
+                        </p>
+                      </div>
+                    </div>
+                  )
+                  ) : (
+                    <div className="flex-1 flex flex-col items-center justify-center gap-3 p-8 text-center">
+                      <div className="rounded-full bg-primary/10 p-4">
+                        <Database
+                          className="h-8 w-8 text-primary/80"
+                          aria-hidden
+                        />
+                      </div>
+                      <div className="space-y-1 max-w-sm">
+                        <p className="text-sm font-medium text-foreground">
+                          Pick a table on the left
+                        </p>
+                        <p className="text-xs text-muted-foreground leading-relaxed">
+                          <span className="inline-flex items-center gap-1 font-medium text-primary">
+                            <KeyRound className="h-3 w-3" aria-hidden />
+                            Primary
+                          </span>{" "}
+                          and{" "}
+                          <span className="inline-flex items-center gap-1 font-medium text-sky-600 dark:text-sky-400">
+                            <Link2 className="h-3 w-3" aria-hidden />
+                            foreign
+                          </span>{" "}
+                          columns are tinted so you can scan relationships
+                          quickly.
+                        </p>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -2844,18 +3095,7 @@ function StudioPageInner({
                     variant="ghost"
                     size="sm"
                     className="h-6 text-[10px] gap-0.5"
-                    onClick={() => {
-                      if (sqlEditor.trim()) {
-                        const name = prompt("Name this query:");
-                        if (name) {
-                          setSavedQueries((prev) => [
-                            ...prev,
-                            { name, sql: sqlEditor },
-                          ]);
-                          toast.success("Query saved!");
-                        }
-                      }
-                    }}
+                    onClick={openSaveQueryDialog}
                   >
                     <Save className="h-2.5 w-2.5" />
                     Save
@@ -2981,16 +3221,37 @@ function StudioPageInner({
               className="flex-1 overflow-hidden m-0"
             >
               <div className="flex h-full">
-                {/* Schema tree sidebar */}
-                <div className="w-56 border-r bg-muted/30 flex flex-col shrink-0 overflow-hidden">
-                  <div className="px-2 py-1.5 border-b shrink-0">
-                    <p className="text-[9px] font-semibold text-muted-foreground uppercase tracking-wider">
-                      Schema Tree
-                    </p>
+                {/* Schema overview sidebar */}
+                <div className="w-60 border-r bg-muted/20 flex flex-col shrink-0 overflow-hidden">
+                  <div className="px-2.5 py-2 border-b shrink-0 bg-muted/40">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <GitBranch
+                        className="h-3.5 w-3.5 shrink-0 text-primary"
+                        aria-hidden
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[11px] font-semibold text-foreground truncate">
+                            Schema
+                          </span>
+                          <Badge
+                            variant="secondary"
+                            className="text-[9px] px-1.5 py-0 h-5 font-medium tabular-nums shrink-0"
+                          >
+                            {generatedSchema.length} table
+                            {generatedSchema.length === 1 ? "" : "s"}
+                          </Badge>
+                        </div>
+                        <p className="text-[10px] text-muted-foreground mt-0.5 leading-snug">
+                          Primary keys (PK), foreign keys (FK), types, and
+                          plain-English hints. Star a table to pin it to the top.
+                        </p>
+                      </div>
+                    </div>
                   </div>
-                  <ScrollArea className="flex-1 min-h-0 p-1.5">
-                    <div className="space-y-1.5">
-                      {generatedSchema.map((table) => {
+                  <ScrollArea className="flex-1 min-h-0 p-2">
+                    <div className="space-y-2 pr-1">
+                      {explorerSortedTables.map((table) => {
                         const tableData = generatedData[table.name] as
                           | Record<string, unknown>[]
                           | undefined;
@@ -2998,20 +3259,38 @@ function StudioPageInner({
                         return (
                           <div
                             key={table.name}
-                            className="rounded border bg-card overflow-hidden"
+                            className="rounded-xl border border-border/80 bg-card shadow-sm overflow-hidden"
                           >
-                            <div className="px-2 py-1 bg-muted/50 flex items-center gap-1.5 border-b">
-                              <Table2 className="h-2.5 w-2.5 text-amber-600" />
-                              <span className="text-[10px] font-semibold">
-                                {table.name}
-                              </span>
-                              <Badge
-                                variant="outline"
-                                className="text-[7px] ml-auto px-0.5 py-0"
-                              >
-                                {tableData?.length || 0} rows
-                              </Badge>
+                            <div className="px-2.5 py-2 bg-muted/50 border-b border-border/60 flex items-start gap-2">
+                              <Table2
+                                className="h-3.5 w-3.5 shrink-0 text-amber-600 mt-0.5"
+                                aria-hidden
+                              />
+                              <div className="min-w-0 flex-1 space-y-0.5">
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <span className="text-[11px] font-semibold font-mono text-foreground truncate">
+                                    {table.name}
+                                  </span>
+                                  <Badge
+                                    variant="outline"
+                                    className="text-[9px] px-1.5 py-0 h-5 tabular-nums font-medium"
+                                  >
+                                    {table.columns.length} col
+                                    {table.columns.length === 1 ? "" : "s"}
+                                  </Badge>
+                                  <Badge
+                                    variant="secondary"
+                                    className="text-[9px] px-1.5 py-0 h-5 tabular-nums"
+                                  >
+                                    {tableData?.length ?? 0} rows
+                                  </Badge>
+                                </div>
+                              </div>
                               <button
+                                type="button"
+                                title={
+                                  isFav ? "Unpin from top" : "Pin to top of list"
+                                }
                                 onClick={() => {
                                   setFavoriteTables((prev) => {
                                     const next = new Set(prev);
@@ -3021,60 +3300,79 @@ function StudioPageInner({
                                     return next;
                                   });
                                 }}
-                                className="ml-0.5"
+                                className="shrink-0 rounded-md p-1 hover:bg-background/80 text-muted-foreground hover:text-foreground transition-colors"
                               >
                                 {isFav ? (
-                                  <Star className="h-2.5 w-2.5 text-amber-500 fill-amber-500" />
+                                  <Star className="h-3.5 w-3.5 text-amber-500 fill-amber-500" />
                                 ) : (
-                                  <StarOff className="h-2.5 w-2.5 text-muted-foreground/50" />
+                                  <StarOff className="h-3.5 w-3.5 opacity-60" />
                                 )}
                               </button>
                             </div>
-                            <div className="p-1 space-y-px">
-                              {table.columns.map((col) => (
-                                <div
-                                  key={col.name}
-                                  className="flex items-center justify-between px-1 py-px rounded text-[9px] hover:bg-muted/50"
-                                >
-                                  <div className="flex items-center gap-0.5">
-                                    {col.name === "id" && (
-                                      <Badge
-                                        variant="secondary"
-                                        className="text-[6px] px-0.5 py-0 bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
-                                      >
-                                        PK
-                                      </Badge>
-                                    )}
-                                    {col.name.endsWith("_id") &&
-                                      col.name !== "id" && (
-                                        <Badge
-                                          variant="secondary"
-                                          className="text-[6px] px-0.5 py-0 bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-400"
-                                        >
-                                          FK
-                                        </Badge>
-                                      )}
-                                    <span className="font-mono">
-                                      {col.name}
-                                    </span>
-                                  </div>
-                                  <span className="text-muted-foreground font-mono text-[8px]">
-                                    {col.type}
-                                  </span>
-                                </div>
-                              ))}
-                            </div>
-                            {/* Quick preview */}
+                            <ul className="p-2 space-y-1.5 bg-background/40">
+                              {table.columns.map((col) => {
+                                const kind = getDataColumnKind(col.name);
+                                const hint = columnPlainEnglishHint(col.name);
+                                const label = humanizeColumnName(col.name);
+                                return (
+                                  <li
+                                    key={col.name}
+                                    className="rounded-lg border border-border/50 bg-muted/20 px-2 py-1.5 text-[10px] leading-snug"
+                                  >
+                                    <div className="flex items-start justify-between gap-2">
+                                      <div className="min-w-0 flex-1 space-y-0.5">
+                                        <div className="flex items-center gap-1 flex-wrap">
+                                          {kind === "pk" && (
+                                            <Badge
+                                              variant="secondary"
+                                              className="text-[8px] px-1 py-0 h-4 bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 font-semibold"
+                                            >
+                                              PK
+                                            </Badge>
+                                          )}
+                                          {kind === "fk" && (
+                                            <Badge
+                                              variant="secondary"
+                                              className="text-[8px] px-1 py-0 h-4 bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-300 font-semibold"
+                                            >
+                                              FK
+                                            </Badge>
+                                          )}
+                                          <span className="font-mono font-medium text-foreground">
+                                            {col.name}
+                                          </span>
+                                        </div>
+                                        {label !== col.name && (
+                                          <p className="text-[9px] text-muted-foreground truncate">
+                                            {label}
+                                          </p>
+                                        )}
+                                        {hint && (
+                                          <p className="text-[9px] text-muted-foreground/90 italic line-clamp-2">
+                                            {hint}
+                                          </p>
+                                        )}
+                                      </div>
+                                      <span className="shrink-0 font-mono text-[9px] text-muted-foreground bg-muted/80 px-1.5 py-0.5 rounded border border-border/40 max-w-[5.5rem] truncate" title={col.type}>
+                                        {col.type}
+                                      </span>
+                                    </div>
+                                  </li>
+                                );
+                              })}
+                            </ul>
                             {tableData && tableData.length > 0 && (
                               <button
+                                type="button"
                                 onClick={() => {
                                   setSelectedTable(table.name);
                                   setActiveTab("data");
                                   setVisibleRows(20);
                                 }}
-                                className="w-full px-2 py-1 text-[9px] text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-950/30 border-t transition-colors"
+                                className="w-full px-2.5 py-2 text-[10px] font-medium text-primary hover:bg-primary/5 border-t border-border/60 transition-colors flex items-center justify-center gap-1"
                               >
-                                Preview first 5 rows →
+                                <MousePointerClick className="h-3 w-3 shrink-0" />
+                                Open in Data tab
                               </button>
                             )}
                           </div>
@@ -3087,7 +3385,8 @@ function StudioPageInner({
                 {/* ER Diagram visualization */}
                 <div className="flex-1 relative overflow-hidden bg-muted/10">
                   {/* Zoom controls */}
-                  <div className="absolute top-2 right-2 z-10 flex items-center gap-1 bg-card border rounded-lg px-1.5 py-1 shadow-sm">
+                  <div className="absolute top-2 right-2 z-10 flex flex-col items-end gap-1">
+                    <div className="flex items-center gap-1 bg-card border rounded-lg px-1.5 py-1 shadow-sm">
                     <Button
                       variant="ghost"
                       size="sm"
@@ -3122,6 +3421,10 @@ function StudioPageInner({
                     >
                       <Move className="h-3 w-3" />
                     </Button>
+                    </div>
+                    <p className="text-[9px] text-muted-foreground bg-card/95 border border-border/80 rounded-md px-2 py-0.5 shadow-sm pointer-events-none">
+                      Drag canvas to pan
+                    </p>
                   </div>
 
                   <div
@@ -3587,6 +3890,82 @@ function StudioPageInner({
             >
               Execute Anyway
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Delete database confirmation */}
+      <Dialog open={deleteDbConfirmOpen} onOpenChange={setDeleteDbConfirmOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Trash2 className="h-5 w-5 text-destructive" />
+              Delete this database?
+            </DialogTitle>
+            <DialogDescription>
+              This removes <span className="font-medium text-foreground">{databaseName || "this project"}</span>{" "}
+              and all of its tables and rows. This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setDeleteDbConfirmOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={performDeleteDatabase}>
+              Delete database
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Save SQL query — name in-app dialog (no browser prompt) */}
+      <Dialog
+        open={saveQueryDialogOpen}
+        onOpenChange={(open) => {
+          setSaveQueryDialogOpen(open);
+          if (!open) setSaveQueryName("");
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Save className="h-5 w-5 text-primary" />
+              Save query
+            </DialogTitle>
+            <DialogDescription>
+              Give this SQL a short label so you can load it again from Saved.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label htmlFor="save-query-name" className="text-xs">
+              Name
+            </Label>
+            <Input
+              id="save-query-name"
+              value={saveQueryName}
+              onChange={(e) => setSaveQueryName(e.target.value)}
+              placeholder="e.g. Monthly revenue"
+              className="h-9"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  commitSaveQuery();
+                }
+              }}
+              autoFocus
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setSaveQueryDialogOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button onClick={commitSaveQuery}>Save</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import type { Json } from '@/lib/supabase/types'
 
 // Default user ID for fallback when auth is not available
 const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
@@ -168,8 +169,8 @@ export async function POST(request: NextRequest) {
         .insert({
           name: fileName,
           db_type: 'postgresql',
-          schema_json: schemaJson,
-          data_json: dataJson,
+          schema_json: schemaJson as unknown as Json,
+          data_json: dataJson as unknown as Json,
           row_count: Object.values(dataJson).reduce(
             (s, arr) => s + (Array.isArray(arr) ? arr.length : 0),
             0

@@ -288,7 +288,7 @@ export function QuestionFlowPanel({ flow, onAnswer, onCancel }: QuestionFlowPane
               onClick={handleCustomToggle}
               className="text-[10px] text-violet-600 hover:text-violet-700 dark:text-violet-400 dark:hover:text-violet-300 font-semibold underline underline-offset-2"
             >
-              {showCustomInput ? 'Back to choices' : 'I have a custom answer'}
+              {showCustomInput ? 'Back to choices' : "Something else — I'll type details"}
             </button>
           </div>
         )}

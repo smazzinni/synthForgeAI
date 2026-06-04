@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { resolveSupabasePublicConfig } from '@/lib/supabase/env'
 
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url)
@@ -9,8 +10,8 @@ export async function GET(request: NextRequest) {
     try {
       const { createServerClient } = await import('@supabase/ssr')
 
-      const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
-      const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+      const { url: supabaseUrl, anonKey: supabaseAnonKey } =
+        resolveSupabasePublicConfig()
 
       if (supabaseUrl && supabaseAnonKey) {
         // Create a response first so we can set cookies on it
