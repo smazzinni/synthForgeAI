@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { getSupabaseAdmin } from "@/lib/supabase/admin";
+import { getSupabaseAdmin, isAuthEnabled } from "@/lib/supabase/admin";
+import { getSupabaseServerClient } from "@/lib/supabase/server";
 import type { Database, Json } from "@/lib/supabase/types";
 import { validateAndCleanRecord } from "@/lib/record-validation";
 
@@ -12,8 +13,6 @@ import { validateAndCleanRecord } from "@/lib/record-validation";
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const DEEPSEEK_API_URL =
   process.env.DEEPSEEK_API_URL || "https://api.deepseek.com";
-const DEFAULT_USER_ID = "5a784d48-945a-47d3-ae95-d2aa5d9abe8c";
-
 const BATCH_SIZE = 200;
 const FLUSH_INTERVAL_MS = 300;
 const STALE_GENERATION_TIMEOUT_MS = 5 * 60 * 1000;
@@ -93,7 +92,6 @@ interface GenerationRequest {
   rowCounts: Record<string, number>;
   instructions?: string;
   conversationHistory?: Array<{ role: string; content: string }>;
-  userId?: string;
 }
 
 interface SSEEvent {
@@ -115,11 +113,15 @@ interface SSEEvent {
   databaseId?: string;
 }
 
+/** Fallback when auth is off or server client is unavailable — keep patterns aligned with `src/app/api/auth/user/route.ts`. */
 function getUserIdFromCookies(request: NextRequest): string | null {
   try {
-    const supabaseCookies = request.cookies
-      .getAll()
-      .filter((c) => c.name.includes("-auth-token"));
+    const supabaseCookies = request.cookies.getAll().filter(
+      (c) =>
+        c.name.includes("auth-token") ||
+        c.name.startsWith("sb-") ||
+        c.name.includes("-auth-token"),
+    );
     for (const cookie of supabaseCookies) {
       try {
         const rawValue = decodeURIComponent(cookie.value);
@@ -140,9 +142,34 @@ function getUserIdFromCookies(request: NextRequest): string | null {
       }
     }
     return null;
-  } catch {
+  } catch (err) {
+    console.warn("[Generate-Stream] getUserIdFromCookies failed:", err);
     return null;
   }
+}
+
+/**
+ * Resolve the signed-in user the same way as middleware (`getSupabaseServerClient` +
+ * `auth.getUser()`), so Route Handlers see the session cookies @supabase/ssr sets.
+ * When auth is off, fall back to cookie JWT decode and SYNTHFORGE_DEV_USER_UUID.
+ */
+async function resolveGenerationUserId(
+  request: NextRequest,
+): Promise<string | null> {
+  const supabase = await getSupabaseServerClient();
+  if (supabase) {
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (user?.id) return user.id;
+  }
+  if (isAuthEnabled()) {
+    return null;
+  }
+  const fromCookies = getUserIdFromCookies(request);
+  if (fromCookies) return fromCookies;
+  const dev = process.env.SYNTHFORGE_DEV_USER_UUID?.trim();
+  return dev || null;
 }
 
 function extractLocaleFromHistory(
@@ -296,8 +323,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const userId =
-      getUserIdFromCookies(request) || body.userId || DEFAULT_USER_ID;
+    const userId = await resolveGenerationUserId(request);
+    if (isAuthEnabled() && !userId) {
+      return new Response(
+        JSON.stringify({ error: "Authentication required" }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      );
+    }
     const startTime = Date.now();
 
     let databaseId = body.databaseId;
@@ -356,12 +388,13 @@ export async function POST(request: NextRequest) {
         const dbName =
           body.databaseName || body.schema[0]?.name || "synthetic_db";
 
-        const { data: existingDb, error: selectError } = await supabase
+        const existingByName = supabase
           .from("synthetic_databases")
           .select("id, status, updated_at")
-          .eq("user_id", userId)
-          .eq("name", dbName)
-          .single();
+          .eq("name", dbName);
+        const { data: existingDb, error: selectError } = userId
+          ? await existingByName.eq("user_id", userId).single()
+          : await existingByName.is("user_id", null).single();
 
         if (existingDb && !selectError) {
           const isStale = isStaleGeneration(existingDb.status, existingDb.updated_at);
@@ -408,12 +441,13 @@ export async function POST(request: NextRequest) {
               dbError.code === "23505" ||
               dbError.message?.includes("unique")
             ) {
-              const { data: fallbackDb } = await supabase
+              const fallbackQuery = supabase
                 .from("synthetic_databases")
                 .select("id")
-                .eq("user_id", userId)
-                .eq("name", dbName)
-                .single();
+                .eq("name", dbName);
+              const { data: fallbackDb } = userId
+                ? await fallbackQuery.eq("user_id", userId).single()
+                : await fallbackQuery.is("user_id", null).single();
 
               if (fallbackDb) {
                 databaseId = fallbackDb.id;
@@ -607,16 +641,15 @@ export async function POST(request: NextRequest) {
       return encoder.encode(`data: ${JSON.stringify(event)}\n\n`);
     };
 
-    // FIX (Bug 2): separate flush-level lock from generation-level lock
-    // The generation lock serializes the entire generation across concurrent
-    // requests; the flush lock only serializes individual DB writes.
+    // Serialize generation per database on this instance; cross-instance
+    // consistency relies on merge_generation_flush RPC (see migration 002).
     let generationLockRelease: (() => void) | null = null;
-    const flushLock = { release: null as (() => void) | null };
 
     if (databaseId) {
       try {
         generationLockRelease = await acquireDbLock(databaseId);
-      } catch {
+      } catch (err) {
+        console.warn("[Generate-Stream] acquireDbLock failed:", err);
         generationLockRelease = null;
       }
     }
@@ -633,31 +666,62 @@ export async function POST(request: NextRequest) {
       allTableData[tableName].push(...records);
 
       if (databaseId) {
-        // FIX (Bug 2): always acquire the flush-level lock independently
         let release: (() => void) | null = null;
+        const newRowCount = totalInserted + records.length;
         try {
-          release = await acquireDbLock(`flush:${databaseId}`);
+          const { error: rpcError } = await supabase.rpc(
+            "merge_generation_flush",
+            {
+              p_database_id: databaseId,
+              p_table_name: tableName,
+              p_rows: records as Json,
+              p_row_count: newRowCount,
+            },
+          );
 
-          const { data: db } = await supabase
-            .from("synthetic_databases")
-            .select("data_json")
-            .eq("id", databaseId)
-            .single();
+          if (rpcError) {
+            const msg = rpcError.message ?? "";
+            const rpcMissing =
+              rpcError.code === "PGRST202" ||
+              /could not find the function/i.test(msg) ||
+              /function .* does not exist/i.test(msg);
+            if (rpcMissing) {
+              console.warn(
+                "[Generate-Stream] merge_generation_flush RPC missing; apply supabase/migrations/002_merge_generation_flush.sql. Using legacy flush (may race across instances).",
+              );
+            } else {
+              console.warn(
+                "[Generate-Stream] merge_generation_flush RPC failed, using legacy flush:",
+                rpcError,
+              );
+            }
 
-          const existingData =
-            (db?.data_json as Record<string, unknown[]>) || {};
-          if (!existingData[tableName]) {
-            existingData[tableName] = [];
+            release = await acquireDbLock(`flush:${databaseId}`);
+
+            const { data: db } = await supabase
+              .from("synthetic_databases")
+              .select("data_json")
+              .eq("id", databaseId)
+              .single();
+
+            const existingData =
+              (db?.data_json as Record<string, unknown[]>) || {};
+            if (!existingData[tableName]) {
+              existingData[tableName] = [];
+            }
+            existingData[tableName] = [
+              ...existingData[tableName],
+              ...records,
+            ];
+
+            await supabase
+              .from("synthetic_databases")
+              .update({
+                data_json: existingData as unknown as Json,
+                row_count: newRowCount,
+              })
+              .eq("id", databaseId);
           }
-          existingData[tableName] = [...existingData[tableName], ...records];
-
-          await supabase
-            .from("synthetic_databases")
-            .update({
-              data_json: existingData as unknown as Json,
-              row_count: totalInserted + records.length,
-            })
-            .eq("id", databaseId);
         } catch (err) {
           console.warn("[Generate-Stream] DB update failed:", err);
         } finally {
@@ -979,8 +1043,8 @@ export async function POST(request: NextRequest) {
           if (insertQueue.length > 0 && currentTable) {
             try {
               await flushBatch(currentTable, insertQueue.splice(0));
-            } catch {
-              // Best effort
+            } catch (flushErr) {
+              console.warn("[Generate-Stream] flush after stream error:", flushErr);
             }
           }
 
@@ -997,8 +1061,8 @@ export async function POST(request: NextRequest) {
           if (insertQueue.length > 0 && currentTable) {
             try {
               await flushBatch(currentTable, insertQueue.splice(0));
-            } catch {
-              // Best effort
+            } catch (err) {
+              console.warn("[Generate-Stream] final flush in finally:", err);
             }
           }
 
@@ -1009,8 +1073,8 @@ export async function POST(request: NextRequest) {
               if (insertQueue.length > 0) {
                 await flushBatch(currentTable, insertQueue.splice(0));
               }
-            } catch {
-              // Best effort
+            } catch (err) {
+              console.warn("[Generate-Stream] final content-buffer flush failed:", err);
             }
           }
 
@@ -1055,7 +1119,9 @@ export async function POST(request: NextRequest) {
               generationLockRelease();
               generationLockRelease = null;
             }
-          } catch {}
+          } catch (err) {
+            console.warn("[Generate-Stream] generationLockRelease failed:", err);
+          }
 
           if (allValidationFailures.length > 0) {
             console.warn(

@@ -1,72 +1,76 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { createClient } from '@supabase/supabase-js'
+import { resolveSupabasePublicConfig } from '@/lib/supabase/env'
+import { checkRateLimit, type RateLimitEntry } from '@/lib/in-memory-rate-limit'
 
-// ─── Rate limiter: max 5 login attempts per minute ───
-const loginRateLimiter = new Map<string, { count: number; resetAt: number }>()
+// ─── Rate limiter: max 5 login attempts per minute (bounded map) ───
+const loginRateLimiter = new Map<string, RateLimitEntry>()
 const LOGIN_RATE_LIMIT = 5
-const LOGIN_RATE_WINDOW = 60000
+const LOGIN_RATE_WINDOW = 60_000
 
 function getClientId(request: NextRequest): string {
   const forwarded = request.headers.get('x-forwarded-for')
-  const ip = forwarded ? forwarded.split(',')[0] : 'unknown'
-  return ip
+  const realIp = request.headers.get('x-real-ip')
+  if (forwarded) return forwarded.split(',')[0]?.trim() || 'unknown'
+  if (realIp) return realIp.trim()
+  return 'unknown'
 }
 
-// NOTE: The primary login flow is client-side via useAuth().signIn()
-// which uses the Supabase browser client directly.
-// This API route is only used as a fallback for programmatic login.
+// NOTE: Primary login is client-side via useAuth().signIn() with the browser client.
+// This route verifies email/password server-side via Supabase Auth (anon key).
 export async function POST(request: NextRequest) {
-  // Rate limit check
   const clientId = getClientId(request)
-  const now = Date.now()
-  const entry = loginRateLimiter.get(clientId)
-
-  if (entry && now <= entry.resetAt && entry.count >= LOGIN_RATE_LIMIT) {
+  if (
+    !checkRateLimit(
+      loginRateLimiter,
+      'login',
+      clientId,
+      LOGIN_RATE_LIMIT,
+      LOGIN_RATE_WINDOW,
+    )
+  ) {
     return NextResponse.json(
       { error: 'Too many login attempts. Please wait a moment.' },
-      { status: 429 }
+      { status: 429 },
     )
-  }
-
-  if (!entry || now > entry.resetAt) {
-    loginRateLimiter.set(clientId, { count: 1, resetAt: now + LOGIN_RATE_WINDOW })
-  } else {
-    entry.count++
   }
 
   try {
     const body = await request.json()
-    const { email, password } = body
+    const { email, password } = body as { email?: string; password?: string }
 
     if (!email || !password) {
-      return NextResponse.json({ error: 'Email and password are required' }, { status: 400 })
+      return NextResponse.json(
+        { error: 'Email and password are required' },
+        { status: 400 },
+      )
     }
 
-    // Use the Supabase admin client to find the user
-    const { getSupabaseAdmin } = await import('@/lib/supabase/admin')
-    const admin = getSupabaseAdmin()
-
-    if (!admin) {
-      return NextResponse.json({ error: 'Auth service not configured' }, { status: 503 })
+    const { url, anonKey } = resolveSupabasePublicConfig()
+    if (!url || !anonKey) {
+      return NextResponse.json(
+        { error: 'Auth service not configured' },
+        { status: 503 },
+      )
     }
 
-    // Use listUsers with a filter to find by email
-    const { data: { users }, error: listError } = await admin.auth.admin.listUsers()
+    const supabase = createClient(url, anonKey, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    })
 
-    if (listError) {
-      console.error('[Auth Login] List users error:', listError.message)
-      return NextResponse.json({ error: 'Authentication failed' }, { status: 401 })
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    })
+
+    if (error || !data.user) {
+      return NextResponse.json(
+        { error: 'Invalid email or password' },
+        { status: 401 },
+      )
     }
 
-    // Find the user by email
-    const user = users?.find(u => u.email === email)
-    if (!user) {
-      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 })
-    }
-
-    // Note: We can't verify the password server-side with the admin client
-    // The actual password verification happens client-side via Supabase browser client
-    // This endpoint just confirms the user exists
-
+    const user = data.user
     return NextResponse.json({
       user: {
         id: user.id,

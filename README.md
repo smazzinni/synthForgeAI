@@ -260,6 +260,9 @@ SUPABASE_URL=https://your-project.supabase.co
 DEEPSEEK_API_KEY=your-deepseek-api-key-here
 DEEPSEEK_API_URL=https://api.deepseek.com
 
+# When NEXT_PUBLIC_AUTH_ENABLED=false, optional UUID for synthetic_databases.user_id on generate-stream (must exist in profiles if FK enforced)
+SYNTHFORGE_DEV_USER_UUID=
+
 # ─── Authentication ───────────────────────────────────────────────
 NEXT_PUBLIC_AUTH_ENABLED=true
 
@@ -276,6 +279,7 @@ DATABASE_URL=file:/home/z/my-project/db/custom.db
 | `DEEPSEEK_API_KEY` | Yes | — | DeepSeek API key for AI chat |
 | `DEEPSEEK_API_URL` | No | `https://api.deepseek.com` | DeepSeek API endpoint |
 | `NEXT_PUBLIC_AUTH_ENABLED` | No | `false` | Enable/disable Supabase auth |
+| `SYNTHFORGE_DEV_USER_UUID` | No | — | When auth is disabled, optional `profiles.id` used as `user_id` for streamed generation (avoids anonymous rows) |
 | `DATABASE_URL` | No | `file:./db/custom.db` | SQLite database path (Prisma) |
 
 ### Agent Configuration
@@ -297,6 +301,10 @@ Agent behavior is configured through the AI system prompt in `src/app/api/chat/r
 | `CHAT_RATE_LIMIT` | 20 | Max chat requests per window |
 | `CHAT_RATE_WINDOW` | 60000 | Rate limit window in milliseconds |
 | Payload size limit | 50000 | Max message payload size in bytes |
+
+In-memory rate limiter maps are capped and periodically pruned (`src/lib/in-memory-rate-limit.ts`) so warm server instances do not grow keys without bound.
+
+For streamed generation, apply `supabase/migrations/002_merge_generation_flush.sql` so incremental flushes merge `data_json` atomically in Postgres (avoids lost updates when multiple workers touch the same row).
 
 ---
 
@@ -358,7 +366,7 @@ POST /api/conversations                — Create or append to conversation
 ### SQL Execution
 
 ```
-POST /api/sql/execute          — Execute SQL against generated data
+POST /api/sql/execute          — Run a single read-only SELECT (or WITH) against generated in-memory JSON
      Body: { sql, databaseId }
      Response: { rows?, columns?, executionTime?, rowCount?, error? }
 ```

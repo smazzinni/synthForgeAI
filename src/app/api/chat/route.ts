@@ -1,38 +1,17 @@
 import { NextRequest } from 'next/server'
+import {
+  checkRateLimit,
+  periodicCleanup,
+  type RateLimitEntry,
+} from '@/lib/in-memory-rate-limit'
 
-// ─── Rate limiter ───
-const chatRateLimiter = new Map<string, { count: number; resetAt: number }>()
+// ─── Rate limiter (bounded; see in-memory-rate-limit) ───
+const chatRateLimiter = new Map<string, RateLimitEntry>()
 const CHAT_RATE_LIMIT = 20
-const CHAT_RATE_WINDOW = 60000
+const CHAT_RATE_WINDOW = 60_000
 
-let lastCleanup = Date.now()
-const CLEANUP_INTERVAL = 120000
-
-function cleanup() {
-  const now = Date.now()
-  if (now - lastCleanup < CLEANUP_INTERVAL) return
-  lastCleanup = now
-  for (const [key, entry] of chatRateLimiter.entries()) {
-    if (now > entry.resetAt) chatRateLimiter.delete(key)
-  }
-}
-
-function checkRateLimit(clientId: string): boolean {
-  // FIX (Bug 1): sanitize clientId before using it as a Map key.
-  // A forged X-Forwarded-For like "chat:admin" could collide with
-  // unrelated keys or allow an attacker to bypass their own bucket.
-  const safeId = clientId.replace(/[^a-zA-Z0-9._\-:]/g, '_').slice(0, 128)
-  const key = `chat:${safeId}`
-  const now = Date.now()
-  const entry = chatRateLimiter.get(key)
-  if (!entry || now > entry.resetAt) {
-    chatRateLimiter.set(key, { count: 1, resetAt: now + CHAT_RATE_WINDOW })
-    return true
-  }
-  if (entry.count >= CHAT_RATE_LIMIT) return false
-  entry.count++
-  return true
-}
+const lastCleanup = { value: Date.now() }
+const CLEANUP_INTERVAL = 120_000
 
 // ─── DeepSeek API streaming ───
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
@@ -217,7 +196,7 @@ Rules:
 `
 
 export async function POST(request: NextRequest) {
-  cleanup()
+  periodicCleanup(chatRateLimiter, lastCleanup, CLEANUP_INTERVAL)
 
   // FIX (Bug 2): x-forwarded-for may contain multiple IPs (proxies append
   // their own). We want the original client IP which is the first entry.
@@ -228,7 +207,15 @@ export async function POST(request: NextRequest) {
     ? forwarded.split(',')[0].trim()
     : realIp?.trim() ?? 'unknown'
 
-  if (!checkRateLimit(clientId)) {
+  if (
+    !checkRateLimit(
+      chatRateLimiter,
+      'chat',
+      clientId,
+      CHAT_RATE_LIMIT,
+      CHAT_RATE_WINDOW,
+    )
+  ) {
     return new Response(JSON.stringify({ error: 'Rate limit exceeded' }), {
       status: 429,
       headers: { 'Content-Type': 'application/json' },

@@ -1,12 +1,49 @@
-import { NextRequest, NextResponse } from 'next/server'
+import { NextResponse, type NextRequest } from 'next/server'
+import { createServerClient } from '@supabase/ssr'
+import { resolveSupabasePublicConfig } from '@/lib/supabase/env'
 
-// Lightweight proxy/middleware that does NOT create Supabase clients.
-// Auth state is handled entirely client-side via the AuthProvider.
-// This prevents the middleware from being a bottleneck that causes 502s.
+const AUTH_ENABLED = process.env.NEXT_PUBLIC_AUTH_ENABLED === 'true'
 
 export async function middleware(request: NextRequest) {
-  // Just pass through - all auth is handled client-side
-  return NextResponse.next()
+  if (!AUTH_ENABLED) {
+    return NextResponse.next()
+  }
+
+  const { url: supabaseUrl, anonKey } = resolveSupabasePublicConfig()
+  if (!supabaseUrl || !anonKey) {
+    return NextResponse.next()
+  }
+
+  let supabaseResponse = NextResponse.next({
+    request: { headers: request.headers },
+  })
+
+  const supabase = createServerClient(supabaseUrl, anonKey, {
+    cookies: {
+      getAll() {
+        return request.cookies.getAll()
+      },
+      setAll(cookiesToSet) {
+        cookiesToSet.forEach(({ name, value, options }) => {
+          request.cookies.set(name, value)
+          supabaseResponse.cookies.set(name, value, options)
+        })
+      },
+    },
+  })
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser()
+
+  const path = request.nextUrl.pathname
+  if (path.startsWith('/dashboard') && !user) {
+    const loginUrl = new URL('/login', request.url)
+    loginUrl.searchParams.set('next', `${path}${request.nextUrl.search}`)
+    return NextResponse.redirect(loginUrl)
+  }
+
+  return supabaseResponse
 }
 
 export const config = {

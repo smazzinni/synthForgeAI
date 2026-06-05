@@ -207,7 +207,17 @@ export interface Database {
       }
     }
     Views: Record<string, never>
-    Functions: Record<string, never>
+    Functions: {
+      merge_generation_flush: {
+        Args: {
+          p_database_id: string
+          p_table_name: string
+          p_rows: Json
+          p_row_count: number
+        }
+        Returns: undefined
+      }
+    }
     Enums: {
       database_status: 'draft' | 'generating' | 'ready' | 'error' | 'archived'
       conversation_status: 'active' | 'archived' | 'error' | 'deleted'

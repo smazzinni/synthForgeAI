@@ -5,12 +5,9 @@ import { executeSQLAgainstData } from '@/lib/sql-executor'
 // ─── SQL Execution API ───
 // Executes SQL against the Supabase database and returns results
 
-const ALLOWED_STATEMENTS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'WITH']
-const DANGEROUS_PATTERNS = [
-  /;\s*DROP\s+DATABASE/i,
-  /;\s*DROP\s+SCHEMA/i,
-  /TRUNCATE\s+TABLE/i,
-]
+// Read-only: executor only runs SELECT/WITH against in-memory JSON; other
+// statement types were misleading and suggested server-side DML.
+const ALLOWED_STATEMENTS = ['SELECT', 'WITH']
 
 export async function POST(request: NextRequest) {
   try {
@@ -32,29 +29,16 @@ export async function POST(request: NextRequest) {
 
     // Basic validation: check for allowed statement types
     const firstWord = trimmedSql.split(/\s+/)[0]?.toUpperCase() || ''
-    const isWithCTE = firstWord === 'WITH'
-    if (!ALLOWED_STATEMENTS.includes(firstWord) && !isWithCTE) {
+    if (!ALLOWED_STATEMENTS.includes(firstWord)) {
       return NextResponse.json({ error: `Statement type "${firstWord}" is not allowed` }, { status: 400 })
     }
 
-    // Check for potentially destructive operations and require confirmation
-    for (const pattern of DANGEROUS_PATTERNS) {
-      if (pattern.test(trimmedSql)) {
-        return NextResponse.json({
-          error: 'This query contains a potentially destructive operation. Please confirm before executing.',
-          requiresConfirmation: true,
-          sql: trimmedSql,
-        }, { status: 200 })
-      }
-    }
-
-    // Additional check: DELETE without WHERE should prompt for confirmation
-    if (/^\s*DELETE\b/i.test(trimmedSql) && !/\bWHERE\b/i.test(trimmedSql)) {
-      return NextResponse.json({
-        error: 'DELETE without WHERE detected. Please confirm before executing.',
-        requiresConfirmation: true,
-        sql: trimmedSql,
-      }, { status: 200 })
+    const withoutTrailingSemicolons = trimmedSql.replace(/;+\s*$/g, '').trim()
+    if (/;/g.test(withoutTrailingSemicolons)) {
+      return NextResponse.json(
+        { error: 'Multiple SQL statements are not allowed' },
+        { status: 400 },
+      )
     }
 
     const admin = getSupabaseAdmin()

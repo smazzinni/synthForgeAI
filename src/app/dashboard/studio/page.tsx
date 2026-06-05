@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback, useMemo, useTransition, Suspense } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -137,6 +138,9 @@ const CHAT_API_HISTORY_LIMIT = 10;
 const CHAT_API_MAX_CONTENT = 12000;
 const GENERATION_HISTORY_LIMIT = 12;
 
+/** Sonner toast id so loading → success/error replaces the same toast */
+const STUDIO_GEN_TOAST_ID = "studio-db-generation";
+
 function buildApiChatHistory(
   messages: Message[],
 ): Array<{ role: "user" | "assistant"; content: string }> {
@@ -181,6 +185,21 @@ function getDataColumnKind(columnName: string): DataColumnKind {
   if (columnName === 'id') return 'pk'
   if (columnName.endsWith('_id') && columnName !== 'id') return 'fk'
   return 'regular'
+}
+
+/** Heuristic row height for chat virtualization (TanStack measures actual DOM). */
+function estimateStudioChatMessageHeight(m: Message | undefined): number {
+  if (!m) return 88;
+  if (m.generationProgress?.isGenerating) return 220;
+  if (m.generationProgress) return 150;
+  if (m.interactiveOptions?.choices?.length) {
+    return 100 + m.interactiveOptions.choices.length * 34;
+  }
+  const len = typeof m.content === "string" ? m.content.length : 0;
+  if (m.role === "user") {
+    return Math.min(400, Math.max(52, 36 + Math.ceil(len / 8)));
+  }
+  return Math.min(560, Math.max(72, 52 + Math.ceil(len / 6)));
 }
 
 // ─── Main Studio Page Component ───
@@ -288,7 +307,6 @@ function StudioPageInner({
 
   const [rightGenBanner, setRightGenBanner] = useState<string | null>(null);
 
-  const chatEndRef = useRef<HTMLDivElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const messagesRef = useRef<Message[]>(messages);
@@ -299,6 +317,14 @@ function StudioPageInner({
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  const chatVirtualizer = useVirtualizer({
+    count: messages.length,
+    getScrollElement: () => chatContainerRef.current,
+    estimateSize: (index) => estimateStudioChatMessageHeight(messages[index]),
+    overscan: 8,
+    getItemKey: (index) => messages[index]?.id ?? index,
+  });
 
   useEffect(() => {
     return () => {
@@ -311,6 +337,10 @@ function StudioPageInner({
 
   const hasGeneratedData =
     generatedSchema.length > 0 || Object.keys(generatedData).length > 0;
+
+  /** Keep Data/SQL/Explorer available while rows stream, including before schema is applied. */
+  const showDataWorkspace =
+    hasGeneratedData || generationProgress.isGenerating;
 
   // ✅ REMOVED: duplicate first useEffect that set setInput(q) + setInitialQuerySent(true).
   // It was redundant — sendMessage(q) in the second effect handles everything, and
@@ -332,10 +362,39 @@ function StudioPageInner({
     return () => window.clearTimeout(timer);
   }, [generatedData, selectedTable]);
 
-  // Scroll to bottom of chat
+  // Scroll chat: only pin to bottom when user is already near the end, or
+  // while assistant is streaming / generation is running (otherwise virtual
+  // scroll would yank the viewport on every token).
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, currentReasoning]);
+    if (messages.length === 0) return;
+    const el = chatContainerRef.current;
+    if (!el) return;
+    const threshold = 100;
+    const distanceFromBottom =
+      el.scrollHeight - el.scrollTop - el.clientHeight;
+    const nearBottom = distanceFromBottom < threshold;
+    const last = messages[messages.length - 1];
+    const pinToBottom =
+      nearBottom ||
+      !!last?.isStreaming ||
+      generationProgress.isGenerating;
+
+    if (!pinToBottom) return;
+
+    const id = requestAnimationFrame(() => {
+      chatVirtualizer.scrollToIndex(messages.length - 1, {
+        align: "end",
+        behavior: generationProgress.isGenerating ? "auto" : "smooth",
+      });
+    });
+    return () => cancelAnimationFrame(id);
+  }, [
+    messages,
+    currentReasoning,
+    generationProgress.isGenerating,
+    chatVirtualizer,
+    messages.length,
+  ]);
 
   // ─── Resize handler ───
   useEffect(() => {
@@ -481,7 +540,6 @@ function StudioPageInner({
     generationLock = true;
     const genProgressId = (Date.now() + 2).toString();
 
-    setActiveTab("data");
     setRightGenBanner(null);
     if (genDoneBannerTimeoutRef.current) {
       clearTimeout(genDoneBannerTimeoutRef.current);
@@ -491,6 +549,8 @@ function StudioPageInner({
     let createdDatabaseId: string | undefined;
 
     let genFetchTimeoutId: number | undefined;
+    /** Set once stream reader exists; `finally` drains pending throttled UI. */
+    let drainGenProgressUi: (() => void) | null = null;
 
     try {
       const controller = new AbortController();
@@ -508,7 +568,10 @@ function StudioPageInner({
         totalInserted: 0,
         targetRows: Object.values(signal.rowCounts).reduce((s, n) => s + n, 0),
         tablesGenerated: 0,
-        statusMessages: ["Generating database schema..."],
+        statusMessages: [
+          "Starting — your schema is ready.",
+          "Connecting to the generator (this can take a moment)…",
+        ],
         databaseId: currentDatabaseId,
       });
 
@@ -517,7 +580,8 @@ function StudioPageInner({
         {
           id: genProgressId,
           role: "assistant" as const,
-          content: "",
+          content:
+            "Your database is being created. You can follow progress below and in the Data tab once rows start streaming.",
           agentName: "Data Generator",
           generationProgress: {
             isGenerating: true,
@@ -529,11 +593,19 @@ function StudioPageInner({
               0,
             ),
             tablesGenerated: 0,
-            statusMessages: ["Generating database schema..."],
+            statusMessages: [
+              "Starting — your schema is ready.",
+              "Connecting to the generator (this can take a moment)…",
+            ],
           },
           timestamp: new Date(),
         },
       ]);
+
+      toast.loading(
+        "Creating your database — connecting to the generator…",
+        { id: STUDIO_GEN_TOAST_ID, duration: 720_000 },
+      );
 
       const history =
         conversationHistoryOverride && conversationHistoryOverride.length > 0
@@ -548,6 +620,7 @@ function StudioPageInner({
 
       const response = await fetch("/api/generate-stream", {
         method: "POST",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           databaseId: currentDatabaseId,
@@ -573,9 +646,114 @@ function StudioPageInner({
       const reader = response.body?.getReader();
       if (!reader) throw new Error("No response stream");
 
+      setActiveTab("data");
+
+      toast.loading("Generator connected — streaming rows into your tables…", {
+        id: STUDIO_GEN_TOAST_ID,
+        duration: 720_000,
+      });
+
       const decoder = new TextDecoder();
       let sseBuffer = "";
       const accumulatedData: Record<string, unknown[]> = {};
+
+      // Throttle progress SSE → React updates. Without this, hundreds of
+      // setState + scrollIntoView(smooth) per second freeze the main thread.
+      const GEN_PROGRESS_UI_MS = 140;
+      let genProgressUiTimer: ReturnType<typeof setTimeout> | null = null;
+      let lastGenProgressUiFlush = 0;
+      let latestProgressEvent: Record<string, unknown> | null = null;
+      let lastGenUiTable = "";
+
+      const flushPendingGenerationProgressUI = () => {
+        genProgressUiTimer = null;
+        const event = latestProgressEvent;
+        if (!event) return;
+        latestProgressEvent = null;
+        lastGenProgressUiFlush = Date.now();
+
+        const statusMsg =
+          (event.message as string) ||
+          (event.table
+            ? `Streaming records into [${event.table}] — ${(event.totalInserted as number) || 0} rows`
+            : `${(event.totalInserted as number) || 0} rows inserted`);
+
+        const table = event.table ? String(event.table) : "";
+
+        startGenTransition(() => {
+          if (table && table !== lastGenUiTable) {
+            lastGenUiTable = table;
+            setSelectedTable(table);
+          }
+
+          setGenerationProgress((prev) => ({
+            ...prev,
+            currentTable: table || prev.currentTable,
+            rowsInserted: (event.rowsInserted as number) || 0,
+            totalInserted:
+              (event.totalInserted as number) ?? prev.totalInserted,
+            targetRows: (event.targetRows as number) || prev.targetRows,
+            tablesGenerated: prev.tablesGenerated,
+            statusMessages: [...prev.statusMessages.slice(-5), statusMsg],
+          }));
+
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === genProgressId
+                ? {
+                    ...m,
+                    generationProgress: {
+                      isGenerating: true,
+                      currentTable: table,
+                      rowsInserted: (event.rowsInserted as number) || 0,
+                      totalInserted: (event.totalInserted as number) || 0,
+                      targetRows: (event.targetRows as number) || 0,
+                      tablesGenerated:
+                        m.generationProgress?.tablesGenerated ?? 0,
+                      statusMessages: [
+                        ...(m.generationProgress?.statusMessages || []).slice(
+                          -5,
+                        ),
+                        statusMsg,
+                      ],
+                    },
+                  }
+                : m,
+            ),
+          );
+        });
+      };
+
+      const scheduleGenerationProgressUI = (event: Record<string, unknown>) => {
+        latestProgressEvent = event;
+        const now = Date.now();
+        if (now - lastGenProgressUiFlush >= GEN_PROGRESS_UI_MS) {
+          if (genProgressUiTimer) {
+            clearTimeout(genProgressUiTimer);
+            genProgressUiTimer = null;
+          }
+          flushPendingGenerationProgressUI();
+          return;
+        }
+        if (!genProgressUiTimer) {
+          genProgressUiTimer = setTimeout(
+            flushPendingGenerationProgressUI,
+            GEN_PROGRESS_UI_MS - (now - lastGenProgressUiFlush),
+          );
+        }
+      };
+
+      const drainGenerationProgressThrottle = () => {
+        if (genProgressUiTimer) {
+          clearTimeout(genProgressUiTimer);
+          genProgressUiTimer = null;
+        }
+        if (latestProgressEvent) {
+          flushPendingGenerationProgressUI();
+        }
+      };
+
+      drainGenProgressUi = drainGenerationProgressThrottle;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -605,51 +783,11 @@ function StudioPageInner({
             }
 
             if (event.type === "progress") {
-              const statusMsg =
-                event.message ||
-                (event.table
-                  ? `Streaming records into [${event.table}] — ${event.totalInserted || 0} rows`
-                  : `${event.totalInserted || 0} rows inserted`);
-
-              startGenTransition(() => {
-                if (event.table) {
-                  setSelectedTable(String(event.table));
-                }
-
-                setGenerationProgress((prev) => ({
-                  ...prev,
-                  currentTable: event.table || prev.currentTable,
-                  rowsInserted: event.rowsInserted || 0,
-                  totalInserted: event.totalInserted || prev.totalInserted,
-                  targetRows: event.targetRows || prev.targetRows,
-                  statusMessages: [...prev.statusMessages.slice(-5), statusMsg],
-                }));
-
-                setMessages((prev) =>
-                  prev.map((m) =>
-                    m.id === genProgressId
-                      ? {
-                          ...m,
-                          generationProgress: {
-                            isGenerating: true,
-                            currentTable: event.table || "",
-                            rowsInserted: event.rowsInserted || 0,
-                            totalInserted: event.totalInserted || 0,
-                            targetRows: event.targetRows || 0,
-                            tablesGenerated: 0,
-                            statusMessages: [
-                              ...(m.generationProgress?.statusMessages || []).slice(-5),
-                              statusMsg,
-                            ],
-                          },
-                        }
-                      : m,
-                  ),
-                );
-              });
+              scheduleGenerationProgressUI(event as Record<string, unknown>);
             }
 
             if (event.type === "table_complete") {
+              drainGenerationProgressThrottle();
               const tableName = event.table || "";
               const tableRows = event.totalRows || 0;
 
@@ -695,6 +833,7 @@ function StudioPageInner({
             }
 
             if (event.type === "complete") {
+              drainGenerationProgressThrottle();
               const durationSec = ((event.durationMs || 0) / 1000).toFixed(1);
               const totalRows = event.totalRows || 0;
               const tablesGen = event.tablesGenerated || 0;
@@ -756,7 +895,8 @@ function StudioPageInner({
               if (signal.databaseName) setDatabaseName(signal.databaseName);
 
               toast.success(
-                `Database generated: ${totalRows.toLocaleString()} rows across ${tablesGen} tables`,
+                `Database ready: ${totalRows.toLocaleString()} rows across ${tablesGen} table${tablesGen === 1 ? "" : "s"} (${durationSec}s)`,
+                { id: STUDIO_GEN_TOAST_ID, duration: 6000 },
               );
               invalidateCache("/api/databases");
 
@@ -772,6 +912,7 @@ function StudioPageInner({
             }
 
             if (event.type === "error") {
+              drainGenerationProgressThrottle();
               const errorMsg = event.message || "Generation failed";
 
               setRightGenBanner(`Could not finish · ${errorMsg}`);
@@ -809,9 +950,15 @@ function StudioPageInner({
               );
 
               if (event.recoverable) {
-                toast.warning(`Generation partially completed: ${errorMsg}`);
+                toast.warning(`Partially completed: ${errorMsg}`, {
+                  id: STUDIO_GEN_TOAST_ID,
+                  duration: 8000,
+                });
               } else {
-                toast.error(`Generation failed: ${errorMsg}`);
+                toast.error(`Generation failed: ${errorMsg}`, {
+                  id: STUDIO_GEN_TOAST_ID,
+                  duration: 8000,
+                });
               }
             }
           } catch {
@@ -820,6 +967,7 @@ function StudioPageInner({
         }
       }
 
+      drainGenerationProgressThrottle();
       setGenerationProgress((prev) => ({ ...prev, isGenerating: false }));
     } catch (err) {
       if ((err as Error).name === "AbortError") {
@@ -839,7 +987,10 @@ function StudioPageInner({
               : m,
           ),
         );
-        toast.warning("Generation stopped (timeout or cancelled).");
+        toast.warning("Generation stopped (timeout or cancelled).", {
+          id: STUDIO_GEN_TOAST_ID,
+          duration: 6000,
+        });
         return;
       }
 
@@ -874,8 +1025,12 @@ function StudioPageInner({
         ),
       );
 
-      toast.error(`Generation failed: ${errorMsg}`);
+      toast.error(`Generation failed: ${errorMsg}`, {
+        id: STUDIO_GEN_TOAST_ID,
+        duration: 8000,
+      });
     } finally {
+      drainGenProgressUi?.();
       if (genFetchTimeoutId) window.clearTimeout(genFetchTimeoutId);
       generationLock = false;
     }
@@ -987,6 +1142,40 @@ function StudioPageInner({
         let lastAgentStatus: AgentStatus | null = null;
         let lastInteractiveOptions: InteractiveOptions | null = null;
 
+        /** Coalesce token-level SSE updates to one React commit per animation frame. */
+        let assistantStreamRaf: number | null = null;
+        const applyAssistantStreamUi = () => {
+          setCurrentReasoning(fullReasoning);
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId
+                ? {
+                    ...m,
+                    content: fullContent,
+                    reasoningContent: fullReasoning,
+                    agentName: lastAgentName,
+                    agentStatus: lastAgentStatus,
+                    interactiveOptions: lastInteractiveOptions,
+                  }
+                : m,
+            ),
+          );
+        };
+        const scheduleAssistantStreamUi = () => {
+          if (assistantStreamRaf != null) return;
+          assistantStreamRaf = requestAnimationFrame(() => {
+            assistantStreamRaf = null;
+            applyAssistantStreamUi();
+          });
+        };
+        const cancelAndFlushAssistantStreamUi = () => {
+          if (assistantStreamRaf != null) {
+            cancelAnimationFrame(assistantStreamRaf);
+            assistantStreamRaf = null;
+          }
+          applyAssistantStreamUi();
+        };
+
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -1005,14 +1194,7 @@ function StudioPageInner({
 
               if (parsed.type === "reasoning") {
                 fullReasoning += parsed.content;
-                setCurrentReasoning(fullReasoning);
-                setMessages((prev) =>
-                  prev.map((m) =>
-                    m.id === assistantId
-                      ? { ...m, reasoningContent: fullReasoning }
-                      : m,
-                  ),
-                );
+                scheduleAssistantStreamUi();
               } else if (parsed.type === "content") {
                 fullContent += parsed.content;
 
@@ -1030,20 +1212,9 @@ function StudioPageInner({
                 }
 
                 // During streaming, store raw content but display cleaned version
-                setMessages((prev) =>
-                  prev.map((m) =>
-                    m.id === assistantId
-                      ? {
-                          ...m,
-                          content: fullContent,
-                          agentName: lastAgentName,
-                          agentStatus: lastAgentStatus,
-                          interactiveOptions: lastInteractiveOptions,
-                        }
-                      : m,
-                  ),
-                );
+                scheduleAssistantStreamUi();
               } else if (parsed.type === "done" || parsed.type === "finish") {
+                cancelAndFlushAssistantStreamUi();
                 setMessages((prev) =>
                   prev.map((m) =>
                     m.id === assistantId ? { ...m, isStreaming: false } : m,
@@ -1067,14 +1238,7 @@ function StudioPageInner({
 
               if (parsed.type === "reasoning") {
                 fullReasoning += parsed.content;
-                setCurrentReasoning(fullReasoning);
-                setMessages((prev) =>
-                  prev.map((m) =>
-                    m.id === assistantId
-                      ? { ...m, reasoningContent: fullReasoning }
-                      : m,
-                  ),
-                );
+                scheduleAssistantStreamUi();
               } else if (parsed.type === "content") {
                 fullContent += parsed.content;
 
@@ -1089,20 +1253,9 @@ function StudioPageInner({
                   lastInteractiveOptions = allOptions[allOptions.length - 1];
                 }
 
-                setMessages((prev) =>
-                  prev.map((m) =>
-                    m.id === assistantId
-                      ? {
-                          ...m,
-                          content: fullContent,
-                          agentName: lastAgentName,
-                          agentStatus: lastAgentStatus,
-                          interactiveOptions: lastInteractiveOptions,
-                        }
-                      : m,
-                  ),
-                );
+                scheduleAssistantStreamUi();
               } else if (parsed.type === "done" || parsed.type === "finish") {
+                cancelAndFlushAssistantStreamUi();
                 setMessages((prev) =>
                   prev.map((m) =>
                     m.id === assistantId ? { ...m, isStreaming: false } : m,
@@ -1116,6 +1269,8 @@ function StudioPageInner({
             }
           }
         }
+
+        cancelAndFlushAssistantStreamUi();
 
         // Finalize the message
         setMessages((prev) =>
@@ -1160,7 +1315,8 @@ function StudioPageInner({
             setDatabaseName(beginGenSignal.databaseName);
           }
 
-          // Trigger the streaming generation pipeline
+          // Trigger the streaming generation pipeline (stay on Chat until HTTP + stream open)
+          setActiveTab("chat");
           setLoading(false);
           loadingRef.current = false;
           setReasoningVisible(false);
@@ -1788,10 +1944,17 @@ function StudioPageInner({
     // ─── Render generation progress UI ───
     if (message.generationProgress) {
       return (
-        <GenerationProgressView
-          gp={message.generationProgress}
-          variant="compact"
-        />
+        <div className="space-y-2">
+          {message.content?.trim() ? (
+            <p className="text-[11px] text-muted-foreground leading-snug border-b border-border/50 pb-2">
+              {message.content}
+            </p>
+          ) : null}
+          <GenerationProgressView
+            gp={message.generationProgress}
+            variant="compact"
+          />
+        </div>
       );
     }
 
@@ -2120,7 +2283,16 @@ function StudioPageInner({
                 Thinking
               </Badge>
             )}
-            {hasGeneratedData && !loading && (
+            {generationProgress.isGenerating && !loading && (
+              <Badge
+                variant="secondary"
+                className="text-[9px] gap-0.5 h-5 border-emerald-500/30 bg-emerald-500/10 text-emerald-800 dark:text-emerald-200"
+              >
+                <Loader2 className="h-2.5 w-2.5 shrink-0 animate-spin" />
+                Creating database
+              </Badge>
+            )}
+            {hasGeneratedData && !loading && !generationProgress.isGenerating && (
               <Badge
                 variant="outline"
                 className="text-[9px] gap-0.5 text-emerald-600 border-emerald-300 h-5"
@@ -2199,14 +2371,29 @@ function StudioPageInner({
           </div>
         )}
 
-        {/* Chat Messages */}
+        {/* Chat Messages (virtualized for long threads) */}
         <div
           ref={chatContainerRef}
-          className="flex-1 overflow-y-auto px-2.5 py-3 space-y-2.5 scroll-smooth"
+          className="flex-1 min-h-0 overflow-y-auto px-2.5 py-3 scroll-smooth"
         >
-          {messages.map((message) => (
+          <div
+            className="relative w-full"
+            style={{ height: chatVirtualizer.getTotalSize() }}
+          >
+            {chatVirtualizer.getVirtualItems().map((virtualRow) => {
+              const message = messages[virtualRow.index];
+              if (!message) return null;
+              return (
             <div
-              key={message.id}
+              key={virtualRow.key}
+              data-index={virtualRow.index}
+              ref={chatVirtualizer.measureElement}
+              className="absolute left-0 top-0 w-full pb-2.5"
+              style={{
+                transform: `translateY(${virtualRow.start}px)`,
+              }}
+            >
+            <div
               className={`flex gap-1.5 ${message.role === "user" ? "justify-end" : ""}`}
             >
               {message.role === "assistant" && (
@@ -2372,7 +2559,10 @@ function StudioPageInner({
                 </div>
               )}
             </div>
-          ))}
+            </div>
+              );
+            })}
+          </div>
           {loading &&
             messages.length > 0 &&
             !messages[messages.length - 1]?.isStreaming && (
@@ -2395,7 +2585,6 @@ function StudioPageInner({
               onCancel={() => setActiveFlow(null)}
             />
           )}
-          <div ref={chatEndRef} />
         </div>
 
         {/* Chat Input - Multi-line textarea with Enter to send, Shift+Enter for newline */}
@@ -2461,7 +2650,16 @@ function StudioPageInner({
 
         {/* Panel Header */}
         <div className="px-3 py-2 border-b flex items-center justify-between bg-card shrink-0">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            {generationProgress.isGenerating && (
+              <Badge
+                variant="secondary"
+                className="text-[10px] gap-1 h-6 font-medium border-emerald-500/40 bg-emerald-500/10 text-emerald-800 dark:text-emerald-200 animate-pulse"
+              >
+                <Loader2 className="h-3 w-3 animate-spin shrink-0" />
+                Creating data
+              </Badge>
+            )}
             {hasGeneratedData && (
               <>
                 <Database className="h-3.5 w-3.5 text-amber-600" />
@@ -2472,9 +2670,15 @@ function StudioPageInner({
                 />
               </>
             )}
-            {!hasGeneratedData && (
+            {!hasGeneratedData && !generationProgress.isGenerating && (
               <span className="text-xs text-muted-foreground">
                 No database generated yet
+              </span>
+            )}
+            {!hasGeneratedData && generationProgress.isGenerating && (
+              <span className="text-xs text-muted-foreground max-w-[14rem] leading-snug">
+                Connecting — open the Data tab to watch tables fill in as the
+                stream starts.
               </span>
             )}
           </div>
@@ -2581,7 +2785,7 @@ function StudioPageInner({
           </div>
         </div>
 
-        {hasGeneratedData ? (
+        {showDataWorkspace ? (
           <Tabs
             value={activeTab}
             onValueChange={setActiveTab}
@@ -2616,6 +2820,79 @@ function StudioPageInner({
             {/* ─── Data Tab ─── */}
             <TabsContent value="data" className="flex-1 overflow-hidden m-0">
               <div className="flex h-full">
+                {generationProgress.isGenerating &&
+                Object.keys(generatedData).length === 0 ? (
+                  <div className="flex flex-1 flex-col items-center justify-center gap-4 px-6 py-10 text-center min-h-[240px] bg-gradient-to-b from-emerald-500/[0.06] to-background">
+                    <div className="relative">
+                      <div className="h-16 w-16 rounded-2xl border-2 border-emerald-500/30 border-t-emerald-600 animate-spin" />
+                      <Database className="h-7 w-7 text-emerald-600 absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2" />
+                    </div>
+                    <div className="space-y-1 max-w-md">
+                      <p className="text-sm font-semibold text-foreground">
+                        {generatedSchema.length > 0
+                          ? "Building your database"
+                          : "Connecting to the generator"}
+                      </p>
+                      <p className="text-xs text-muted-foreground leading-relaxed">
+                        {generatedSchema.length > 0 ? (
+                          <>
+                            Rows are being streamed from the AI into your
+                            project. The table list will fill in as each table
+                            completes. Large datasets can take several minutes —
+                            progress also appears in the card above and in chat.
+                          </>
+                        ) : (
+                          <>
+                            Opening the secure stream and loading your schema.
+                            This step can take a few seconds after the assistant
+                            finishes planning. Status updates appear in the card
+                            above and in the Data Generator message in chat.
+                          </>
+                        )}
+                      </p>
+                    </div>
+                    {generationProgress.targetRows > 0 && (
+                      <p className="text-[10px] text-muted-foreground tabular-nums">
+                        Target ≈{" "}
+                        {generationProgress.targetRows.toLocaleString()} rows
+                        planned
+                      </p>
+                    )}
+                    {generationProgress.statusMessages.length > 0 && (
+                      <p
+                        className="max-w-md rounded-lg border bg-muted/40 px-3 py-2 text-left text-[10px] text-muted-foreground leading-snug"
+                        aria-live="polite"
+                      >
+                        <span className="font-medium text-foreground/80">
+                          Latest:{" "}
+                        </span>
+                        {
+                          generationProgress.statusMessages[
+                            generationProgress.statusMessages.length - 1
+                          ]
+                        }
+                      </p>
+                    )}
+                    {generatedSchema.length > 0 ? (
+                      <div className="w-full max-w-md rounded-xl border bg-card/80 px-3 py-2 text-left">
+                        <p className="text-[10px] font-medium text-muted-foreground mb-1.5">
+                          Planned tables
+                        </p>
+                        <ul className="flex flex-wrap gap-1 justify-center">
+                          {generatedSchema.map((t) => (
+                            <li
+                              key={t.name}
+                              className="text-[10px] px-2 py-0.5 rounded-full bg-muted font-mono text-foreground/90"
+                            >
+                              {t.name}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : (
+                <>
                 {/* Table selector sidebar */}
                 <div className="w-44 border-r bg-muted/25 flex flex-col shrink-0">
                   <div className="px-2.5 py-2 border-b flex items-center justify-between gap-1">
@@ -3034,6 +3311,8 @@ function StudioPageInner({
                     </div>
                   )}
                 </div>
+                </>
+                )}
               </div>
             </TabsContent>
 
@@ -3903,6 +4182,23 @@ function StudioPageInner({
               </div>
             </TabsContent>
           </Tabs>
+        ) : loading && !hasGeneratedData ? (
+          <div className="flex-1 flex flex-col items-center justify-center gap-3 px-6 py-10 text-center min-h-[200px]">
+            <div className="relative">
+              <div className="h-14 w-14 rounded-2xl border-2 border-amber-500/25 border-t-amber-600 animate-spin" />
+              <Brain className="h-6 w-6 text-amber-600 absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2" />
+            </div>
+            <div className="space-y-1 max-w-sm">
+              <p className="text-sm font-semibold text-foreground">
+                Working in chat
+              </p>
+              <p className="text-xs text-muted-foreground leading-relaxed">
+                The assistant is drafting a reply on the left. If you asked for a
+                synthetic database, you&apos;ll see this panel switch to tables
+                and data when the design is ready.
+              </p>
+            </div>
+          </div>
         ) : (
           /* Empty state */
           <div className="flex-1 flex items-center justify-center">
