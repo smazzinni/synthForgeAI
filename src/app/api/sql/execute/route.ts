@@ -1,21 +1,39 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import { executeSqlOnExternalConnection } from '@/lib/db-connections/executor'
 
 // ─── SQL Execution API ───
-// Executes SQL against the Supabase database and returns results
+// Executes SQL against either:
+//   (a) the app's synthetic database record stored in Supabase, OR
+//   (b) a live external Postgres/MySQL connection the user has saved, OR
+//   (c) client-side in-memory data (when no DB id or connection is supplied)
+//
+// For mutations (INSERT/UPDATE/DELETE/CREATE/ALTER/DROP/TRUNCATE) the route
+// applies the change to the underlying store and returns the refreshed
+// `data_json` + `schema_json` so the client can update its local state.
 
-const ALLOWED_STATEMENTS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'WITH']
+const ALLOWED_STATEMENTS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'WITH', 'TRUNCATE']
 const DANGEROUS_PATTERNS = [
   /;\s*DROP\s+DATABASE/i,
   /;\s*DROP\s+SCHEMA/i,
-  /TRUNCATE\s+TABLE/i,
-  /DELETE\s+FROM\s+\w+\s*;/i, // DELETE without WHERE
 ]
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { sql, databaseId, data: clientData } = body as { sql: string; databaseId?: string; data?: Record<string, unknown[]> }
+    const {
+      sql,
+      databaseId,
+      data: clientData,
+      connectionId,
+      skipDangerousCheck = false,
+    } = body as {
+      sql: string
+      databaseId?: string
+      data?: Record<string, unknown[]>
+      connectionId?: string
+      skipDangerousCheck?: boolean
+    }
 
     if (!sql || typeof sql !== 'string') {
       return NextResponse.json({ error: 'SQL query is required' }, { status: 400 })
@@ -26,28 +44,38 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'SQL query cannot be empty' }, { status: 400 })
     }
 
-    if (trimmedSql.length > 10000) {
-      return NextResponse.json({ error: 'SQL query too long (max 10,000 characters)' }, { status: 400 })
+    if (trimmedSql.length > 100000) {
+      return NextResponse.json({ error: 'SQL query too long (max 100,000 characters)' }, { status: 400 })
     }
 
     // Basic validation: check for allowed statement types
     const firstWord = trimmedSql.split(/\s+/)[0]?.toUpperCase() || ''
-    const isWithCTE = firstWord === 'WITH'
-    if (!ALLOWED_STATEMENTS.includes(firstWord) && !isWithCTE) {
+    if (!ALLOWED_STATEMENTS.includes(firstWord)) {
       return NextResponse.json({ error: `Statement type "${firstWord}" is not allowed` }, { status: 400 })
     }
 
-    // Check for dangerous patterns
-    for (const pattern of DANGEROUS_PATTERNS) {
-      if (pattern.test(trimmedSql)) {
-        return NextResponse.json({
-          error: 'This query contains a potentially destructive operation. Please confirm before executing.',
-          requiresConfirmation: true,
-          sql: trimmedSql,
-        }, { status: 200 })
+    // Check for catastrophic dangerous patterns (unless caller explicitly skips)
+    if (!skipDangerousCheck) {
+      for (const pattern of DANGEROUS_PATTERNS) {
+        if (pattern.test(trimmedSql)) {
+          return NextResponse.json({
+            error: 'This query contains a potentially destructive operation. Please confirm before executing.',
+            requiresConfirmation: true,
+            sql: trimmedSql,
+          }, { status: 200 })
+        }
       }
     }
 
+    // ─── External DB path ───
+    // If a connectionId is supplied, execute the SQL live against the
+    // user-supplied external Postgres/MySQL database.
+    if (connectionId) {
+      const result = await executeSqlOnExternalConnection(connectionId, trimmedSql)
+      return NextResponse.json(result, { status: result.error ? 200 : 200 })
+    }
+
+    // ─── Synthetic DB path (existing behavior, enhanced) ───
     const admin = getSupabaseAdmin()
     if (!admin) {
       return NextResponse.json({ error: 'Database service not configured' }, { status: 503 })
@@ -55,90 +83,186 @@ export async function POST(request: NextRequest) {
 
     const startTime = Date.now()
 
-    // Try using RPC for raw SQL execution, fall back to data_json based approach
-    try {
-      // Use Supabase's rpc() or from() based approach
-      // Since we can't execute raw SQL directly, we'll work with the stored data
+    let dataJson: Record<string, unknown[]> = {}
+    let schemaJson: Array<{ name: string; columns: Array<{ name: string; type: string }> }> = []
+    let liveDatabaseId: string | undefined = databaseId
 
-      let dataJson: Record<string, unknown[]> = {}
+    if (databaseId) {
+      const { data: db, error: dbError } = await admin
+        .from('synthetic_databases')
+        .select('data_json, schema_json')
+        .eq('id', databaseId)
+        .single()
 
-      if (databaseId) {
-        // Fetch the database data from Supabase
-        const { data: db, error: dbError } = await admin
-          .from('synthetic_databases')
-          .select('data_json, schema_json')
-          .eq('id', databaseId)
-          .single()
-
-        if (dbError || !db) {
-          return NextResponse.json({ error: 'Database not found' }, { status: 404 })
-        }
-
-        dataJson = db.data_json as Record<string, unknown[]> || {}
-      } else if (clientData && Object.keys(clientData).length > 0) {
-        // Use client-side data when no databaseId is available
-        dataJson = clientData
-      } else {
-        return NextResponse.json({
-          error: 'No database selected. Please generate some data first before executing SQL.',
-        }, { status: 400 })
+      if (dbError || !db) {
+        return NextResponse.json({ error: 'Database not found' }, { status: 404 })
       }
 
-      const result = executeSQLAgainstData(trimmedSql, dataJson)
-      const executionTime = Date.now() - startTime
-
+      dataJson = (db.data_json as Record<string, unknown[]>) || {}
+      schemaJson = (db.schema_json as Array<{ name: string; columns: Array<{ name: string; type: string }> }>) || []
+    } else if (clientData && Object.keys(clientData).length > 0) {
+      dataJson = clientData
+    } else {
       return NextResponse.json({
-        rows: result.rows,
-        columns: result.columns,
-        rowCount: result.rows.length,
-        executionTime,
-        sql: trimmedSql,
-      })
-    } catch (execError) {
-      const executionTime = Date.now() - startTime
-      return NextResponse.json({
-        error: execError instanceof Error ? execError.message : 'SQL execution failed',
-        executionTime,
-        sql: trimmedSql,
-      }, { status: 200 })
+        error: 'No database selected. Please generate some data first before executing SQL.',
+      }, { status: 400 })
     }
+
+    // Execute the SQL against the in-memory data
+    const result = executeSQLAgainstData(trimmedSql, dataJson, schemaJson)
+    const executionTime = Date.now() - startTime
+
+    // If the statement mutated data, persist the updated data_json back to
+    // Supabase so subsequent reads see the new state. We also return the
+    // refreshed data so the client can update its local copy.
+    if (result.mutated && liveDatabaseId) {
+      try {
+        const updatePayload: Record<string, unknown> = {
+          data_json: result.dataAfter,
+          row_count: Object.values(result.dataAfter).reduce((sum, rows) => sum + (Array.isArray(rows) ? rows.length : 0), 0),
+        }
+        if (result.schemaAfter) {
+          updatePayload.schema_json = result.schemaAfter
+        }
+        await admin
+          .from('synthetic_databases')
+          .update(updatePayload)
+          .eq('id', liveDatabaseId)
+      } catch (err) {
+        console.warn('[SQL Execute API] Failed to persist mutation:', err)
+      }
+    }
+
+    return NextResponse.json({
+      rows: result.rows,
+      columns: result.columns,
+      rowCount: result.rows.length,
+      affectedRows: result.affectedRows,
+      executionTime,
+      sql: trimmedSql,
+      refreshedData: result.mutated ? result.dataAfter : undefined,
+      refreshedSchema: result.mutated ? (result.schemaAfter || schemaJson) : undefined,
+    })
   } catch (err) {
     console.error('[SQL Execute API] Error:', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
 
-/**
- * Execute simplified SQL against in-memory data.
- * Supports: SELECT * FROM table, SELECT col1, col2 FROM table, WHERE clauses, LIMIT, ORDER BY
- */
+// ─── In-memory SQL execution (synthetic data mode) ───
+
+interface SqlExecResult {
+  rows: Record<string, unknown>[]
+  columns: string[]
+  affectedRows: number
+  mutated: boolean
+  dataAfter: Record<string, unknown[]>
+  schemaAfter?: Array<{ name: string; columns: Array<{ name: string; type: string }> }>
+}
+
 function executeSQLAgainstData(
   sql: string,
-  data: Record<string, unknown[]>
-): { rows: Record<string, unknown>[]; columns: string[] } {
+  data: Record<string, unknown[]>,
+  schema: Array<{ name: string; columns: Array<{ name: string; type: string }> }>,
+): SqlExecResult {
   const normalized = sql.trim().toUpperCase()
+  const dataCopy: Record<string, unknown[]> = JSON.parse(JSON.stringify(data))
 
-  // Parse SELECT statements
+  // SELECT
   if (normalized.startsWith('SELECT') || normalized.startsWith('WITH')) {
-    return executeSelect(sql, data)
+    const result = executeSelect(sql, dataCopy)
+    return {
+      rows: result.rows,
+      columns: result.columns,
+      affectedRows: 0,
+      mutated: false,
+      dataAfter: dataCopy,
+      schemaAfter: schema,
+    }
   }
 
-  // For INSERT/UPDATE/DELETE, we return a message
+  // INSERT
+  if (normalized.startsWith('INSERT')) {
+    const result = executeInsert(sql, dataCopy)
+    return {
+      rows: [{ message: `Inserted ${result.affectedRows} row(s)`, type: 'info' }],
+      columns: ['message', 'type'],
+      affectedRows: result.affectedRows,
+      mutated: result.affectedRows > 0,
+      dataAfter: dataCopy,
+      schemaAfter: schema,
+    }
+  }
+
+  // UPDATE
+  if (normalized.startsWith('UPDATE')) {
+    const result = executeUpdate(sql, dataCopy)
+    return {
+      rows: [{ message: `Updated ${result.affectedRows} row(s)`, type: 'info' }],
+      columns: ['message', 'type'],
+      affectedRows: result.affectedRows,
+      mutated: true,
+      dataAfter: dataCopy,
+      schemaAfter: schema,
+    }
+  }
+
+  // DELETE
+  if (normalized.startsWith('DELETE')) {
+    const result = executeDelete(sql, dataCopy)
+    return {
+      rows: [{ message: `Deleted ${result.affectedRows} row(s)`, type: 'info' }],
+      columns: ['message', 'type'],
+      affectedRows: result.affectedRows,
+      mutated: true,
+      dataAfter: dataCopy,
+      schemaAfter: schema,
+    }
+  }
+
+  // CREATE TABLE
+  if (normalized.startsWith('CREATE')) {
+    const result = executeCreate(sql, dataCopy, schema)
+    return {
+      rows: [{ message: result.message, type: 'info' }],
+      columns: ['message', 'type'],
+      affectedRows: 0,
+      mutated: result.mutated,
+      dataAfter: dataCopy,
+      schemaAfter: result.schema,
+    }
+  }
+
+  // ALTER / DROP / TRUNCATE
+  if (normalized.startsWith('ALTER') || normalized.startsWith('DROP') || normalized.startsWith('TRUNCATE')) {
+    const result = executeAlterDropTruncate(sql, dataCopy, schema)
+    return {
+      rows: [{ message: result.message, type: 'info' }],
+      columns: ['message', 'type'],
+      affectedRows: result.affectedRows,
+      mutated: result.mutated,
+      dataAfter: dataCopy,
+      schemaAfter: result.schema,
+    }
+  }
+
   return {
-    rows: [{ message: 'DML operations are simulated. Use the AI chat to modify data.', type: 'info' }],
+    rows: [{ message: 'Unsupported statement', type: 'error' }],
     columns: ['message', 'type'],
+    affectedRows: 0,
+    mutated: false,
+    dataAfter: dataCopy,
+    schemaAfter: schema,
   }
 }
 
 function executeSelect(
   sql: string,
-  data: Record<string, unknown[]>
+  data: Record<string, unknown[]>,
 ): { rows: Record<string, unknown>[]; columns: string[] } {
-  // Simple SQL parser for SELECT statements
   const selectMatch = sql.match(/SELECT\s+(.*?)\s+FROM\s+(\w+)(?:\s+WHERE\s+(.*?))?(?:\s+ORDER\s+BY\s+(.*?))?(?:\s+LIMIT\s+(\d+))?$/is)
 
   if (!selectMatch) {
-    // Try SELECT * FROM table
     const simpleMatch = sql.match(/SELECT\s+\*\s+FROM\s+(\w+)/i)
     if (simpleMatch) {
       const tableName = simpleMatch[1]
@@ -148,7 +272,7 @@ function executeSelect(
       }
       const rows = tableData as Record<string, unknown>[]
       const columns = rows.length > 0 ? Object.keys(rows[0]) : []
-      return { rows: rows.slice(0, 100), columns }
+      return { rows: rows.slice(0, 500), columns }
     }
     return { rows: [{ error: 'Could not parse SQL query. Try: SELECT * FROM table_name' }], columns: ['error'] }
   }
@@ -166,17 +290,9 @@ function executeSelect(
 
   let rows = [...(tableData as Record<string, unknown>[])]
 
-  // Apply WHERE
-  if (whereClause) {
-    rows = applyWhere(rows, whereClause)
-  }
+  if (whereClause) rows = applyWhere(rows, whereClause)
+  if (orderByClause) rows = applyOrderBy(rows, orderByClause)
 
-  // Apply ORDER BY
-  if (orderByClause) {
-    rows = applyOrderBy(rows, orderByClause)
-  }
-
-  // Apply column selection
   let columns: string[]
   if (selectCols === '*') {
     columns = rows.length > 0 ? Object.keys(rows[0]) : []
@@ -184,64 +300,54 @@ function executeSelect(
     columns = selectCols.split(',').map(c => c.trim())
     rows = rows.map(row => {
       const filtered: Record<string, unknown> = {}
-      for (const col of columns) {
-        filtered[col] = row[col]
-      }
+      for (const col of columns) filtered[col] = row[col]
       return filtered
     })
   }
 
-  // Apply LIMIT
   if (limitClause) {
     const limit = parseInt(limitClause, 10)
     rows = rows.slice(0, limit)
   } else {
-    rows = rows.slice(0, 100) // Default limit
+    rows = rows.slice(0, 500)
   }
 
   return { rows, columns }
 }
 
 function applyWhere(rows: Record<string, unknown>[], where: string): Record<string, unknown>[] {
-  // Simple WHERE parser: col = 'value', col > number, col LIKE '%pattern%'
-  const conditions = where.split(/\s+AND\s+/i)
+  // Strip trailing clauses the main regex didn't capture (ORDER BY / LIMIT)
+  const cleaned = where.replace(/\s+ORDER\s+BY\s+.*$/is, '').replace(/\s+LIMIT\s+\d+.*$/is, '').trim()
+  const conditions = cleaned.split(/\s+AND\s+/i)
 
   return rows.filter(row => {
     return conditions.every(cond => {
       const trimmed = cond.trim()
 
-      // col = 'value' or col = number
       const eqMatch = trimmed.match(/(\w+)\s*=\s*'?([^']*)'?/)
       if (eqMatch) {
         const col = eqMatch[1]
         const val = eqMatch[2]
         return String(row[col]) === val
       }
-
-      // col > number
       const gtMatch = trimmed.match(/(\w+)\s*>\s*(\d+)/)
       if (gtMatch) {
         const col = gtMatch[1]
         const val = parseFloat(gtMatch[2])
         return typeof row[col] === 'number' && (row[col] as number) > val
       }
-
-      // col < number
       const ltMatch = trimmed.match(/(\w+)\s*<\s*(\d+)/)
       if (ltMatch) {
         const col = ltMatch[1]
         const val = parseFloat(ltMatch[2])
         return typeof row[col] === 'number' && (row[col] as number) < val
       }
-
-      // col LIKE '%pattern%'
       const likeMatch = trimmed.match(/(\w+)\s+LIKE\s+'%([^']+)%'/i)
       if (likeMatch) {
         const col = likeMatch[1]
         const pattern = likeMatch[2]
         return String(row[col] || '').toLowerCase().includes(pattern.toLowerCase())
       }
-
       return true
     })
   })
@@ -258,9 +364,270 @@ function applyOrderBy(rows: Record<string, unknown>[], orderBy: string): Record<
     if (aVal === bVal) return 0
     if (aVal == null) return 1
     if (bVal == null) return -1
-    if (typeof aVal === 'number' && typeof bVal === 'number') {
-      return (aVal - bVal) * dir
-    }
+    if (typeof aVal === 'number' && typeof bVal === 'number') return (aVal - bVal) * dir
     return String(aVal).localeCompare(String(bVal)) * dir
   })
+}
+
+// ─── INSERT ───
+// Supports: INSERT INTO table (col1, col2, ...) VALUES (v1, v2, ...), (v3, v4, ...)
+function executeInsert(
+  sql: string,
+  data: Record<string, unknown[]>,
+): { affectedRows: number } {
+  const match = sql.match(/INSERT\s+INTO\s+(\w+)\s*(?:\(([^)]+)\))?\s*VALUES\s*([\s\S]+);?$/i)
+  if (!match) return { affectedRows: 0 }
+
+  const tableName = match[1]
+  const colList = match[2]?.split(',').map(c => c.trim())
+  const valuesSection = match[3].trim().replace(/;$/, '')
+
+  // Split into individual tuples — naive but works for typical test data
+  const tuples: string[] = []
+  let depth = 0
+  let current = ''
+  let inStr = false
+  for (const ch of valuesSection) {
+    if (ch === "'" && (current.length === 0 || current[current.length - 1] !== '\\')) inStr = !inStr
+    if (!inStr) {
+      if (ch === '(') { depth++; if (depth === 1) { current = ''; continue } }
+      if (ch === ')') { depth--; if (depth === 0) { tuples.push(current); current = ''; continue } }
+    }
+    if (depth >= 1) current += ch
+  }
+
+  if (!data[tableName]) data[tableName] = []
+  const tableRows = data[tableName] as Record<string, unknown>[]
+
+  let inserted = 0
+  for (const tuple of tuples) {
+    const values = parseValueList(tuple)
+    const row: Record<string, unknown> = {}
+    if (colList && colList.length > 0) {
+      colList.forEach((col, i) => {
+        row[col] = values[i] ?? null
+      })
+    } else if (tableRows.length > 0) {
+      // Use the columns from the first existing row
+      const existingCols = Object.keys(tableRows[0])
+      existingCols.forEach((col, i) => {
+        row[col] = values[i] ?? null
+      })
+    } else {
+      values.forEach((v, i) => { row[`col_${i + 1}`] = v })
+    }
+    if (!row.id) row.id = crypto.randomUUID()
+    tableRows.push(row)
+    inserted++
+  }
+
+  return { affectedRows: inserted }
+}
+
+function parseValueList(tuple: string): unknown[] {
+  const values: unknown[] = []
+  let i = 0
+  while (i < tuple.length) {
+    // Skip whitespace & commas
+    while (i < tuple.length && (tuple[i] === ' ' || tuple[i] === ',' || tuple[i] === '\t' || tuple[i] === '\n')) i++
+    if (i >= tuple.length) break
+
+    if (tuple[i] === "'") {
+      // String literal
+      i++
+      let str = ''
+      while (i < tuple.length) {
+        if (tuple[i] === "'" && tuple[i + 1] === "'") { str += "'"; i += 2; continue }
+        if (tuple[i] === "'") { i++; break }
+        str += tuple[i]; i++
+      }
+      values.push(str)
+    } else if (tuple[i] === '"') {
+      i++
+      let str = ''
+      while (i < tuple.length && tuple[i] !== '"') { str += tuple[i]; i++ }
+      i++
+      values.push(str)
+    } else {
+      // Number, boolean, or NULL
+      let token = ''
+      while (i < tuple.length && tuple[i] !== ',' && tuple[i] !== ' ' && tuple[i] !== '\t' && tuple[i] !== '\n') {
+        token += tuple[i]; i++
+      }
+      if (token.toUpperCase() === 'NULL') values.push(null)
+      else if (token.toUpperCase() === 'TRUE') values.push(true)
+      else if (token.toUpperCase() === 'FALSE') values.push(false)
+      else {
+        const num = Number(token)
+        values.push(Number.isNaN(num) ? token : num)
+      }
+    }
+  }
+  return values
+}
+
+// ─── UPDATE ───
+// Supports: UPDATE table SET col1 = v1, col2 = v2 WHERE ...
+function executeUpdate(
+  sql: string,
+  data: Record<string, unknown[]>,
+): { affectedRows: number } {
+  const match = sql.match(/UPDATE\s+(\w+)\s+SET\s+(.*?)(?:\s+WHERE\s+(.*))?$/is)
+  if (!match) return { affectedRows: 0 }
+
+  const tableName = match[1]
+  const setClause = match[2].trim()
+  const whereClause = match[3]?.trim() || ''
+
+  const tableData = data[tableName] as Record<string, unknown>[] | undefined
+  if (!tableData) return { affectedRows: 0 }
+
+  // Parse SET assignments
+  const assignments: Array<{ col: string; value: unknown }> = []
+  for (const part of setClause.split(',')) {
+    const m = part.trim().match(/(\w+)\s*=\s*(.*)$/s)
+    if (!m) continue
+    const col = m[1]
+    const rawVal = m[2].trim().replace(/;$/, '')
+    assignments.push({ col, value: parseScalar(rawVal) })
+  }
+
+  let updated = 0
+  const candidateRows = whereClause ? applyWhere([...tableData], whereClause) : tableData
+  const candidateIds = new Set(candidateRows.map(r => r.id))
+
+  for (const row of tableData) {
+    if (whereClause && !candidateIds.has(row.id)) continue
+    for (const a of assignments) row[a.col] = a.value
+    updated++
+  }
+
+  return { affectedRows: updated }
+}
+
+function parseScalar(raw: string): unknown {
+  const v = raw.trim()
+  if (v.toUpperCase() === 'NULL') return null
+  if (v.toUpperCase() === 'TRUE') return true
+  if (v.toUpperCase() === 'FALSE') return false
+  if (v.startsWith("'") && v.endsWith("'")) return v.slice(1, -1).replace(/''/g, "'")
+  if (v.startsWith('"') && v.endsWith('"')) return v.slice(1, -1)
+  const num = Number(v)
+  if (!Number.isNaN(num) && v !== '') return num
+  return v
+}
+
+// ─── DELETE ───
+// Supports: DELETE FROM table WHERE ...
+function executeDelete(
+  sql: string,
+  data: Record<string, unknown[]>,
+): { affectedRows: number } {
+  const match = sql.match(/DELETE\s+FROM\s+(\w+)\s*(?:WHERE\s+(.*))?$/is)
+  if (!match) return { affectedRows: 0 }
+
+  const tableName = match[1]
+  const whereClause = match[2]?.trim() || ''
+
+  const tableData = data[tableName] as Record<string, unknown>[] | undefined
+  if (!tableData) return { affectedRows: 0 }
+
+  if (!whereClause) {
+    const count = tableData.length
+    data[tableName] = []
+    return { affectedRows: count }
+  }
+
+  const toKeep = applyWhere([...tableData], whereClause)
+  const toDeleteIds = new Set(tableData.filter(r => !toKeep.includes(r)).map(r => r.id))
+  data[tableName] = tableData.filter(r => !toDeleteIds.has(r.id))
+  return { affectedRows: tableData.length - data[tableName].length }
+}
+
+// ─── CREATE TABLE ───
+function executeCreate(
+  sql: string,
+  data: Record<string, unknown[]>,
+  schema: Array<{ name: string; columns: Array<{ name: string; type: string }> }>,
+): { message: string; mutated: boolean; schema: Array<{ name: string; columns: Array<{ name: string; type: string }> }> } {
+  const match = sql.match(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\(([\s\S]+)\)\s*;?$/i)
+  if (!match) return { message: 'Could not parse CREATE TABLE', mutated: false, schema }
+
+  const tableName = match[1]
+  const colDefs = match[2].split(',').map(c => c.trim()).filter(Boolean)
+
+  if (data[tableName]) {
+    return { message: `Table "${tableName}" already exists`, mutated: false, schema }
+  }
+
+  const columns = colDefs.map(def => {
+    const parts = def.split(/\s+/)
+    return { name: parts[0].replace(/"/g, ''), type: parts[1] || 'varchar(255)' }
+  })
+
+  data[tableName] = []
+  const newSchema = [...schema, { name: tableName, columns }]
+  return { message: `Table "${tableName}" created with ${columns.length} column(s)`, mutated: true, schema: newSchema }
+}
+
+// ─── ALTER / DROP / TRUNCATE ───
+function executeAlterDropTruncate(
+  sql: string,
+  data: Record<string, unknown[]>,
+  schema: Array<{ name: string; columns: Array<{ name: string; type: string }> }>,
+): { message: string; affectedRows: number; mutated: boolean; schema: Array<{ name: string; columns: Array<{ name: string; type: string }> }> } {
+  const normalized = sql.trim().toUpperCase()
+
+  // DROP TABLE
+  const dropMatch = sql.match(/DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(\w+)/i)
+  if (dropMatch) {
+    const tableName = dropMatch[1]
+    if (!data[tableName]) return { message: `Table "${tableName}" not found`, affectedRows: 0, mutated: false, schema }
+    const rowCount = (data[tableName] as unknown[]).length
+    delete data[tableName]
+    const newSchema = schema.filter(t => t.name !== tableName)
+    return { message: `Table "${tableName}" dropped (${rowCount} rows)`, affectedRows: rowCount, mutated: true, schema: newSchema }
+  }
+
+  // TRUNCATE TABLE
+  const truncMatch = sql.match(/TRUNCATE\s+TABLE\s+(\w+)/i)
+  if (truncMatch) {
+    const tableName = truncMatch[1]
+    if (!data[tableName]) return { message: `Table "${tableName}" not found`, affectedRows: 0, mutated: false, schema }
+    const rowCount = (data[tableName] as unknown[]).length
+    data[tableName] = []
+    return { message: `Table "${tableName}" truncated (${rowCount} rows removed)`, affectedRows: rowCount, mutated: true, schema }
+  }
+
+  // ALTER TABLE ... ADD COLUMN
+  const addColMatch = sql.match(/ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)\s+(\w+(?:\([^)]+\))?)/i)
+  if (addColMatch) {
+    const [, tableName, colName, colType] = addColMatch
+    if (!data[tableName]) return { message: `Table "${tableName}" not found`, affectedRows: 0, mutated: false, schema }
+    const newSchema = schema.map(t =>
+      t.name === tableName
+        ? { ...t, columns: [...t.columns, { name: colName, type: colType }] }
+        : t
+    )
+    return { message: `Column "${colName}" added to "${tableName}"`, affectedRows: 0, mutated: true, schema: newSchema }
+  }
+
+  // ALTER TABLE ... DROP COLUMN
+  const dropColMatch = sql.match(/ALTER\s+TABLE\s+(\w+)\s+DROP\s+COLUMN\s+(\w+)/i)
+  if (dropColMatch) {
+    const [, tableName, colName] = dropColMatch
+    if (!data[tableName]) return { message: `Table "${tableName}" not found`, affectedRows: 0, mutated: false, schema }
+    data[tableName] = (data[tableName] as Record<string, unknown>[]).map(r => {
+      const { [colName]: _drop, ...rest } = r
+      return rest
+    })
+    const newSchema = schema.map(t =>
+      t.name === tableName
+        ? { ...t, columns: t.columns.filter(c => c.name !== colName) }
+        : t
+    )
+    return { message: `Column "${colName}" dropped from "${tableName}"`, affectedRows: 0, mutated: true, schema: newSchema }
+  }
+
+  return { message: 'ALTER/DROP/TRUNCATE: statement not recognized', affectedRows: 0, mutated: false, schema }
 }

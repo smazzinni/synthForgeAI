@@ -152,6 +152,9 @@ export async function POST(request: NextRequest) {
       currentSchema,
       currentData,
       conversationId,
+      connectionId,
+      connectionName,
+      connectionDialect,
     } = body as {
       message: string
       databaseId?: string
@@ -160,6 +163,13 @@ export async function POST(request: NextRequest) {
       currentSchema?: Array<{ name: string; columns: Array<{ name: string; type: string }> }>
       currentData?: Record<string, unknown[]>
       conversationId?: string
+      // ─── External DB connection context ───
+      // When set, the AI knows it is talking to a LIVE external DB and
+      // should respond with SQL inside ```sql ... ``` code blocks instead
+      // of using the synthetic BEGIN_GENERATION pipeline.
+      connectionId?: string
+      connectionName?: string
+      connectionDialect?: 'postgres' | 'mysql'
     }
 
     if (!message || typeof message !== 'string') {
@@ -179,8 +189,51 @@ export async function POST(request: NextRequest) {
     // Build system prompt with context
     let systemPrompt = BASE_SYSTEM_PROMPT
 
-    // Add context about existing database
-    if (databaseId) {
+    // ─── External live DB mode ───
+    // When a connectionId is supplied, the AI operates against a real
+    // external database (Postgres or MySQL). It must respond with SQL
+    // inside ```sql ... ``` code blocks; the frontend intercepts those
+    // blocks and offers to execute them live against the DB (with a
+    // confirmation dialog for destructive statements).
+    if (connectionId) {
+      systemPrompt += `\n\n## LIVE EXTERNAL DATABASE MODE
+
+You are connected to a LIVE external database:
+- Connection name: ${connectionName || '(unnamed)'}
+- Dialect: ${connectionDialect || 'postgres'}
+
+### CRITICAL RULES
+1. When the user asks you to perform ANY data operation (insert, update, delete, drop, create, alter, truncate, select, etc.) you MUST respond with a SQL code block using exactly this format:
+   \`\`\`sql
+   -- brief explanation of what this does
+   <the SQL statement(s)>
+   \`\`\`
+2. Only emit ONE \`\`\`sql block per response unless the user explicitly asks for multiple statements. Multiple statements inside a single block are allowed (separated by semicolons).
+3. Always use the correct dialect-specific syntax (e.g. \`SERIAL\`/\`RETURNING\` for Postgres, \`AUTO_INCREMENT\` for MySQL).
+4. Before destructive operations (DROP, TRUNCATE, DELETE without WHERE, mass UPDATE), include a comment like \`-- DESTRUCTIVE: this will permanently delete all rows in <table>\` on the line above the statement. The frontend will still ask the user for confirmation, but the warning helps them decide.
+5. Do NOT emit BEGIN_GENERATION signals or option-block JSON in this mode — the user is working with real data, not synthetic generation.
+6. If the user asks an open-ended question ("show me what's in the users table", "how many orders were placed yesterday"), respond with a SELECT query in a \`\`\`sql block. The frontend will execute it and show the rows.
+7. If you need to inspect the schema to answer a question, ask the user to run \`SELECT * FROM information_schema.columns WHERE table_name='X'\` — do not guess.
+
+### CURRENT EXTERNAL SCHEMA`
+      if (currentSchema && currentSchema.length > 0) {
+        systemPrompt += `\nTables:`
+        for (const table of currentSchema) {
+          systemPrompt += `\n- ${table.name} (${table.columns.map(c => `${c.name} ${c.type}`).join(', ')})`
+        }
+      } else {
+        systemPrompt += `\n(No schema introspection available. Ask the user to describe the table if needed.)`
+      }
+      if (currentData && Object.keys(currentData).length > 0) {
+        systemPrompt += `\n\n### SAMPLE ROWS (first row per table)`
+        for (const [tableName, rows] of Object.entries(currentData)) {
+          if (Array.isArray(rows) && rows.length > 0) {
+            systemPrompt += `\n- ${tableName}: ${JSON.stringify(rows[0])}`
+          }
+        }
+      }
+      // Skip the synthetic-DB context block below
+    } else if (databaseId) {
       systemPrompt += `\n\n## CURRENT DATABASE CONTEXT`
       systemPrompt += `\nYou are currently editing database "${databaseName || databaseId}" (ID: ${databaseId}).`
       if (conversationId) {

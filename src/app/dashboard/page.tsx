@@ -30,6 +30,7 @@ import {
   HardDrive,
   Server,
   ArrowUpFromLine,
+  PlugZap,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { apiDelete } from '@/lib/api-client'
@@ -271,6 +272,37 @@ export default function DashboardPage() {
                 {suggestion}
               </button>
             ))}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Connect to a Live DB feature */}
+      <Card className="mb-6 border-2 border-dashed border-sky-300 dark:border-sky-800 bg-gradient-to-br from-sky-50/50 to-indigo-50/50 dark:from-sky-950/20 dark:to-indigo-950/20">
+        <CardContent className="pt-6">
+          <div className="flex items-start gap-4">
+            <div className="h-9 w-9 rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 flex items-center justify-center shrink-0">
+              <PlugZap className="h-4.5 w-4.5 text-white" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <h2 className="font-semibold text-lg">Connect to a Live Database</h2>
+              <p className="text-xs text-muted-foreground mb-3">
+                Add your Postgres or MySQL credentials, then ask the AI chat to perform CRUD operations directly on your live data (edit, delete, drop, rewrite, etc.).
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <Button asChild size="sm" className="bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-700 hover:to-indigo-700 text-white">
+                  <Link href="/dashboard/connections">
+                    <PlugZap className="mr-2 h-4 w-4" />
+                    Manage Connections
+                  </Link>
+                </Button>
+                <Button asChild size="sm" variant="outline">
+                  <Link href="/dashboard/studio">
+                    <MessageSquare className="mr-2 h-4 w-4" />
+                    Open AI Chat
+                  </Link>
+                </Button>
+              </div>
+            </div>
           </div>
         </CardContent>
       </Card>

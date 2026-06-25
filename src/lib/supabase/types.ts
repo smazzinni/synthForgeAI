@@ -181,6 +181,57 @@ export interface Database {
           expires_at?: string | null
         }
       }
+      db_connections: {
+        Row: {
+          id: string
+          user_id: string | null
+          name: string
+          dialect: 'postgres' | 'mysql'
+          host: string
+          port: number
+          username: string
+          password: string
+          database: string
+          schema: string | null
+          ssl: boolean
+          status: 'untested' | 'connected' | 'failed'
+          last_connected_at: string | null
+          error_message: string | null
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          id?: string
+          user_id?: string | null
+          name: string
+          dialect?: 'postgres' | 'mysql'
+          host?: string
+          port?: number
+          username?: string
+          password?: string
+          database?: string
+          schema?: string | null
+          ssl?: boolean
+          status?: 'untested' | 'connected' | 'failed'
+          last_connected_at?: string | null
+          error_message?: string | null
+        }
+        Update: {
+          name?: string
+          dialect?: 'postgres' | 'mysql'
+          host?: string
+          port?: number
+          username?: string
+          password?: string
+          database?: string
+          schema?: string | null
+          ssl?: boolean
+          status?: 'untested' | 'connected' | 'failed'
+          last_connected_at?: string | null
+          error_message?: string | null
+          updated_at?: string
+        }
+      }
     }
     Views: Record<string, never>
     Functions: Record<string, never>

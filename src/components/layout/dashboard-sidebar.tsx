@@ -19,6 +19,7 @@ import {
   LayoutDashboard,
   FlaskConical,
   Database,
+  PlugZap,
   Settings,
   Moon,
   Sun,
@@ -30,6 +31,7 @@ const sidebarLinks = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/dashboard/studio', label: 'AI Studio', icon: FlaskConical },
   { href: '/dashboard/databases', label: 'My Databases', icon: Database },
+  { href: '/dashboard/connections', label: 'DB Connections', icon: PlugZap },
   { href: '/dashboard/settings', label: 'Settings', icon: Settings },
 ]
 

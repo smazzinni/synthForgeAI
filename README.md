@@ -170,6 +170,8 @@ Key differentiators:
 - **Schema Visualization** — ER diagrams (SVG) with zoom/pan, table tree view with PK/FK badges and favorites
 - **Data Table View** — Sortable, filterable data display per table with copy/export actions and load-more pagination
 - **SQL Workspace** — Write SQL queries against generated data, query history, AI-assisted SQL generation, destructive SQL confirmation dialog
+- **Live DB Connections** — Connect to an external PostgreSQL or MySQL database with credentials (host/port/user/pass/db/ssl). The connection is tested before saving, schema + sample rows are introspected, and the AI chat can then perform CRUD operations (INSERT/UPDATE/DELETE/DROP/CREATE/ALTER) directly on the live DB with destructive-action confirmation
+- **AI Chat CRUD** — When a live DB connection is active, the AI responds with SQL code blocks; clicking "Run on live DB" executes them against the external DB and refreshes the studio with the new state
 - **File Upload** — Drag-and-drop upload for SQL, CSV, JSON, XML files with automatic content extraction
 - **Export System** — Export as JSON, CSV, SQL (INSERT statements), or SQL (full DDL+DML) via client-side generators or API
 

@@ -53,6 +53,7 @@ import {
   CheckCircle2,
   Shield,
   Wand2,
+  PlugZap,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { apiPost, apiPatch, apiDelete, apiGet, invalidateCache } from '@/lib/api-client'
@@ -94,6 +95,12 @@ interface Message {
   timestamp: Date
   isStreaming?: boolean
   tables?: Record<string, unknown[]> | null
+  // ─── External DB SQL block ───
+  // When the AI returns a ```sql block in live-DB mode, the parsed SQL is
+  // stored here so the UI can render an "Execute" button.
+  sqlBlock?: string | null
+  sqlBlockExecuting?: boolean
+  sqlBlockResult?: { ok: boolean; message: string; rowCount?: number; affectedRows?: number; rows?: Record<string, unknown>[]; columns?: string[] } | null
 }
 
 interface SchemaTable {
@@ -108,6 +115,10 @@ interface StudioPageProps {
   initialData?: Record<string, unknown[]>
   initialMessages?: Message[]
   conversationId?: string
+  // ─── External DB connection (live mode) ───
+  initialConnectionId?: string
+  initialConnectionName?: string
+  initialConnectionDialect?: 'postgres' | 'mysql'
 }
 
 // ─── Export helpers (client-side) ───
@@ -255,6 +266,17 @@ function extractSchema(tables: Record<string, unknown[]>): SchemaTable[] {
   return schema
 }
 
+// ─── Extract a ```sql ... ``` code block from AI response content ───
+// Returns the SQL text (without fences) or null if no block was found.
+function extractSqlBlock(content: string): string | null {
+  // Prefer fenced ```sql block
+  const fenced = content.match(/```(?:sql|SQL)?\s*\n([\s\S]*?)\n?```/)
+  if (fenced && fenced[1] && fenced[1].trim()) {
+    return fenced[1].trim()
+  }
+  return null
+}
+
 // ─── Agent icon helper ───
 function AgentIcon({ agentName, size = 'sm' }: { agentName?: string; size?: 'sm' | 'md' }) {
   const agent = getAgentByName(agentName || '')
@@ -353,17 +375,34 @@ function StudioPageInner({
   initialData,
   initialMessages,
   conversationId: initialConversationId,
+  initialConnectionId,
+  initialConnectionName,
+  initialConnectionDialect,
 }: StudioPageProps) {
   const router = useRouter()
   const searchParams = useSearchParams()
 
   // ─── State ───
   const [currentDatabaseId, setCurrentDatabaseId] = useState<string | undefined>(databaseId)
+
+  // ─── External DB connection state ───
+  // When a connection is active, the studio operates in "live mode" — the AI
+  // returns SQL blocks instead of BEGIN_GENERATION signals, and SQL is
+  // executed against the external DB via /api/connections/execute.
+  const [activeConnectionId, setActiveConnectionId] = useState<string | undefined>(initialConnectionId)
+  const [activeConnectionName, setActiveConnectionName] = useState<string | undefined>(initialConnectionName)
+  const [activeConnectionDialect, setActiveConnectionDialect] = useState<'postgres' | 'mysql' | undefined>(initialConnectionDialect)
+  const [connectionLoading, setConnectionLoading] = useState(false)
+
+  const isLiveDbMode = !!activeConnectionId
+
   const [messages, setMessages] = useState<Message[]>(initialMessages && initialMessages.length > 0 ? initialMessages : [
     {
       id: '1',
       role: 'assistant',
-      content: databaseId
+      content: initialConnectionId
+        ? `Connected to live ${initialConnectionDialect || 'DB'} **"${initialConnectionName || ''}"**. Ask me to perform CRUD operations on it — for example:\n\n- "Show me the first 10 rows of users"\n- "Delete all users created before 2020"\n- "Add a status column to the orders table"\n- "Drop the legacy_logs table"\n\nI'll respond with SQL that you can execute against your live DB.`
+        : databaseId
         ? `You're editing database **"${initialName || databaseId}"**. Describe changes or ask me to add more data.`
         : 'Welcome to **SynthForge AI Studio**! I can help you generate synthetic data.\n\nDescribe the database you need, and I\'ll design the schema, generate realistic data, and ensure quality compliance.\n\nFor example: "Generate an e-commerce database with users, orders, and products"',
       agentName: 'Orchestrator',
@@ -438,6 +477,72 @@ function StudioPageInner({
       setInput(q)
     }
   }, [searchParams, initialQuerySent])
+
+  // ─── Load external DB connection when ?connectionId=... is in the URL ───
+  // Fetches the connection record, then introspects schema + sample rows.
+  useEffect(() => {
+    const connId = searchParams.get('connectionId')
+    if (!connId || activeConnectionId === connId) return
+    let cancelled = false
+
+    const loadConnection = async () => {
+      setConnectionLoading(true)
+      try {
+        const result = await apiGet<{
+          connection?: {
+            id: string
+            name: string
+            dialect: 'postgres' | 'mysql'
+            status: string
+            error_message: string | null
+          }
+          schema?: SchemaTable[]
+          data?: Record<string, unknown[]>
+          error?: string
+        }>(`/api/connections?id=${connId}&include=introspect`, { cacheTtl: 0, force: true, timeout: 30000 })
+
+        if (cancelled) return
+
+        if (!result.connection) {
+          toast.error('Connection not found')
+          router.replace('/dashboard/connections')
+          return
+        }
+
+        if (result.connection.status === 'failed') {
+          toast.error(`Connection test failed: ${result.connection.error_message || 'unknown error'}`)
+        }
+
+        setActiveConnectionId(result.connection.id)
+        setActiveConnectionName(result.connection.name)
+        setActiveConnectionDialect(result.connection.dialect)
+
+        if (result.schema && result.schema.length > 0) {
+          setGeneratedSchema(result.schema)
+        }
+        if (result.data && Object.keys(result.data).length > 0) {
+          setGeneratedData(result.data)
+        }
+        setDatabaseName(result.connection.name)
+
+        if (result.error) {
+          toast.warning(`Schema introspection warning: ${result.error}`)
+        } else {
+          toast.success(`Connected to ${result.connection.name}`)
+        }
+      } catch (err) {
+        if (!cancelled) {
+          toast.error(err instanceof Error ? err.message : 'Failed to load connection')
+        }
+      } finally {
+        if (!cancelled) setConnectionLoading(false)
+      }
+    }
+
+    loadConnection()
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams])
 
   // Auto-select first table
   useEffect(() => {
@@ -566,6 +671,12 @@ function StudioPageInner({
           message: userMessage.content,
           ...(currentDatabaseId ? { databaseId: currentDatabaseId, databaseName } : {}),
           ...(conversationId ? { conversationId } : {}),
+          // ─── Live DB mode ───
+          ...(activeConnectionId ? {
+            connectionId: activeConnectionId,
+            connectionName: activeConnectionName,
+            connectionDialect: activeConnectionDialect,
+          } : {}),
           currentSchema: generatedSchema,
           currentData: dataToSend,
           history,
@@ -662,6 +773,37 @@ function StudioPageInner({
           : m
       ))
 
+      // ─── LIVE DB MODE ───
+      // When connected to an external DB, the AI responds with SQL code
+      // blocks instead of BEGIN_GENERATION signals. Extract the SQL block
+      // and attach it to the message so the UI can render an Execute button.
+      if (isLiveDbMode) {
+        const sqlBlock = extractSqlBlock(fullContent)
+        // Strip the fenced block from the displayed text so the user sees
+        // just the explanation + the rendered SQL card (which has its own
+        // Copy / Execute buttons).
+        const displayText = fullContent.replace(/```(?:sql|SQL)?\s*\n[\s\S]*?\n?```/g, '').trim()
+
+        setMessages(prev => prev.map(m =>
+          m.id === assistantId
+            ? {
+              ...m,
+              content: displayText || (sqlBlock ? 'Here\'s the SQL:' : ''),
+              sqlBlock: sqlBlock || null,
+              interactiveOptions: lastInteractiveOptions,
+            }
+            : m
+        ))
+
+        setLoading(false)
+        loadingRef.current = false
+        setReasoningVisible(false)
+        setCurrentReasoning('')
+
+        saveConversation(userMessage.content, displayText || fullContent, lastAgentName)
+        return
+      }
+
       // Check for BEGIN_GENERATION signal first
       const beginGenSignal = parseBeginGeneration(fullContent)
 
@@ -690,6 +832,12 @@ function StudioPageInner({
         loadingRef.current = false
         setReasoningVisible(false)
         setCurrentReasoning('')
+
+        // Persist the user message + assistant acknowledgment to the
+        // conversation (previously this was skipped on the BEGIN_GENERATION
+        // path, which meant generation prompts were lost on refresh).
+        const cleanedDisplay = cleanDisplayText(fullContent).replace(/<think[\s\S]*?<\/think>/gi, '').trim()
+        saveConversation(userMessage.content, cleanedDisplay || 'Starting database generation...', lastAgentName)
 
         // Start streaming generation in the background
         startStreamingGeneration(beginGenSignal, assistantId)
@@ -749,7 +897,7 @@ function StudioPageInner({
       loadingRef.current = false
       setReasoningVisible(false)
     }
-  }, [input, currentDatabaseId, databaseName, conversationId, generatedSchema, generatedData, hasGeneratedData, saveConversation])
+  }, [input, currentDatabaseId, databaseName, conversationId, generatedSchema, generatedData, hasGeneratedData, saveConversation, activeConnectionId, activeConnectionName, activeConnectionDialect, isLiveDbMode])
 
   // Auto-send query from dashboard
   useEffect(() => {
@@ -787,10 +935,13 @@ function StudioPageInner({
           status: 'ready',
         })
       } else {
+        // Create the database WITH data_json in the same POST so we don't
+        // end up with a half-saved record if a follow-up PATCH were to fail.
         const result = await apiPost<{ database?: { id: string } }>('/api/databases', {
           name,
           db_type: 'postgresql',
           schema_json: schema,
+          data_json: tables,
           row_count: totalRows,
           quality_score: 0.85,
           status: 'ready',
@@ -798,18 +949,11 @@ function StudioPageInner({
 
         const dbId = result.database?.id
         if (dbId) {
-          // Update the tracked database ID so SQL execution works
           setCurrentDatabaseId(dbId)
-          if (Object.keys(tables).length > 0) {
-            try {
-              await apiPatch('/api/databases', {
-                id: dbId,
-                data_json: tables,
-              })
-            } catch {
-              console.warn('[Studio] Failed to save data_json')
-            }
-          }
+        } else {
+          // POST returned 200 but no id — surface the failure instead of
+          // showing a misleading green toast.
+          throw new Error('Server did not return a database id')
         }
       }
       invalidateCache('/api/databases')
@@ -876,6 +1020,111 @@ function StudioPageInner({
     toast.success('Copied to clipboard')
   }
 
+  // ─── Execute a SQL block returned by the AI (live DB mode) ───
+  // Called from the chat message UI when the user clicks "Execute".
+  // If the statement is destructive, ask for confirmation first.
+  const executeSqlBlock = async (messageId: string, sql: string, skipConfirm = false) => {
+    if (!activeConnectionId) {
+      toast.error('No active DB connection')
+      return
+    }
+    if (!sql.trim()) return
+
+    if (!skipConfirm && isDestructiveSQL(sql)) {
+      const ok = window.confirm(
+        `⚠️  This SQL will modify or destroy data on your LIVE database "${activeConnectionName}":\n\n${sql.slice(0, 200)}${sql.length > 200 ? '...' : ''}\n\nAre you sure you want to execute this?`,
+      )
+      if (!ok) return
+    }
+
+    setMessages(prev => prev.map(m =>
+      m.id === messageId
+        ? { ...m, sqlBlockExecuting: true, sqlBlockResult: null }
+        : m
+    ))
+
+    try {
+      const result = await apiPost<{
+        rows?: Record<string, unknown>[]
+        columns?: string[]
+        error?: string
+        executionTime?: number
+        rowCount?: number
+        affectedRows?: number
+      }>('/api/connections/execute', {
+        connectionId: activeConnectionId,
+        sql,
+        skipDangerousCheck: skipConfirm,
+      }, { timeout: 60000 })
+
+      if (result.error) {
+        setMessages(prev => prev.map(m =>
+          m.id === messageId
+            ? { ...m, sqlBlockExecuting: false, sqlBlockResult: { ok: false, message: result.error!, rowCount: 0, affectedRows: 0 } }
+            : m
+        ))
+        toast.error(result.error)
+        return
+      }
+
+      const verb = sql.trim().split(/\s+/)[0]?.toUpperCase() || ''
+      const isMutation = ['INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE'].includes(verb)
+      const affected = result.affectedRows ?? result.rowCount ?? (result.rows?.length || 0)
+
+      setMessages(prev => prev.map(m =>
+        m.id === messageId
+          ? {
+            ...m,
+            sqlBlockExecuting: false,
+            sqlBlockResult: {
+              ok: true,
+              message: isMutation ? `${verb} OK — ${affected} row(s) affected` : `Returned ${result.rowCount || result.rows?.length || 0} row(s)`,
+              rowCount: result.rowCount || result.rows?.length || 0,
+              affectedRows: affected,
+              rows: result.rows?.slice(0, 50),
+              columns: result.columns,
+            },
+          }
+          : m
+      ))
+
+      if (isMutation) {
+        toast.success(`${verb} OK — ${affected} row(s) affected`)
+        // Refresh the schema + data from the external DB so the data tab
+        // reflects the change immediately.
+        try {
+          const refresh = await apiGet<{
+            schema?: SchemaTable[]
+            data?: Record<string, unknown[]>
+          }>(`/api/connections?id=${activeConnectionId}&include=introspect`, { cacheTtl: 0, force: true, timeout: 30000 })
+          if (refresh.schema) setGeneratedSchema(refresh.schema)
+          if (refresh.data) setGeneratedData(refresh.data)
+        } catch (err) {
+          console.warn('[Studio] Failed to refresh external DB after mutation:', err)
+        }
+      } else {
+        toast.success(`Returned ${result.rowCount || result.rows?.length || 0} row(s)`)
+        // If it's a SELECT, also surface the rows in the SQL tab results area
+        if (result.rows && result.rows.length > 0) {
+          setSqlResults({
+            rows: result.rows,
+            columns: result.columns || [],
+            executionTime: result.executionTime || 0,
+          })
+          setActiveTab('sql')
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Execution failed'
+      setMessages(prev => prev.map(m =>
+        m.id === messageId
+          ? { ...m, sqlBlockExecuting: false, sqlBlockResult: { ok: false, message: msg, rowCount: 0, affectedRows: 0 } }
+          : m
+      ))
+      toast.error(msg)
+    }
+  }
+
   // ─── SQL Execution ───
   const executeSQL = async (sql: string, skipConfirm = false) => {
     if (!sql.trim()) return
@@ -893,13 +1142,19 @@ function StudioPageInner({
     setQueryHistory(prev => [sql, ...prev.filter(q => q !== sql)].slice(0, 10))
 
     try {
-      // Build request payload - include client data as fallback when no databaseId
-      const payload: Record<string, unknown> = { sql }
-      if (currentDatabaseId) {
+      // Build request payload. Route to the live external DB when a
+      // connection is active; otherwise fall back to the synthetic DB or
+      // client-side data.
+      const payload: Record<string, unknown> = { sql, skipDangerousCheck: skipConfirm }
+      if (activeConnectionId) {
+        payload.connectionId = activeConnectionId
+      } else if (currentDatabaseId) {
         payload.databaseId = currentDatabaseId
       } else if (hasGeneratedData) {
         payload.data = generatedData
       }
+
+      const endpoint = activeConnectionId ? '/api/connections/execute' : '/api/sql/execute'
 
       const result = await apiPost<{
         rows?: Record<string, unknown>[]
@@ -907,7 +1162,10 @@ function StudioPageInner({
         error?: string
         executionTime?: number
         rowCount?: number
-      }>('/api/sql/execute', payload)
+        affectedRows?: number
+        refreshedData?: Record<string, unknown[]>
+        refreshedSchema?: SchemaTable[]
+      }>(endpoint, payload, { timeout: 60000 })
 
       if (result.error) {
         toast.error(result.error)
@@ -918,7 +1176,26 @@ function StudioPageInner({
           columns: result.columns || [],
           executionTime: result.executionTime || 0,
         })
-        toast.success(`Query returned ${result.rowCount || result.rows.length} rows`)
+
+        // If the SQL mutated data (INSERT / UPDATE / DELETE / etc.) the
+        // server now returns the refreshed `data_json` and `schema_json`.
+        // Apply them to local state so the Data tab stays in sync with the
+        // backend instead of showing stale rows.
+        if (result.refreshedData) {
+          setGeneratedData(result.refreshedData)
+        }
+        if (result.refreshedSchema) {
+          setGeneratedSchema(result.refreshedSchema)
+        }
+
+        const verb = sql.trim().split(/\s+/)[0]?.toUpperCase() || ''
+        const isMutation = ['INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE'].includes(verb)
+        if (isMutation) {
+          const affected = result.affectedRows ?? result.rowCount ?? result.rows.length
+          toast.success(`${verb} OK — ${affected} row(s) affected`)
+        } else {
+          toast.success(`Query returned ${result.rowCount || result.rows.length} rows`)
+        }
       }
     } catch (err) {
       toast.error('Failed to execute SQL')
@@ -1025,6 +1302,10 @@ function StudioPageInner({
       let sseBuffer = ''
       const accumulatedData: Record<string, unknown[]> = {}
       let totalInserted = 0
+      // Local mutable copy of the database id so that the `complete` handler
+      // can read the most recent value, even if `database_created` fired
+      // mid-stream after this closure captured the initial value.
+      let liveDatabaseId = currentDatabaseId
 
       while (true) {
         const { done, value } = await reader.read()
@@ -1043,6 +1324,10 @@ function StudioPageInner({
             const event = JSON.parse(sseData)
 
             if (event.type === 'database_created' && event.databaseId) {
+              // Update both React state AND the local closure variable so the
+              // `complete` handler later in this same async function reads the
+              // freshly-assigned id instead of the stale `currentDatabaseId`.
+              liveDatabaseId = event.databaseId
               setCurrentDatabaseId(event.databaseId)
               setGenerationProgress(prev => ({ ...prev, databaseId: event.databaseId }))
             }
@@ -1123,24 +1408,29 @@ function StudioPageInner({
               const totalRows = event.totalRows || 0
               const tablesGen = event.tablesGenerated || 0
 
-              // Update all the data at once from the server
-              // Fetch the full database data from Supabase
-              if (currentDatabaseId || generationProgress.databaseId) {
+              // Update all the data at once from the server.
+              // Use `liveDatabaseId` (the local mutable variable kept in sync
+              // with `database_created` events) instead of the stale closure
+              // value of `currentDatabaseId`.
+              const dbId = liveDatabaseId || generationProgress.databaseId
+              if (dbId) {
                 try {
-                  const dbId = currentDatabaseId || generationProgress.databaseId
-                  const dbResult = await apiGet<{ database?: { data_json: Record<string, unknown[]>; schema_json: SchemaTable[] } }>(`/api/databases?id=${dbId}`)
-                  if (dbResult.database?.data_json) {
+                  const dbResult = await apiGet<{ database?: { data_json: Record<string, unknown[]>; schema_json: SchemaTable[] } }>(`/api/databases?id=${dbId}`, { cacheTtl: 0, force: true })
+                  if (dbResult.database?.data_json && Object.keys(dbResult.database.data_json).length > 0) {
                     setGeneratedData(dbResult.database.data_json)
                   }
-                  if (dbResult.database?.schema_json) {
-                    setGeneratedSchema(dbResult.database.schema_json)
+                  if (dbResult.database?.schema_json && Array.isArray(dbResult.database.schema_json) && dbResult.database.schema_json.length > 0) {
+                    setGeneratedSchema(dbResult.database.schema_json as SchemaTable[])
                   }
-                } catch {
-                  // Fallback: use accumulated data
+                } catch (err) {
+                  console.warn('[Studio] Failed to fetch generated DB after completion:', err)
+                  // Fallback: use accumulated data if we collected any
                   if (Object.keys(accumulatedData).length > 0) {
                     setGeneratedData(accumulatedData)
                   }
                 }
+              } else if (Object.keys(accumulatedData).length > 0) {
+                setGeneratedData(accumulatedData)
               }
 
               const finalMsg = `Generation complete — ${totalRows.toLocaleString()} rows across ${tablesGen} tables (${durationSec}s)`
@@ -1509,13 +1799,19 @@ function StudioPageInner({
       <div className="flex flex-col border-r bg-background shrink-0" style={{ width: chatWidth }}>
         {/* Chat Header */}
         <div className="px-3 py-2.5 border-b flex items-center justify-between bg-card shrink-0">
-          <div className="flex items-center gap-2">
-            <div className="h-6 w-6 rounded-lg bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center">
-              <Sparkles className="h-3 w-3 text-white" />
+          <div className="flex items-center gap-2 min-w-0">
+            <div className={`h-6 w-6 rounded-lg flex items-center justify-center shrink-0 ${isLiveDbMode ? 'bg-gradient-to-br from-sky-500 to-indigo-600' : 'bg-gradient-to-br from-amber-500 to-red-600'}`}>
+              {isLiveDbMode ? <PlugZap className="h-3 w-3 text-white" /> : <Sparkles className="h-3 w-3 text-white" />}
             </div>
-            <div>
-              <h2 className="text-xs font-semibold">SynthForge AI</h2>
-              <p className="text-[9px] text-muted-foreground">DeepSeek Reasoner</p>
+            <div className="min-w-0">
+              <h2 className="text-xs font-semibold truncate">
+                {isLiveDbMode ? (activeConnectionName || 'Live DB') : 'SynthForge AI'}
+              </h2>
+              <p className="text-[9px] text-muted-foreground truncate">
+                {isLiveDbMode
+                  ? `LIVE ${activeConnectionDialect || 'postgres'} · CRUD mode`
+                  : 'DeepSeek Reasoner'}
+              </p>
             </div>
           </div>
           <div className="flex items-center gap-1">
@@ -1528,6 +1824,12 @@ function StudioPageInner({
             >
               <Plus className="h-3 w-3" />
             </Button>
+            {isLiveDbMode && (
+              <Badge variant="outline" className="text-[9px] gap-0.5 text-sky-700 dark:text-sky-400 border-sky-400 h-5 animate-pulse">
+                <PlugZap className="h-2.5 w-2.5" />
+                LIVE
+              </Badge>
+            )}
             {loading && (
               <Badge variant="secondary" className="text-[9px] gap-0.5 animate-pulse h-5">
                 <Brain className="h-2.5 w-2.5" />
@@ -1649,6 +1951,109 @@ function StudioPageInner({
                     </div>
                   </div>
                 )}
+
+                {/* ─── SQL block (live DB mode) ─── */}
+                {message.role === 'assistant' && message.sqlBlock && (
+                  <div className="mt-2 rounded-md border border-sky-300 dark:border-sky-800 bg-sky-50/50 dark:bg-sky-950/30 overflow-hidden">
+                    <div className="px-2 py-1 border-b border-sky-300/50 dark:border-sky-800/50 flex items-center justify-between">
+                      <div className="flex items-center gap-1.5">
+                        <Code2 className="h-3 w-3 text-sky-600 dark:text-sky-400" />
+                        <span className="text-[9px] font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-400">
+                          SQL · {activeConnectionDialect || 'postgres'}
+                        </span>
+                        {isDestructiveSQL(message.sqlBlock) && (
+                          <Badge variant="outline" className="text-[8px] h-3.5 px-1 border-rose-400 text-rose-700 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/40">
+                            <AlertTriangle className="h-2 w-2 mr-0.5" />
+                            Destructive
+                          </Badge>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-0.5">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-5 px-1.5 text-[9px]"
+                          onClick={() => copyToClipboard(message.sqlBlock!)}
+                          title="Copy SQL"
+                        >
+                          <Copy className="h-2.5 w-2.5" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-5 px-1.5 text-[9px]"
+                          onClick={() => { setSqlEditor(message.sqlBlock!); setActiveTab('sql') }}
+                          title="Open in SQL editor"
+                        >
+                          <Code2 className="h-2.5 w-2.5" />
+                        </Button>
+                      </div>
+                    </div>
+                    <pre className="p-2 text-[10px] leading-relaxed font-mono overflow-x-auto max-h-[180px] overflow-y-auto bg-background/50">
+                      <code>{message.sqlBlock}</code>
+                    </pre>
+                    <div className="px-2 py-1.5 border-t border-sky-300/50 dark:border-sky-800/50 flex items-center gap-1.5">
+                      <Button
+                        size="sm"
+                        className="h-6 text-[10px] bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-700 hover:to-indigo-700 text-white"
+                        disabled={message.sqlBlockExecuting}
+                        onClick={() => executeSqlBlock(message.id, message.sqlBlock!)}
+                      >
+                        {message.sqlBlockExecuting ? (
+                          <>
+                            <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                            Executing...
+                          </>
+                        ) : (
+                          <>
+                            <Play className="h-3 w-3 mr-1" />
+                            Run on live DB
+                          </>
+                        )}
+                      </Button>
+                      {message.sqlBlockResult && (
+                        <span className={`text-[9px] font-medium ${message.sqlBlockResult.ok ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
+                          {message.sqlBlockResult.ok ? <CheckCircle2 className="inline h-2.5 w-2.5 mr-0.5" /> : <AlertTriangle className="inline h-2.5 w-2.5 mr-0.5" />}
+                          {message.sqlBlockResult.message}
+                        </span>
+                      )}
+                    </div>
+                    {/* Show returned rows for SELECT queries */}
+                    {message.sqlBlockResult?.ok && message.sqlBlockResult.rows && message.sqlBlockResult.rows.length > 0 && (
+                      <div className="border-t border-sky-300/50 dark:border-sky-800/50 max-h-[200px] overflow-auto">
+                        <table className="w-full text-[9px] font-mono">
+                          <thead className="sticky top-0 bg-sky-100 dark:bg-sky-950/60">
+                            <tr>
+                              {(message.sqlBlockResult.columns || Object.keys(message.sqlBlockResult.rows[0])).map(col => (
+                                <th key={col} className="px-1.5 py-1 text-left font-semibold text-sky-800 dark:text-sky-300 whitespace-nowrap">
+                                  {col}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {message.sqlBlockResult.rows.slice(0, 20).map((row, i) => (
+                              <tr key={i} className="border-t border-sky-200/50 dark:border-sky-800/30">
+                                {(message.sqlBlockResult?.columns || Object.keys(row)).map(col => (
+                                  <td key={col} className="px-1.5 py-0.5 whitespace-nowrap">
+                                    {row[col] === null || row[col] === undefined
+                                      ? <span className="text-muted-foreground italic">NULL</span>
+                                      : String(row[col]).slice(0, 80)}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        {message.sqlBlockResult.rows.length > 20 && (
+                          <div className="px-2 py-1 text-[8px] text-muted-foreground bg-sky-50/50 dark:bg-sky-950/30">
+                            + {message.sqlBlockResult.rows.length - 20} more row(s)
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
               {message.role === 'user' && (
                 <div className="h-5 w-5 rounded-full bg-primary flex items-center justify-center shrink-0 mt-0.5">
@@ -1678,8 +2083,8 @@ function StudioPageInner({
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Describe the data you need..."
-              disabled={loading}
+              placeholder={isLiveDbMode ? 'Ask me to edit, delete, drop, or query your live DB...' : 'Describe the data you need...'}
+              disabled={loading || connectionLoading}
               className="flex-1 text-xs h-8"
             />
             <Button
@@ -1705,10 +2110,24 @@ function StudioPageInner({
       <div className="flex-1 flex flex-col min-w-0">
         {/* Panel Header */}
         <div className="px-3 py-2 border-b flex items-center justify-between bg-card shrink-0">
-          <div className="flex items-center gap-2">
-            {hasGeneratedData && (
+          <div className="flex items-center gap-2 min-w-0">
+            {isLiveDbMode && (
               <>
-                <Database className="h-3.5 w-3.5 text-amber-600" />
+                <PlugZap className="h-3.5 w-3.5 text-sky-600 shrink-0" />
+                <Input
+                  value={databaseName}
+                  onChange={(e) => setDatabaseName(e.target.value)}
+                  className="h-6 text-xs font-medium border-transparent hover:border-input focus:border-input w-44 px-1"
+                />
+                <Badge variant="outline" className="text-[9px] gap-0.5 text-sky-700 dark:text-sky-400 border-sky-400 h-5 shrink-0">
+                  <PlugZap className="h-2.5 w-2.5" />
+                  LIVE {activeConnectionDialect || 'postgres'}
+                </Badge>
+              </>
+            )}
+            {!isLiveDbMode && hasGeneratedData && (
+              <>
+                <Database className="h-3.5 w-3.5 text-amber-600 shrink-0" />
                 <Input
                   value={databaseName}
                   onChange={(e) => setDatabaseName(e.target.value)}
@@ -1716,8 +2135,10 @@ function StudioPageInner({
                 />
               </>
             )}
-            {!hasGeneratedData && (
-              <span className="text-xs text-muted-foreground">No database generated yet</span>
+            {!isLiveDbMode && !hasGeneratedData && (
+              <span className="text-xs text-muted-foreground">
+                {connectionLoading ? 'Loading connection...' : 'No database generated yet'}
+              </span>
             )}
           </div>
           <div className="flex items-center gap-1.5">
@@ -1765,12 +2186,13 @@ function StudioPageInner({
                   size="sm"
                   className="h-6 text-[10px] gap-1"
                   onClick={saveToDatabase}
-                  disabled={saving}
+                  disabled={saving || isLiveDbMode}
+                  title={isLiveDbMode ? 'Save is disabled in live DB mode — changes are written directly to your external DB when you run SQL.' : 'Save'}
                 >
                   {saving ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : <Save className="h-2.5 w-2.5" />}
                   Save
                 </Button>
-                {currentDatabaseId && (
+                {currentDatabaseId && !isLiveDbMode && (
                   <Button
                     variant="outline"
                     size="sm"
