@@ -141,6 +141,12 @@ export default function DatabaseConnectionsPage() {
       toast.error('Please fill in name, host, username, and database')
       return
     }
+    // BUGFIX (BUG-52): client-side port validation — previously the user
+    // could enter 0 or 99999 and only get a generic server error.
+    if (!Number.isInteger(form.port) || form.port < 1 || form.port > 65535) {
+      toast.error('Port must be an integer between 1 and 65535')
+      return
+    }
     if (!editingId && !form.password) {
       toast.error('Password is required for new connections')
       return
@@ -153,15 +159,39 @@ export default function DatabaseConnectionsPage() {
       if (editingId) {
         // If password is empty on edit, don't send it (keep existing)
         if (!payload.password) delete payload.password
-        result = await apiPatch<{ connection: SafeDbConnection; test?: { ok: boolean; error?: string; latencyMs?: number } }>('/api/connections', { id: editingId, ...payload })
+        result = await apiPatch<{ connection: SafeDbConnection; test?: { ok: boolean; error?: string; hint?: string; latencyMs?: number } }>('/api/connections', { id: editingId, ...payload })
       } else {
-        result = await apiPost<{ connection: SafeDbConnection; test?: { ok: boolean; error?: string; latencyMs?: number } }>('/api/connections', payload)
+        result = await apiPost<{ connection: SafeDbConnection; test?: { ok: boolean; error?: string; hint?: string; latencyMs?: number } }>('/api/connections', payload)
       }
       invalidateCache('/api/connections')
-      toast.success(test ? (result.test?.ok ? 'Connection saved and verified' : 'Saved — but connection test failed') : 'Connection saved')
-      if (test && result.test?.error) {
-        toast.error(`Test failed: ${result.test.error}`)
+
+      // BUGFIX (BUG-55): previously we showed BOTH a green "Saved — but
+      // connection test failed" toast AND a red "Test failed: ..." toast
+      // simultaneously. Now we show a single contextual toast:
+      //   - test ok      → green success
+      //   - test failed  → warning with the error + hint
+      //   - no test      → green "Connection saved"
+      if (test) {
+        if (result.test?.ok) {
+          toast.success(`Connection saved and verified (${result.test.latencyMs ?? 0}ms)`)
+        } else {
+          // Show the failure as a single warning toast with the hint if available
+          const errMsg = result.test?.error || 'Unknown error'
+          const hint = result.test?.hint
+          // Use warning so the user knows the connection was saved but isn't usable yet
+          if (hint) {
+            toast.warning(`Connection saved, but test failed: ${errMsg}`, {
+              description: hint,
+              duration: 10000,
+            })
+          } else {
+            toast.warning(`Connection saved, but test failed: ${errMsg}`)
+          }
+        }
+      } else {
+        toast.success('Connection saved')
       }
+
       setDialogOpen(false)
       await loadConnections()
     } catch (err) {

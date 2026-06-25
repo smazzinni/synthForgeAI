@@ -54,7 +54,9 @@ function validateInput(body: unknown): { ok: true; input: DbConnectionInput } | 
   if (!name) return { ok: false, error: 'Name is required' }
   if (dialect !== 'postgres' && dialect !== 'mysql') return { ok: false, error: 'dialect must be "postgres" or "mysql"' }
   if (!host) return { ok: false, error: 'Host is required' }
-  if (!Number.isFinite(port) || port < 1 || port > 65535) return { ok: false, error: 'Port must be between 1 and 65535' }
+  // BUGFIX (BUG-9): reject floating-point ports — pg/mysql2 coerce them
+  // unpredictably.
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return { ok: false, error: 'Port must be an integer between 1 and 65535' }
   if (!username) return { ok: false, error: 'Username is required' }
   if (!database) return { ok: false, error: 'Database name is required' }
 
@@ -141,8 +143,21 @@ export async function POST(request: NextRequest) {
 
     if (shouldTest) {
       // Save first, then test (so we have a record id to use with the executor).
+      // BUGFIX (BUG-7): if the test throws an unhandled error (executor crash),
+      // the record stays as 'untested' — but the client got a 500 and may
+      // retry, creating duplicate records. Wrap the test in a try/catch so
+      // we always update the record's status before returning.
       const saved = await createConnection(userId, input, 'untested', null)
-      const testResult = await testConnection(saved)
+      let testResult: { ok: boolean; error?: string; hint?: string; latencyMs?: number }
+      try {
+        testResult = await testConnection(saved)
+      } catch (err) {
+        testResult = {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+          hint: 'The connection test itself crashed. This is usually a transient issue — try again.',
+        }
+      }
       if (testResult.ok) {
         status = 'connected'
       } else {
@@ -153,7 +168,7 @@ export async function POST(request: NextRequest) {
       const updated = await updateConnection(userId, saved.id, { status, error_message: errorMessage })
       return NextResponse.json({
         connection: updated ? toSafeRecord(updated) : toSafeRecord(saved),
-        test: { ok: testResult.ok, error: testResult.error, latencyMs: testResult.latencyMs },
+        test: { ok: testResult.ok, error: testResult.error, hint: testResult.hint, latencyMs: testResult.latencyMs },
       })
     }
 
@@ -185,6 +200,7 @@ export async function PATCH(request: NextRequest) {
     }
 
     const { updateConnection } = await import('@/lib/db-connections/store')
+    const { evictPool, testConnection } = await import('@/lib/db-connections/executor')
 
     // Apply the patch first
     const updated = await updateConnection(userId, id, patch)
@@ -192,10 +208,20 @@ export async function PATCH(request: NextRequest) {
       return NextResponse.json({ error: 'Connection not found' }, { status: 404 })
     }
 
+    // BUGFIX (BUG-18): if any connection parameter changed, evict the cached
+    // pool so the next test/query uses the NEW credentials instead of the
+    // stale pool (which would keep working against the OLD database for up
+    // to 10 minutes).
+    const connectionParamsChanged = ['host', 'port', 'username', 'password', 'database', 'ssl', 'dialect', 'schema'].some(k => b[k] !== undefined)
+    if (connectionParamsChanged) {
+      await evictPool(id)
+    }
+
     // Re-test if requested OR if connection parameters changed
-    const shouldTest = b.test === true || ['host', 'port', 'username', 'password', 'database', 'ssl', 'dialect'].some(k => b[k] !== undefined)
+    // BUGFIX (BUG-8): include 'schema' in the trigger list — changing the
+    // Postgres schema can break a previously-working connection.
+    const shouldTest = b.test === true || connectionParamsChanged
     if (shouldTest) {
-      const { testConnection } = await import('@/lib/db-connections/executor')
       const result = await testConnection(updated)
       const finalRecord = await updateConnection(userId, id, {
         status: result.ok ? 'connected' : 'failed',
@@ -203,7 +229,7 @@ export async function PATCH(request: NextRequest) {
       })
       return NextResponse.json({
         connection: finalRecord ? toSafeRecord(finalRecord) : toSafeRecord(updated),
-        test: { ok: result.ok, error: result.error, latencyMs: result.latencyMs },
+        test: { ok: result.ok, error: result.error, hint: result.hint, latencyMs: result.latencyMs },
       })
     }
 
@@ -225,6 +251,12 @@ export async function DELETE(request: NextRequest) {
     const { deleteConnection } = await import('@/lib/db-connections/store')
     const ok = await deleteConnection(userId, id)
     if (!ok) return NextResponse.json({ error: 'Connection not found' }, { status: 404 })
+
+    // Evict any cached pool so subsequent requests with the same id fail
+    // fast instead of trying to use a connection that no longer exists.
+    const { evictPool } = await import('@/lib/db-connections/executor')
+    await evictPool(id)
+
     return NextResponse.json({ success: true })
   } catch (err) {
     console.error('[Connections API] DELETE error:', err)

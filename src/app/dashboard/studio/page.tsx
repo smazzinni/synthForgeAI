@@ -64,6 +64,7 @@ import {
   parseBeginGeneration,
   cleanDisplayText,
   isDestructiveSQL,
+  stripSqlComments,
   getAgentByName,
   type AgentStatus,
   type InteractiveOptions,
@@ -95,10 +96,12 @@ interface Message {
   timestamp: Date
   isStreaming?: boolean
   tables?: Record<string, unknown[]> | null
-  // ─── External DB SQL block ───
-  // When the AI returns a ```sql block in live-DB mode, the parsed SQL is
-  // stored here so the UI can render an "Execute" button.
+  // ─── External DB SQL block(s) ───
+  // When the AI returns ```sql blocks in live-DB mode, the parsed SQL is
+  // stored here so the UI can render an "Execute" button per block.
+  // BUGFIX (BUG-35): support multiple SQL blocks per message.
   sqlBlock?: string | null
+  sqlBlocks?: string[]
   sqlBlockExecuting?: boolean
   sqlBlockResult?: { ok: boolean; message: string; rowCount?: number; affectedRows?: number; rows?: Record<string, unknown>[]; columns?: string[] } | null
 }
@@ -200,35 +203,67 @@ function parseAIResponse(content: string): {
   let databaseName: string | null = null
   let displayText = content
 
-  // Try to extract JSON code block
-  const codeBlockMatch = content.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/)
-  if (codeBlockMatch) {
+  // Try to extract JSON code block — match ALL code blocks (global flag)
+  // so that if the AI emits two ```json blocks, both are stripped from
+  // displayText. BUGFIX (BUG-44): the previous version only stripped the
+  // first, leaving the second visible to the user as raw text.
+  const codeBlockRe = /```(?:json)?\s*\n?([\s\S]*?)\n?```/g
+  let codeBlockMatch: RegExpExecArray | null
+  while ((codeBlockMatch = codeBlockRe.exec(content)) !== null) {
     try {
       const parsed = JSON.parse(codeBlockMatch[1])
-      if (parsed?.tables) {
+      if (parsed?.tables && !tables) {
         tables = parsed.tables
         databaseName = parsed.database_name || null
-        displayText = content.replace(/```(?:json)?\s*\n?[\s\S]*?\n?```/, '').trim()
       }
     } catch {
-      // Not valid JSON in code block
+      // Not valid JSON in code block — leave it alone
     }
+  }
+  if (tables) {
+    displayText = content.replace(/```(?:json)?\s*\n?[\s\S]*?\n?```/g, '').trim()
   }
 
   // If no code block found, try raw JSON
+  // BUGFIX (BUG-43): the previous regex `\{[\s\S]*"tables"[\s\S]*\}` was
+  // greedy and could match from the FIRST `{` to the LAST `}` in the
+  // content — including arbitrary text in between — causing JSON.parse to
+  // fail. Use a non-greedy match anchored to balanced braces.
   if (!tables) {
-    const jsonMatch = content.match(/\{[\s\S]*"tables"[\s\S]*\}/)
-    if (jsonMatch) {
+    const marker = '{"tables"'
+    let idx = content.indexOf(marker)
+    while (idx !== -1) {
+      // Walk forward doing bracket counting to find the matching close brace.
+      let depth = 0
+      let inStr = false
+      let escape = false
+      let end = -1
+      for (let i = idx; i < content.length; i++) {
+        const ch = content[i]
+        if (escape) { escape = false; continue }
+        if (ch === '\\' && inStr) { escape = true; continue }
+        if (ch === '"') { inStr = !inStr; continue }
+        if (inStr) continue
+        if (ch === '{') depth++
+        else if (ch === '}') {
+          depth--
+          if (depth === 0) { end = i; break }
+        }
+      }
+      if (end === -1) break
+      const candidate = content.substring(idx, end + 1)
       try {
-        const parsed = JSON.parse(jsonMatch[0])
+        const parsed = JSON.parse(candidate)
         if (parsed?.tables) {
           tables = parsed.tables
           databaseName = parsed.database_name || null
-          displayText = content.replace(jsonMatch[0], '').trim()
+          displayText = content.replace(candidate, '').trim()
+          break
         }
       } catch {
-        // Not parseable
+        // Not parseable — try next occurrence
       }
+      idx = content.indexOf(marker, idx + 1)
     }
   }
 
@@ -266,15 +301,33 @@ function extractSchema(tables: Record<string, unknown[]>): SchemaTable[] {
   return schema
 }
 
-// ─── Extract a ```sql ... ``` code block from AI response content ───
-// Returns the SQL text (without fences) or null if no block was found.
-function extractSqlBlock(content: string): string | null {
-  // Prefer fenced ```sql block
-  const fenced = content.match(/```(?:sql|SQL)?\s*\n([\s\S]*?)\n?```/)
-  if (fenced && fenced[1] && fenced[1].trim()) {
-    return fenced[1].trim()
+// ─── Extract ALL ```sql ... ``` code blocks from AI response content ───
+// Returns an array of SQL strings (without fences). Case-insensitive tag.
+// Non-SQL code blocks (```json, ```bash, etc.) are NOT included.
+//
+// BUGFIX (BUG-35/50): the previous version used a non-global regex that
+// only matched the FIRST block (and was case-sensitive on the language
+// tag). If the AI emitted two ```sql blocks, the second was silently
+// deleted from the displayed text by the caller's /g strip but never
+// surfaced to the user.
+export function extractAllSqlBlocks(content: string): string[] {
+  const blocks: string[] = []
+  // Match ```sql or ```SQL or ```Sql (case-insensitive). The `s` flag
+  // makes `.` match newlines.
+  const re = /```sql\s*\n([\s\S]*?)\n?```/gi
+  let match: RegExpExecArray | null
+  while ((match = re.exec(content)) !== null) {
+    const body = match[1].trim()
+    if (body) blocks.push(body)
   }
-  return null
+  return blocks
+}
+
+// Backwards-compat: returns the FIRST sql block (or null). Most callers
+// only need one — use extractAllSqlBlocks if you need every block.
+function extractSqlBlock(content: string): string | null {
+  const blocks = extractAllSqlBlocks(content)
+  return blocks.length > 0 ? blocks[0] : null
 }
 
 // ─── Agent icon helper ───
@@ -775,22 +828,38 @@ function StudioPageInner({
 
       // ─── LIVE DB MODE ───
       // When connected to an external DB, the AI responds with SQL code
-      // blocks instead of BEGIN_GENERATION signals. Extract the SQL block
-      // and attach it to the message so the UI can render an Execute button.
+      // blocks instead of BEGIN_GENERATION signals. Extract the SQL blocks
+      // and attach them to the message so the UI can render Execute buttons.
       if (isLiveDbMode) {
-        const sqlBlock = extractSqlBlock(fullContent)
-        // Strip the fenced block from the displayed text so the user sees
-        // just the explanation + the rendered SQL card (which has its own
-        // Copy / Execute buttons).
-        const displayText = fullContent.replace(/```(?:sql|SQL)?\s*\n[\s\S]*?\n?```/g, '').trim()
+        // BUGFIX (BUG-35): capture ALL sql blocks, not just the first.
+        const sqlBlocks = extractAllSqlBlocks(fullContent)
+        const primarySqlBlock = sqlBlocks.length > 0 ? sqlBlocks[0] : null
+
+        // Strip ALL ```sql fenced blocks from the displayed text so the
+        // user sees just the explanation + the rendered SQL cards (which
+        // have their own Copy / Execute buttons). Other code blocks
+        // (```json, ```bash) are preserved.
+        let displayText = fullContent.replace(/```sql\s*\n[\s\S]*?\n?```/gi, '').trim()
+
+        // BUGFIX (BUG-39): the system prompt tells the AI NOT to emit
+        // BEGIN_GENERATION signals or option-block JSON in live mode, but
+        // LLMs don't always comply. Strip them so they don't appear in
+        // the displayed text or get saved to conversation history.
+        displayText = cleanDisplayText(displayText)
+        displayText = displayText.replace(/\{"action"\s*:\s*"BEGIN_GENERATION"[\s\S]*?\}/g, '').trim()
+        // Remove multiple consecutive blank lines left by the stripping
+        displayText = displayText.replace(/\n{3,}/g, '\n\n').trim()
 
         setMessages(prev => prev.map(m =>
           m.id === assistantId
             ? {
               ...m,
-              content: displayText || (sqlBlock ? 'Here\'s the SQL:' : ''),
-              sqlBlock: sqlBlock || null,
-              interactiveOptions: lastInteractiveOptions,
+              content: displayText || (primarySqlBlock ? 'Here\'s the SQL:' : ''),
+              sqlBlock: primarySqlBlock,
+              sqlBlocks: sqlBlocks.length > 0 ? sqlBlocks : undefined,
+              // Explicitly null in live mode — option buttons shouldn't
+              // appear here even if the AI emits them by mistake.
+              interactiveOptions: null,
             }
             : m
         ))
@@ -881,7 +950,24 @@ function StudioPageInner({
       setReasoningVisible(false)
       setCurrentReasoning('')
     } catch (err) {
-      if ((err as Error).name === 'AbortError') return
+      // BUGFIX (BUG-42): the AbortError path returned early WITHOUT
+      // resetting loading/loadingRef, leaving the UI stuck in "Thinking…"
+      // state. The new sendMessage call sets them true at the top, so for
+      // the typical "user sent a new message before the previous one
+      // finished" case the state is correct — but for any OTHER abort
+      // reason (component unmount, future Stop button) the UI would hang.
+      // Always reset state here, even on abort.
+      if ((err as Error).name === 'AbortError') {
+        setLoading(false)
+        loadingRef.current = false
+        setReasoningVisible(false)
+        // Mark the in-flight assistant message as no longer streaming so
+        // the typing indicator stops.
+        setMessages(prev => prev.map(m =>
+          m.id === assistantId ? { ...m, isStreaming: false } : m
+        ))
+        return
+      }
 
       setMessages(prev => [
         ...prev.filter(m => m.id !== assistantId),
@@ -1064,10 +1150,25 @@ function StudioPageInner({
             : m
         ))
         toast.error(result.error)
+        // BUGFIX (BUG-46): if the connection itself was deleted or became
+        // invalid, clean up the studio's live-mode state so the user
+        // doesn't keep retrying against a dead connection.
+        if (/connection.*not found|not have access/i.test(result.error)) {
+          setActiveConnectionId(undefined)
+          setActiveConnectionName(undefined)
+          setActiveConnectionDialect(undefined)
+          router.push('/dashboard/connections')
+        }
         return
       }
 
-      const verb = sql.trim().split(/\s+/)[0]?.toUpperCase() || ''
+      // BUGFIX (BUG-37): strip leading SQL comments before computing the
+      // verb, so SQL prefixed with `-- DESTRUCTIVE: ...` is classified
+      // correctly. Otherwise `verb = '--'` and `isMutation = false`,
+      // causing the post-mutation schema refresh to be skipped and the
+      // toast to say "Returned 0 row(s)" instead of "INSERT OK — N rows".
+      const stripped = stripSqlComments(sql).trim()
+      const verb = stripped.split(/\s+/)[0]?.toUpperCase() || ''
       const isMutation = ['INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE'].includes(verb)
       const affected = result.affectedRows ?? result.rowCount ?? (result.rows?.length || 0)
 
@@ -1100,7 +1201,11 @@ function StudioPageInner({
           if (refresh.schema) setGeneratedSchema(refresh.schema)
           if (refresh.data) setGeneratedData(refresh.data)
         } catch (err) {
+          // BUGFIX (BUG-45): surface the refresh failure to the user
+          // instead of silently swallowing it. The Data tab will be stale
+          // until they reload the page.
           console.warn('[Studio] Failed to refresh external DB after mutation:', err)
+          toast.warning('Mutation succeeded, but the schema/data refresh failed. Reload the page to see the latest state.')
         }
       } else {
         toast.success(`Returned ${result.rowCount || result.rows?.length || 0} row(s)`)
@@ -1165,7 +1270,25 @@ function StudioPageInner({
         affectedRows?: number
         refreshedData?: Record<string, unknown[]>
         refreshedSchema?: SchemaTable[]
+        // BUGFIX (BUG-38): the server surfaces destructive-statement
+        // detections the client-side check might have missed (e.g. for
+        // multi-statement SQL where the second statement is destructive).
+        requiresConfirmation?: boolean
+        destructive?: boolean
       }>(endpoint, payload, { timeout: 60000 })
+
+      // BUGFIX (BUG-38): if the server detected a destructive operation
+      // that the client-side `isDestructiveSQL` check missed (e.g.
+      // `SELECT 1; DROP DATABASE prod` — the client only checks the first
+      // verb), open the confirmation dialog instead of showing an error.
+      if (result.requiresConfirmation) {
+        setSqlConfirmQuery(result.sql || sql)
+        setSqlConfirmOpen(true)
+        // Also update the SQL editor so when the user clicks "Execute
+        // anyway" they see exactly what they're confirming.
+        if (result.sql) setSqlEditor(result.sql)
+        return
+      }
 
       if (result.error) {
         toast.error(result.error)

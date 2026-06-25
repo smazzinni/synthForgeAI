@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
 import { executeSqlOnExternalConnection } from '@/lib/db-connections/executor'
+import { isDestructiveSQL, stripSqlComments } from '@/lib/ai-agents'
 
 // ─── SQL Execution API ───
 // Executes SQL against either:
@@ -48,22 +49,39 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'SQL query too long (max 100,000 characters)' }, { status: 400 })
     }
 
-    // Basic validation: check for allowed statement types
-    const firstWord = trimmedSql.split(/\s+/)[0]?.toUpperCase() || ''
+    // Strip leading SQL line/block comments before classifying the statement.
+    // The AI is instructed to prefix destructive statements with explanatory
+    // `-- DESTRUCTIVE: ...` comments, so without stripping the firstWord
+    // check would always be `--` and reject every AI-generated query.
+    const strippedForCheck = stripSqlComments(trimmedSql)
+    const firstWord = strippedForCheck.split(/\s+/)[0]?.toUpperCase() || ''
     if (!ALLOWED_STATEMENTS.includes(firstWord)) {
       return NextResponse.json({ error: `Statement type "${firstWord}" is not allowed` }, { status: 400 })
     }
 
     // Check for catastrophic dangerous patterns (unless caller explicitly skips)
+    // Strip single-quoted string literals first so keywords inside string
+    // values don't trigger false positives.
     if (!skipDangerousCheck) {
+      const literalStripped = strippedForCheck.replace(/'[^']*'/g, "''")
       for (const pattern of DANGEROUS_PATTERNS) {
-        if (pattern.test(trimmedSql)) {
+        if (pattern.test(literalStripped)) {
           return NextResponse.json({
             error: 'This query contains a potentially destructive operation. Please confirm before executing.',
             requiresConfirmation: true,
             sql: trimmedSql,
           }, { status: 200 })
         }
+      }
+      // Also use the improved isDestructiveSQL which handles comments and
+      // multi-statement SQL — surfaces a confirmation dialog to the user.
+      if (isDestructiveSQL(strippedForCheck)) {
+        return NextResponse.json({
+          error: 'This is a destructive operation. Please confirm before executing.',
+          requiresConfirmation: true,
+          destructive: true,
+          sql: trimmedSql,
+        }, { status: 200 })
       }
     }
 
@@ -72,7 +90,7 @@ export async function POST(request: NextRequest) {
     // user-supplied external Postgres/MySQL database.
     if (connectionId) {
       const result = await executeSqlOnExternalConnection(connectionId, trimmedSql)
-      return NextResponse.json(result, { status: result.error ? 200 : 200 })
+      return NextResponse.json(result, { status: result.error ? 400 : 200 })
     }
 
     // ─── Synthetic DB path (existing behavior, enhanced) ───
@@ -201,7 +219,9 @@ function executeSQLAgainstData(
       rows: [{ message: `Updated ${result.affectedRows} row(s)`, type: 'info' }],
       columns: ['message', 'type'],
       affectedRows: result.affectedRows,
-      mutated: true,
+      // BUGFIX (BUG-32): only mark as mutated if rows actually changed,
+      // otherwise we persist an identical data_json back to Supabase.
+      mutated: result.affectedRows > 0,
       dataAfter: dataCopy,
       schemaAfter: schema,
     }
@@ -214,7 +234,7 @@ function executeSQLAgainstData(
       rows: [{ message: `Deleted ${result.affectedRows} row(s)`, type: 'info' }],
       columns: ['message', 'type'],
       affectedRows: result.affectedRows,
-      mutated: true,
+      mutated: result.affectedRows > 0,
       dataAfter: dataCopy,
       schemaAfter: schema,
     }
@@ -324,6 +344,54 @@ function applyWhere(rows: Record<string, unknown>[], where: string): Record<stri
     return conditions.every(cond => {
       const trimmed = cond.trim()
 
+      // IS NULL / IS NOT NULL
+      const isNullMatch = trimmed.match(/(\w+)\s+IS\s+NOT\s+NULL$/i)
+      if (isNullMatch) {
+        return row[isNullMatch[1]] !== null && row[isNullMatch[1]] !== undefined
+      }
+      const isNotNullMatch = trimmed.match(/(\w+)\s+IS\s+NULL$/i)
+      if (isNotNullMatch) {
+        return row[isNotNullMatch[1]] === null || row[isNotNullMatch[1]] === undefined
+      }
+
+      // IN (v1, v2, ...)
+      const inMatch = trimmed.match(/(\w+)\s+IN\s*\(([^)]+)\)/i)
+      if (inMatch) {
+        const col = inMatch[1]
+        const values = inMatch[2].split(',').map(v => parseScalar(v.trim()))
+        return values.some(v => row[col] === v || String(row[col]) === String(v))
+      }
+
+      // !=, <> (not equal)
+      const neMatch = trimmed.match(/(\w+)\s*(?:!=|<>)\s*'?([^']*)'?/)
+      if (neMatch) {
+        const col = neMatch[1]
+        const val = neMatch[2]
+        // BUGFIX (BUG-27): previously unrecognized operators fell through to
+        // `return true`, which meant `WHERE age != 18` matched ALL rows.
+        return String(row[col]) !== val
+      }
+
+      // >=, <= (must be checked BEFORE > and <)
+      const gteMatch = trimmed.match(/(\w+)\s*>=\s*'?([^']*)'?/)
+      if (gteMatch) {
+        const col = gteMatch[1]
+        const val = Number(gteMatch[2])
+        if (!Number.isNaN(val)) {
+          return typeof row[col] === 'number' && (row[col] as number) >= val
+        }
+        return String(row[col]) >= gteMatch[2]
+      }
+      const lteMatch = trimmed.match(/(\w+)\s*<=\s*'?([^']*)'?/)
+      if (lteMatch) {
+        const col = lteMatch[1]
+        const val = Number(lteMatch[2])
+        if (!Number.isNaN(val)) {
+          return typeof row[col] === 'number' && (row[col] as number) <= val
+        }
+        return String(row[col]) <= lteMatch[2]
+      }
+
       const eqMatch = trimmed.match(/(\w+)\s*=\s*'?([^']*)'?/)
       if (eqMatch) {
         const col = eqMatch[1]
@@ -348,7 +416,11 @@ function applyWhere(rows: Record<string, unknown>[], where: string): Record<stri
         const pattern = likeMatch[2]
         return String(row[col] || '').toLowerCase().includes(pattern.toLowerCase())
       }
-      return true
+      // BUGFIX (BUG-27): previously returned `true` for unrecognized
+      // operators, causing `WHERE !=`, `WHERE IN`, etc. to match all rows.
+      // Now we return `false` so the row is excluded — safer default that
+      // prevents accidental mass-DELETE/UPDATE.
+      return false
     })
   })
 }
@@ -482,9 +554,11 @@ function executeUpdate(
   const tableData = data[tableName] as Record<string, unknown>[] | undefined
   if (!tableData) return { affectedRows: 0 }
 
-  // Parse SET assignments
+  // Parse SET assignments — split on commas at paren-depth 0 AND outside
+  // single-quoted strings, so values like `name='a, b'` or `coords=(1,2)`
+  // don't break the parser.
   const assignments: Array<{ col: string; value: unknown }> = []
-  for (const part of setClause.split(',')) {
+  for (const part of splitOnTopLevelCommas(setClause)) {
     const m = part.trim().match(/(\w+)\s*=\s*(.*)$/s)
     if (!m) continue
     const col = m[1]
@@ -494,15 +568,39 @@ function executeUpdate(
 
   let updated = 0
   const candidateRows = whereClause ? applyWhere([...tableData], whereClause) : tableData
-  const candidateIds = new Set(candidateRows.map(r => r.id))
+  const candidateIds = new Set(candidateRows.map(r => (r as { id?: unknown }).id))
 
   for (const row of tableData) {
-    if (whereClause && !candidateIds.has(row.id)) continue
-    for (const a of assignments) row[a.col] = a.value
+    if (whereClause && !candidateIds.has((row as { id?: unknown }).id)) continue
+    for (const a of assignments) (row as Record<string, unknown>)[a.col] = a.value
     updated++
   }
 
   return { affectedRows: updated }
+}
+
+/**
+ * Split a string on commas that are at paren-depth 0 AND outside
+ * single-quoted strings. Used for SET clauses (`a=1, b='x,y', c=(1,2)`)
+ * and CREATE TABLE column definitions (`price decimal(10,2), name varchar(255)`).
+ */
+function splitOnTopLevelCommas(input: string): string[] {
+  const parts: string[] = []
+  let depth = 0
+  let inString = false
+  let current = ''
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]
+    if (ch === "'" && input[i + 1] === "'") { current += "''"; i++; continue }
+    if (ch === "'") { inString = !inString; current += ch; continue }
+    if (inString) { current += ch; continue }
+    if (ch === '(') { depth++; current += ch; continue }
+    if (ch === ')') { depth--; current += ch; continue }
+    if (ch === ',' && depth === 0) { parts.push(current); current = ''; continue }
+    current += ch
+  }
+  if (current.trim()) parts.push(current)
+  return parts
 }
 
 function parseScalar(raw: string): unknown {
@@ -538,10 +636,13 @@ function executeDelete(
     return { affectedRows: count }
   }
 
-  const toKeep = applyWhere([...tableData], whereClause)
-  const toDeleteIds = new Set(tableData.filter(r => !toKeep.includes(r)).map(r => r.id))
-  data[tableName] = tableData.filter(r => !toDeleteIds.has(r.id))
-  return { affectedRows: tableData.length - data[tableName].length }
+  // BUGFIX (BUG-26): applyWhere returns rows that MATCH the WHERE clause.
+  // For DELETE we want to REMOVE those rows, not keep them. The previous
+  // code inverted this logic and kept the matched rows.
+  const matchingIds = new Set(applyWhere([...tableData], whereClause).map(r => (r as { id?: unknown }).id))
+  const before = tableData.length
+  data[tableName] = tableData.filter(r => !matchingIds.has((r as { id?: unknown }).id))
+  return { affectedRows: before - (data[tableName] as unknown[]).length }
 }
 
 // ─── CREATE TABLE ───
@@ -554,13 +655,20 @@ function executeCreate(
   if (!match) return { message: 'Could not parse CREATE TABLE', mutated: false, schema }
 
   const tableName = match[1]
-  const colDefs = match[2].split(',').map(c => c.trim()).filter(Boolean)
+  // BUGFIX (BUG-30): previously used `match[2].split(',')` which broke on
+  // type definitions like `decimal(10,2)` (the comma inside the parens was
+  // treated as a column separator). Use the paren-aware splitter instead.
+  const colDefs = splitOnTopLevelCommas(match[2]).map(c => c.trim()).filter(Boolean)
 
   if (data[tableName]) {
     return { message: `Table "${tableName}" already exists`, mutated: false, schema }
   }
 
   const columns = colDefs.map(def => {
+    // Take the first two whitespace-separated tokens as name and type.
+    // The type can include parenthesised args like `varchar(255)` or
+    // `decimal(10,2)` — they survive because we already split on top-level
+    // commas only.
     const parts = def.split(/\s+/)
     return { name: parts[0].replace(/"/g, ''), type: parts[1] || 'varchar(255)' }
   })

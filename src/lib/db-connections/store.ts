@@ -35,13 +35,38 @@ function saveRaw(userId: string, list: DbConnectionRecord[]) {
   inMemoryStore.set(userId, list)
 }
 
+// Cache the result of the table-existence probe so we don't pay an extra
+// round-trip on every connections API call. Re-probe only when a Supabase
+// error indicates the table doesn't exist (allows users to add the table
+// via db-connections-migration.sql without restarting the server).
+let supabaseAvailable: boolean | null = null
+
 async function trySupabase(): Promise<boolean> {
+  if (supabaseAvailable !== null) return supabaseAvailable
   const admin = getSupabaseAdmin()
-  if (!admin) return false
+  if (!admin) {
+    supabaseAvailable = false
+    return false
+  }
   // Probe the table — if it doesn't exist Supabase returns an error and we
   // transparently fall back to in-memory storage.
-  const { error } = await admin.from('db_connections').select('id').limit(1)
-  return !error
+  try {
+    const { error } = await admin.from('db_connections').select('id').limit(1)
+    // Treat "relation does not exist" (42P01 / 42501) as "table not present"
+    // → fall back to in-memory. Any other error → also fall back.
+    supabaseAvailable = !error
+  } catch {
+    supabaseAvailable = false
+  }
+  return supabaseAvailable
+}
+
+/**
+ * Reset the cached Supabase availability flag. Called by tests or by
+ * routes that just created the db_connections table to force a re-probe.
+ */
+export function _resetSupabaseProbeForTesting(): void {
+  supabaseAvailable = null
 }
 
 export async function listConnections(userId: string): Promise<SafeDbConnectionRecord[]> {
@@ -61,11 +86,18 @@ export async function listConnections(userId: string): Promise<SafeDbConnectionR
 export async function getConnection(userId: string, id: string): Promise<DbConnectionRecord | null> {
   if (await trySupabase()) {
     const admin = getSupabaseAdmin()!
-    const { data, error } = await admin
+    // SECURITY: always scope by user_id so a user can only fetch their own
+    // connection (which contains the plaintext password). The previous
+    // version omitted this filter, allowing any authenticated user to read
+    // any other user's connection record by id.
+    let query = admin
       .from('db_connections')
       .select('*')
       .eq('id', id)
-      .single()
+    if (userId) {
+      query = query.eq('user_id', userId)
+    }
+    const { data, error } = await query.single()
     if (error || !data) return null
     return data as DbConnectionRecord
   }
@@ -173,12 +205,17 @@ export async function updateConnection(
 export async function deleteConnection(userId: string, id: string): Promise<boolean> {
   if (await trySupabase()) {
     const admin = getSupabaseAdmin()!
-    const { error } = await admin
+    // BUGFIX (BUG-10): use `.select('id')` after delete so we can detect
+    // whether any row was actually removed. The previous version returned
+    // `true` even when the id didn't exist, hiding 404s from the client.
+    const { data, error } = await admin
       .from('db_connections')
-      .delete()
+      .delete({ count: 'exact' })
       .eq('id', id)
       .eq('user_id', userId)
-    if (!error) return true
+      .select('id')
+    if (error) return false
+    return Array.isArray(data) && data.length > 0
   }
   const list = listRaw(userId)
   const filtered = list.filter(c => c.id !== id)

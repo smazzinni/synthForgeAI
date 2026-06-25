@@ -243,3 +243,79 @@ Stage Summary:
 - The build passes (`ignoreBuildErrors: true` masks pre-existing TS issues — my new code follows the same patterns as the existing codebase)
 
 ---
+
+---
+Task ID: 2
+Agent: main (orchestrator)
+Task: Test DB connection with user-supplied Supabase credentials + comprehensive bug sweep across AI chat and DB sections
+
+Work Log:
+- Diagnosed the user's connection failure: db.efibhnxfapdjlowkrudc.supabase.co:5432 actively refuses TCP (ECONNREFUSED). DNS resolves to IPv6 only. The Supabase pooler (aws-0-<region>.pooler.supabase.com) reports "tenant/user postgres.efibhnxfapdjlowkrudc not found". Conclusion: the Supabase project is paused or deleted on the Supabase side — NOT a SynthForge code bug. User needs to log into their Supabase dashboard and restore the project, OR use the pooler URL.
+- Delegated a full bug sweep to an Explore subagent which read every file in the AI chat + DB sections and identified 59 issues (12 CRITICAL, 14 HIGH, 16 MEDIUM, 11 LOW).
+- Fixed the following bugs in this task:
+
+CRITICAL BUGS FIXED
+- BUG-6/22: `getConnection` in Supabase mode omitted `.eq('user_id', userId)` — PRIVILEGE ESCALATION allowing any authenticated user to fetch ANY other user's connection record (including plaintext password) by id. Now scopes by user_id.
+- BUG-13: `/api/connections/execute` didn't verify the authenticated user owns the connectionId before running SQL. Now resolves userId from cookies and calls `getConnection(userId, connectionId)`; 403s if not found.
+- BUG-58/12/36/37/11/28: `isDestructiveSQL` + `firstWord` check both broke on SQL prefixed with leading comments (`-- DESTRUCTIVE: ...\nDROP TABLE x`) — the EXACT format the chat route's system prompt instructs the AI to produce. Added `stripSqlComments()` helper that strips `--` and `/* */` comments while preserving string literals; rewrote `isDestructiveSQL` to strip comments, split on `;`, and check each statement's first verb. Applied the strip to `firstWord` checks in both `/api/connections/execute` and `/api/sql/execute`.
+- BUG-14: `DROP DATABASE`/`DROP SCHEMA` regex matched inside string literals (false positive). Now strips string literals before testing.
+- BUG-26: `executeDelete` kept the matched rows instead of deleting them (variable was misnamed `toKeep` but actually held `toDelete`). The result was the OPPOSITE of intended SQL semantics — `DELETE FROM users WHERE age=20` kept the age=20 rows and deleted everything else.
+- BUG-27: `applyWhere` returned `true` for unrecognized operators (`!=`, `IN`, `IS NULL`, `>=`, `<=`), causing them to match ALL rows. Combined with BUG-26 this caused silent data corruption. Now returns `false` for unknown operators (safer default) and explicitly supports `!=`, `<>`, `>=`, `<=`, `IN (...)`, `IS NULL`, `IS NOT NULL`.
+- BUG-16: MySQL mutations returned garbage `rows`/`columns`/`affectedRows`. mysql2/promise returns `[ResultSetHeader, fields]` for mutations where ResultSetHeader is an OBJECT (not array). The old code assumed `raw[0]` was always an array, so for INSERT/UPDATE/DELETE: `rows` was the 2-element tuple, `columns` was `['fieldCount','affectedRows','insertId',...]`, and `affectedRows` was 0. Now detects ResultSetHeader via `'affectedRows' in header` and returns proper empty rows/columns with the real affected count.
+- BUG-1: SSE streams in `/api/chat` and `/api/generate-stream` had no `cancel()` handler on the ReadableStream — when the browser disconnected, the upstream DeepSeek reader kept reading until max_tokens was exhausted, burning tokens. Added `cancel()` handlers that abort the upstream reader.
+- BUG-35/50: `extractSqlBlock` used a non-global case-sensitive regex that only matched the FIRST ```sql block. If the AI emitted two blocks, the second was silently deleted from the displayed text and the user couldn't execute it. Now `extractAllSqlBlocks()` uses a global case-insensitive regex and the message stores `sqlBlocks: string[]`.
+- BUG-31: `/api/sql/execute` external-DB path returned `{ status: result.error ? 200 : 200 }` — a no-op ternary. Now returns 400 on error.
+
+HIGH-SEVERITY BUGS FIXED
+- BUG-2: `currentSchema` columns accessed without null-guard — would throw if a malformed entry lacked `columns`. Now guards with `Array.isArray(table.columns)`.
+- BUG-4: Live-mode system prompt leaked sample-row PII to DeepSeek with no size cap. Now truncates each sample row JSON to 1KB and caps to 25 tables / 30 columns per table.
+- BUG-3: `history` array wasn't validated — a string would return a substring from `.slice(-10)`, a number would throw. Now validates with `Array.isArray` + per-message type check + 8KB cap per message.
+- BUG-7: POST `/api/connections` saved the connection BEFORE testing — if `testConnection` threw an unhandled error, the record stayed as 'untested' but the client got a 500 and could retry creating duplicates. Now wraps `testConnection` in try/catch so the record always gets a final status.
+- BUG-8: PATCH `/api/connections` didn't re-test when only `schema` changed (Postgres). Changing `public` → `app_private` can break a working connection but the badge stayed "connected". Added `'schema'` to the re-test trigger list.
+- BUG-9: `validateInput` accepted floating-point ports (e.g. `5432.7`). Now requires `Number.isInteger(port)`.
+- BUG-10: `deleteConnection` returned `true` even when 0 rows were deleted (Supabase returns no error for non-existent ids). Now uses `.delete({ count: 'exact' }).select('id')` and checks the returned data length.
+- BUG-18: Pool cache was keyed by `conn.id` only — credential changes via PATCH left the old pool with OLD credentials cached for up to 10 minutes. Added `evictPool(connectionId)` export and call it from PATCH and DELETE handlers when connection params change.
+- BUG-20: Replaced the `setInterval` pool-cleanup with a lazy check inside `getPool` so the runtime can't clear the interval and leak pools across warm invocations.
+- BUG-23: `trySupabase()` probed the `db_connections` table on EVERY call (extra DB round-trip). Now caches the result in a module-level variable.
+- BUG-29: `executeUpdate` SET-clause parser broke on commas inside string literals (`name='a, b'`) and inside parenthesized values (`coords=(1,2)`). Added `splitOnTopLevelCommas()` helper that respects paren depth and string literals.
+- BUG-30: `executeCreate` column-def parser broke on type definitions like `decimal(10,2)` (the comma inside parens was treated as a column separator). Now uses `splitOnTopLevelCommas()`.
+- BUG-32: `executeUpdate` and `executeDelete` set `mutated: true` unconditionally — even when 0 rows matched. This persisted identical `data_json` back to Supabase, wasting writes and risking races. Now `mutated: result.affectedRows > 0`.
+- BUG-37: `executeSqlBlock` computed `verb` from the first whitespace token, which was `--` for commented SQL. The post-mutation schema refresh was skipped and the toast said "Returned 0 row(s)" instead of "INSERT OK — N rows". Now strips comments via `stripSqlComments()` before computing the verb.
+- BUG-38: `executeSQL` (SQL tab) didn't handle `requiresConfirmation` from the server. For multi-statement SQL like `SELECT 1; DROP DATABASE prod`, the client-side check missed it (only checks first verb), the server returned `{error, requiresConfirmation: true}` with status 200, and the studio showed an error toast instead of opening the confirmation dialog. Now checks `result.requiresConfirmation` and opens `sqlConfirmOpen`.
+- BUG-39: LIVE DB MODE branch didn't strip BEGIN_GENERATION signals or option-block JSON. If the AI emitted them by mistake (against instructions), the raw JSON appeared in the displayed text and was saved to conversation history. Now explicitly calls `cleanDisplayText()` and strips `{"action":"BEGIN_GENERATION"}` blocks; nullifies `interactiveOptions`.
+- BUG-42: `sendMessage` catch block returned early on AbortError without resetting `loadingRef.current = true` — the UI stayed stuck in "Thinking…" state. Now resets loading, loadingRef, reasoningVisible, and marks the in-flight assistant message as not streaming.
+- BUG-45: `executeSqlBlock` schema refresh after mutation silently failed — the Data tab showed stale rows with no indication. Now shows a warning toast: "Mutation succeeded, but the schema/data refresh failed. Reload the page to see the latest state."
+- BUG-46: `executeSqlBlock` didn't clean up the stale `activeConnectionId` when the connection was deleted mid-execution. The UI kept showing "LIVE" badge and the user could retry against a dead connection. Now clears the connection state and redirects to `/dashboard/connections` on "Connection not found" errors.
+- BUG-52: Client-side port validation was missing — the user could enter 0 or 99999 and only get a generic server error. Now validates `Number.isInteger(port) && port >= 1 && port <= 65535` before submit.
+- BUG-55: Both a green "Saved — but connection test failed" toast AND a red "Test failed: ..." toast appeared simultaneously when a test failed. Now shows a single contextual toast (success / warning with hint / success).
+
+NEW FEATURE: Connection error hints
+- Added `explainConnectionError()` in executor.ts that maps raw connection errors to user-actionable hints:
+  - `ENOTFOUND` for *.supabase.co → "project may be paused or deleted; use the pooler hostname"
+  - `ECONNREFUSED` for *.supabase.co → "project is PAUSED; restore it from the Supabase dashboard"
+  - `ETIMEDOUT` → "host unreachable or firewall blocking the port"
+  - `password authentication failed` / `28P01` → "wrong username or password"
+  - `3d000` → "database does not exist"
+  - `tenant/user ... not found` → "pooler username format should be postgres.<project-ref>"
+- The hints are returned from `/api/connections` POST/PATCH and surfaced in the studio's failure toast (with `description` for extra context, 10s duration).
+
+Files modified:
+- src/lib/ai-agents.ts — added stripSqlComments + rewrote isDestructiveSQL
+- src/lib/db-connections/store.ts — fixed getConnection user_id filter, cached trySupabase, deleteConnection count
+- src/lib/db-connections/executor.ts — fixed MySQL ResultSetHeader handling, added evictPool + lazy TTL, added explainConnectionError
+- src/app/api/connections/route.ts — port integer validation, POST test try/catch, PATCH schema re-test + pool eviction, DELETE pool eviction, returns hint
+- src/app/api/connections/execute/route.ts — user authorization check, stripSqlComments before firstWord, literal stripping before DROP DATABASE regex, proper status code on error
+- src/app/api/sql/execute/route.ts — stripSqlComments before firstWord, isDestructiveSQL server-side check, fixed executeDelete (BUG-26), fixed applyWhere (BUG-27), splitOnTopLevelCommas for UPDATE/CREATE, mutated flag for UPDATE/DELETE, proper status code
+- src/app/api/chat/route.ts — ReadableStream cancel() handler, history validation + 8KB cap, currentSchema null-guard, sample row truncation
+- src/app/api/generate-stream/route.ts — ReadableStream cancel() handler
+- src/app/dashboard/studio/page.tsx — extractAllSqlBlocks (multi-block + case-insensitive), LIVE DB MODE strips BEGIN_GENERATION + nullifies options, executeSqlBlock strips comments before verb + handles connection-not-found + surfaces refresh failures, executeSQL handles requiresConfirmation, sendMessage AbortError resets state, parseAIResponse non-greedy regex + multi-block strip, added stripSqlComments import
+- src/app/dashboard/connections/page.tsx — client-side port validation, single contextual toast on test failure with hint
+
+Stage Summary:
+- All 12 CRITICAL bugs fixed (privilege escalation, data corruption, SSE leaks, broken destructive-statement detection, MySQL garbage results, multiple SQL blocks)
+- 14 HIGH-severity bugs fixed (auth, validation, parsing, error handling, race conditions)
+- 6 MEDIUM bugs fixed (regex, toasts, state cleanup)
+- The user's reported "unable to connect a db" issue was diagnosed as a paused/deleted Supabase project on the Supabase side — not a SynthForge code bug. Added helpful error hints so future users see clear guidance when their Supabase project is paused.
+- Build verified: `next build` succeeds with all routes intact.
+
+---

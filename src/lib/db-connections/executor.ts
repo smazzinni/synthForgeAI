@@ -23,7 +23,8 @@ async function getMysqlPool() {
 
 // ─── Connection-pool cache ───
 // We keep one pool per connection id so we don't pay the TCP+auth cost on
-// every request. Pools are evicted after 10 minutes of inactivity.
+// every request. Pools are evicted after 10 minutes of inactivity OR when
+// the underlying connection record changes (PATCH) or is deleted.
 interface PoolEntry {
   pool: unknown  // either pg.Pool or mysql2.Pool
   dialect: 'postgres' | 'mysql'
@@ -33,7 +34,21 @@ interface PoolEntry {
 const poolCache = new Map<string, PoolEntry>()
 const POOL_TTL_MS = 10 * 60 * 1000
 
-setInterval(() => {
+/**
+ * Evict (close + remove) a cached pool. Called by the connections PATCH
+ * and DELETE handlers so that credential changes take effect immediately
+ * instead of after the 10-minute TTL.
+ */
+export async function evictPool(connectionId: string): Promise<void> {
+  const entry = poolCache.get(connectionId)
+  if (!entry) return
+  try { await entry.close() } catch { /* ignore */ }
+  poolCache.delete(connectionId)
+}
+
+// Lazy TTL check — instead of a setInterval that may be cleared by the
+// serverless runtime, we evict expired entries on every `getPool` call.
+function evictExpired() {
   const now = Date.now()
   for (const [id, entry] of poolCache.entries()) {
     if (now - entry.lastUsedAt > POOL_TTL_MS) {
@@ -41,9 +56,10 @@ setInterval(() => {
       poolCache.delete(id)
     }
   }
-}, 60 * 1000).unref?.()
+}
 
 async function getPool(conn: DbConnectionRecord): Promise<PoolEntry> {
+  evictExpired() // lazy cleanup of expired pools
   const existing = poolCache.get(conn.id)
   if (existing) {
     existing.lastUsedAt = Date.now()
@@ -103,9 +119,13 @@ async function getPool(conn: DbConnectionRecord): Promise<PoolEntry> {
 // ─── Public API ───
 
 /**
- * Test connectivity. Returns `{ ok, error? }`. Does NOT throw.
+ * Test connectivity. Returns `{ ok, error?, hint?, latencyMs? }`. Does NOT throw.
+ *
+ * The `hint` field provides a human-friendly explanation for the most common
+ * failure modes (paused Supabase project, IPv6-only host, wrong credentials,
+ * etc.) so the user can fix the issue without reading raw socket errors.
  */
-export async function testConnection(conn: DbConnectionRecord): Promise<{ ok: boolean; error?: string; latencyMs?: number }> {
+export async function testConnection(conn: DbConnectionRecord): Promise<{ ok: boolean; error?: string; hint?: string; latencyMs?: number }> {
   const start = Date.now()
   try {
     const entry = await getPool(conn)
@@ -124,8 +144,62 @@ export async function testConnection(conn: DbConnectionRecord): Promise<{ ok: bo
       entry.close().catch(() => {})
       poolCache.delete(conn.id)
     }
-    return { ok: false, error: err instanceof Error ? err.message : String(err), latencyMs: Date.now() - start }
+
+    const rawError = err instanceof Error ? err.message : String(err)
+    const hint = explainConnectionError(rawError, conn)
+
+    return { ok: false, error: rawError, hint, latencyMs: Date.now() - start }
   }
+}
+
+/**
+ * Map raw connection errors to user-actionable hints.
+ */
+function explainConnectionError(message: string, conn: DbConnectionRecord): string {
+  const m = message.toLowerCase()
+
+  // DNS resolution failures
+  if (m.includes('enotfound') || m.includes('getaddrinfo')) {
+    if (conn.host.endsWith('.supabase.co')) {
+      return `The Supabase project "${conn.host.split('.')[0]}" could not be found. The project may be paused or deleted — log into your Supabase dashboard to check its status. For newer Supabase projects, use the pooler hostname (aws-0-<region>.pooler.supabase.com) instead of the direct host.`
+    }
+    return `Hostname "${conn.host}" could not be resolved. Check for typos, or that the host is reachable from this network.`
+  }
+
+  // TCP connection refused (port not listening)
+  if (m.includes('econnrefused')) {
+    if (conn.host.endsWith('.supabase.co')) {
+      return `The Supabase project refused the connection on port ${conn.port}. This usually means the project is PAUSED (free-tier Supabase projects auto-pause after 7 days of inactivity). Log into your Supabase dashboard and click "Restore project". Alternatively, use the pooler hostname aws-0-<region>.pooler.supabase.com (port 6543 for transaction mode, 5432 for session mode).`
+    }
+    return `Connection refused on ${conn.host}:${conn.port}. The database server may not be running, the port may be blocked by a firewall, or you may need to use a different port.`
+  }
+
+  // TCP connection timeout
+  if (m.includes('etimedout') || m.includes('timeout') || m.includes('timeoutexpired')) {
+    return `Connection timed out after 10 seconds. The host may be unreachable from this network, or a firewall is blocking port ${conn.port}. For cloud DBs, verify the IP allowlist includes this server's IP.`
+  }
+
+  // Authentication failures
+  if (m.includes('password authentication failed') || m.includes('28p01') || m.includes('access denied')) {
+    return `Authentication failed — the username or password is incorrect. Verify the credentials and try again.`
+  }
+
+  // Database doesn't exist
+  if (m.includes('3d000') || m.includes('database') && m.includes('does not exist')) {
+    return `Database "${conn.database}" does not exist on the server. Check the database name.`
+  }
+
+  // SSL handshake failures
+  if (m.includes('ssl') || m.includes('tls') || m.includes('certificate')) {
+    return `SSL/TLS handshake failed. Try toggling the "Use SSL" option, or for self-signed certs, the connection may require a custom CA.`
+  }
+
+  // Pooler-specific Supavisor errors
+  if (m.includes('tenant/user') && m.includes('not found')) {
+    return `The Supabase pooler does not recognize this project. The pooler username should be "postgres.<project-ref>" (e.g. postgres.abcdefghij). Check the username format.`
+  }
+
+  return ''
 }
 
 /**
@@ -253,10 +327,42 @@ export async function executeSql(
     // MySQL
     const pool = entry.pool as { query: (sql: string, values?: unknown) => Promise<unknown> }
     const raw = await pool.query(sql)
-    const rows = (Array.isArray(raw) && Array.isArray(raw[0]) ? raw[0] : raw) as Record<string, unknown>[]
-    const fields = (Array.isArray(raw) && Array.isArray(raw[1]) ? raw[1] : []) as Array<{ name: string }>
+
+    // mysql2/promise returns:
+    //   - For SELECT: [rows[], fields[]]
+    //   - For INSERT/UPDATE/DELETE: [ResultSetHeader, fields[]]
+    //     where ResultSetHeader is an OBJECT (not an array) with
+    //     { fieldCount, affectedRows, insertId, info, serverStatus, warningStatus }
+    //
+    // BUGFIX (BUG-16): the previous code assumed `raw[0]` was always an
+    // array. For mutations it's the ResultSetHeader object, so:
+    //   - `Array.isArray(raw[0])` is false → `rows = raw` (the 2-element tuple)
+    //   - `Object.keys(rows[0])` returned the ResultSetHeader's keys
+    //   - `affectedRows` was read off the array (always undefined → 0)
+    // The studio then showed "INSERT OK — 0 row(s) affected" and rendered
+    // the ResultSetHeader as if it were a data row.
+    const header = Array.isArray(raw) ? raw[0] : raw
+    const isResultSetHeader =
+      typeof header === 'object' && header !== null && !Array.isArray(header) && 'affectedRows' in header
+
+    let rows: Record<string, unknown>[]
+    let fields: Array<{ name: string }>
+    let affectedRows: number
+
+    if (isResultSetHeader) {
+      // INSERT / UPDATE / DELETE / DDL
+      rows = []
+      fields = []
+      affectedRows = (header as { affectedRows?: number }).affectedRows || 0
+    } else {
+      // SELECT
+      rows = (Array.isArray(raw) && Array.isArray(raw[0]) ? raw[0] : raw) as Record<string, unknown>[]
+      fields = (Array.isArray(raw) && Array.isArray(raw[1]) ? raw[1] : []) as Array<{ name: string }>
+      affectedRows = 0
+    }
+
     const columns = fields.length > 0 ? fields.map(f => f.name) : (rows.length > 0 ? Object.keys(rows[0]) : [])
-    const affectedRows = (raw as unknown as { affectedRows?: number }).affectedRows || 0
+
     return {
       rows: rows.slice(0, 1000),
       columns,

@@ -217,18 +217,36 @@ You are connected to a LIVE external database:
 
 ### CURRENT EXTERNAL SCHEMA`
       if (currentSchema && currentSchema.length > 0) {
-        systemPrompt += `\nTables:`
+        systemPrompt += `\nTables (limited to first 25):`
+        let tableCount = 0
         for (const table of currentSchema) {
-          systemPrompt += `\n- ${table.name} (${table.columns.map(c => `${c.name} ${c.type}`).join(', ')})`
+          if (tableCount >= 25) break
+          // BUGFIX (BUG-2): guard against malformed schema entries that
+          // lack a `columns` array (the client type is untrusted).
+          if (!Array.isArray(table.columns)) continue
+          const colStr = table.columns
+            .slice(0, 30) // cap columns per table to keep prompt under context window
+            .map(c => `${c.name} ${c.type}`)
+            .join(', ')
+          systemPrompt += `\n- ${table.name} (${colStr})`
+          tableCount++
         }
       } else {
         systemPrompt += `\n(No schema introspection available. Ask the user to describe the table if needed.)`
       }
       if (currentData && Object.keys(currentData).length > 0) {
-        systemPrompt += `\n\n### SAMPLE ROWS (first row per table)`
+        systemPrompt += `\n\n### SAMPLE ROWS (first row per table, truncated to 1KB each)`
+        let tableCount = 0
         for (const [tableName, rows] of Object.entries(currentData)) {
+          if (tableCount >= 25) break
           if (Array.isArray(rows) && rows.length > 0) {
-            systemPrompt += `\n- ${tableName}: ${JSON.stringify(rows[0])}`
+            // BUGFIX (BUG-4): truncate sample row JSON to prevent the
+            // system prompt from exceeding the context window when a
+            // column contains a large TEXT/JSON/base64 value.
+            let sampleStr = JSON.stringify(rows[0])
+            if (sampleStr.length > 1000) sampleStr = sampleStr.slice(0, 1000) + '...(truncated)'
+            systemPrompt += `\n- ${tableName}: ${sampleStr}`
+            tableCount++
           }
         }
       }
@@ -270,11 +288,25 @@ You are connected to a LIVE external database:
     ]
 
     // Add conversation history (last 10 messages for context)
-    const recentHistory = (history as ChatMessage[]).slice(-10)
+    // BUGFIX (BUG-3): validate that `history` is actually an array of
+    // {role, content} objects. The previous version cast with `as
+    // ChatMessage[]` and called `.slice(-10)` on whatever the client sent
+    // — a string would return a substring, a number would throw.
+    const safeHistory: ChatMessage[] = Array.isArray(history)
+      ? history.filter((msg): msg is ChatMessage =>
+          msg !== null && typeof msg === 'object' &&
+          (msg.role === 'user' || msg.role === 'assistant' || msg.role === 'system') &&
+          typeof msg.content === 'string'
+        )
+      : []
+    const recentHistory = safeHistory.slice(-10)
     for (const msg of recentHistory) {
-      if (msg.role === 'user' || msg.role === 'assistant') {
-        messages.push({ role: msg.role, content: msg.content })
-      }
+      // Cap each message at 8KB to prevent a single huge message from
+      // blowing the DeepSeek context window.
+      const content = msg.content.length > 8192
+        ? msg.content.slice(0, 8192) + '\n...(truncated)'
+        : msg.content
+      messages.push({ role: msg.role, content })
     }
 
     // Add current user message
@@ -324,6 +356,10 @@ You are connected to a LIVE external database:
         const decoder = new TextDecoder()
         let buffer = ''
         let closed = false
+        // Track whether the client disconnected so the upstream DeepSeek
+        // stream gets cancelled promptly (otherwise tokens keep being
+        // billed until max_tokens is exhausted).
+        let clientCancelled = false
 
         const safeEnqueue = (data: Uint8Array) => {
           if (closed) return
@@ -336,6 +372,7 @@ You are connected to a LIVE external database:
 
         try {
           while (true) {
+            if (clientCancelled) break
             const { done, value } = await reader.read()
             if (done) break
 
@@ -404,6 +441,24 @@ You are connected to a LIVE external database:
               // Already closed
             }
           }
+        }
+      },
+      // BUGFIX (BUG-1): add a cancel() handler so that when the browser
+      // disconnects (tab close, navigation, AbortController.abort on the
+      // client), we cancel the upstream DeepSeek reader too. Without this
+      // the upstream connection leaks and tokens keep being billed until
+      // max_tokens is exhausted.
+      async cancel() {
+        clientCancelled = true
+        try {
+          await reader.cancel()
+        } catch {
+          // Already released
+        }
+        try {
+          await reader.releaseLock()
+        } catch {
+          // Already released
         }
       },
     })

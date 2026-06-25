@@ -357,16 +357,105 @@ function removeJsonBlocks(content: string, marker: string, markerLoose: string):
 }
 
 /**
- * Check if a SQL statement is destructive (DELETE, DROP, TRUNCATE, mass UPDATE)
+ * Strip SQL line comments (`-- ...`) and block comments (`/* ... *\/`)
+ * from a SQL string. Used so that destructive-statement detection and
+ * statement-type classification work on SQL that the AI prefixes with
+ * explanatory comments (which is the format the chat route's system
+ * prompt instructs the AI to produce).
+ *
+ * The function preserves string literals — `--` inside a quoted string
+ * is NOT treated as a comment.
+ */
+export function stripSqlComments(sql: string): string {
+  let result = ''
+  let i = 0
+  let inSingle = false
+  const len = sql.length
+
+  while (i < len) {
+    const ch = sql[i]
+    const next = sql[i + 1]
+
+    // Toggle string-literal state. Escape sequences inside strings are
+    // handled by simply copying the next char.
+    if (ch === "'" && !inSingle) {
+      inSingle = true
+      result += ch
+      i++
+      continue
+    }
+    if (ch === "'" && inSingle) {
+      // Doubled single quote = escaped quote, NOT end of string
+      if (next === "'") {
+        result += "''"
+        i += 2
+        continue
+      }
+      inSingle = false
+      result += ch
+      i++
+      continue
+    }
+
+    if (inSingle) {
+      result += ch
+      i++
+      continue
+    }
+
+    // Line comment: `-- ...` until end of line
+    if (ch === '-' && next === '-') {
+      // Skip to end of line (or end of string)
+      while (i < len && sql[i] !== '\n') i++
+      // Preserve the newline so line numbers / statement splitting still work
+      if (i < len) { result += '\n'; i++ }
+      continue
+    }
+
+    // Block comment: `/* ... */`
+    if (ch === '/' && next === '*') {
+      i += 2
+      while (i < len && !(sql[i] === '*' && sql[i + 1] === '/')) i++
+      i += 2 // skip the closing `*/`
+      if (i > len) i = len
+      result += ' '
+      continue
+    }
+
+    result += ch
+    i++
+  }
+
+  return result
+}
+
+/**
+ * Check if a SQL statement is destructive (DELETE, DROP, TRUNCATE, mass UPDATE).
+ *
+ * This function correctly handles:
+ *   - SQL with leading comments (`-- DESTRUCTIVE: ...\nDROP TABLE x`)
+ *   - Multi-statement SQL (`SELECT 1; DROP TABLE x;`)
+ *   - `WHERE` keywords inside comments (no longer matches them)
+ *
+ * Comments and string literals are stripped before analysis so the
+ * detection reflects the actual SQL semantics.
  */
 export function isDestructiveSQL(sql: string): boolean {
-  const normalized = sql.trim().toUpperCase()
-  return (
-    normalized.startsWith('DELETE') ||
-    normalized.startsWith('DROP') ||
-    normalized.startsWith('TRUNCATE') ||
-    (normalized.startsWith('UPDATE') && !normalized.includes('WHERE'))
-  )
+  const noComments = stripSqlComments(sql)
+  // Strip string literals so `WHERE` inside a string value doesn't fool us
+  const noStrings = noComments.replace(/'[^']*'/g, "''")
+  const statements = noStrings.split(';').map(s => s.trim()).filter(Boolean)
+
+  return statements.some(stmt => {
+    const upper = stmt.toUpperCase()
+    return (
+      upper.startsWith('DELETE') ||
+      upper.startsWith('DROP') ||
+      upper.startsWith('TRUNCATE') ||
+      // Mass UPDATE (no WHERE clause) — destructive because it affects every row
+      (upper.startsWith('UPDATE') && !upper.includes('WHERE'))
+    )
+  })
 }
 
 /**

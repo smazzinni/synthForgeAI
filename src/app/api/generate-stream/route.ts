@@ -517,6 +517,20 @@ export async function POST(request: NextRequest) {
           }
         }
       },
+      // BUGFIX (BUG-1): cancel the upstream DeepSeek stream when the client
+      // disconnects so tokens don't keep being billed after navigation.
+      async cancel() {
+        try {
+          await reader.cancel()
+        } catch {
+          // already released
+        }
+        try {
+          await reader.releaseLock()
+        } catch {
+          // already released
+        }
+      },
     })
 
     return new Response(stream, {
