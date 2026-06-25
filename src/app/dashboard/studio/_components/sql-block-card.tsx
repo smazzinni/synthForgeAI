@@ -44,6 +44,17 @@ export function SqlBlockCard({
   onExecute: () => void
 }) {
   const destructive = isDestructiveSQL(sql)
+  // Detect read-only queries (auto-executed by the studio) so we can show
+  // an "Auto-run" badge and the user understands the rows appeared without
+  // them clicking anything.
+  const stripped = sql.replace(/--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim()
+  const firstVerb = stripped.split(/\s+/)[0]?.toUpperCase() || ''
+  const isReadOnly =
+    firstVerb === 'SELECT' ||
+    firstVerb === 'WITH' ||
+    firstVerb === 'SHOW' ||
+    firstVerb === 'DESCRIBE' ||
+    firstVerb === 'EXPLAIN'
 
   return (
     <div className="mt-2 rounded-md border border-sky-300 dark:border-sky-800 bg-sky-50/50 dark:bg-sky-950/30 overflow-hidden">
@@ -53,12 +64,17 @@ export function SqlBlockCard({
           <span className="text-[9px] font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-400">
             SQL · {dialect || 'postgres'}
           </span>
-          {destructive && (
+          {destructive ? (
             <Badge variant="outline" className="text-[8px] h-3.5 px-1 border-rose-400 text-rose-700 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/40">
               <AlertTriangle className="h-2 w-2 mr-0.5" />
               Destructive
             </Badge>
-          )}
+          ) : isReadOnly ? (
+            <Badge variant="outline" className="text-[8px] h-3.5 px-1 border-emerald-400 text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40">
+              <CheckCircle2 className="h-2 w-2 mr-0.5" />
+              Auto-run
+            </Badge>
+          ) : null}
         </div>
         <div className="flex items-center gap-0.5">
           <Button

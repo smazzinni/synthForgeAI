@@ -124,7 +124,7 @@ function StudioPageInner({
       id: '1',
       role: 'assistant',
       content: initialConnectionId
-        ? `Connected to live ${initialConnectionDialect || 'DB'} **"${initialConnectionName || ''}"**. Ask me to perform CRUD operations on it — for example:\n\n- "Show me the first 10 rows of users"\n- "Delete all users created before 2020"\n- "Add a status column to the orders table"\n- "Drop the legacy_logs table"\n\nI'll respond with SQL that you can execute against your live DB.`
+        ? `Connected to live ${initialConnectionDialect || 'DB'} **"${initialConnectionName || ''}"**. I have direct access to this database — ask me anything and I'll run SQL against it.\n\n**Examples:**\n- "show me the first 10 rows of users"\n- "how many rows are in the orders table?"\n- "what tables are in this database?"\n- "delete all users created before 2020"\n- "add a status column to the orders table"\n- "drop the legacy_logs table"\n\n**How it works:**\n- **SELECT** queries are auto-executed immediately — results appear inline below.\n- **INSERT / UPDATE / DELETE / DDL** operations show a confirmation dialog before executing.\n- Destructive operations (DROP, TRUNCATE, DELETE without WHERE) are clearly badged.`
         : databaseId
         ? `You're editing database **"${initialName || databaseId}"**. Describe changes or ask me to add more data.`
         : 'Welcome to **SynthForge AI Studio**! I can help you generate synthetic data.\n\nDescribe the database you need, and I\'ll design the schema, generate realistic data, and ensure quality compliance.\n\nFor example: "Generate an e-commerce database with users, orders, and products"',
@@ -184,6 +184,11 @@ function StudioPageInner({
   const messagesRef = useRef<Message[]>(messages)
   const loadingRef = useRef(false)
   const resizeRef = useRef<HTMLDivElement>(null)
+  // Ref to the latest `executeSqlBlock` function. `sendMessage` (defined
+  // above `executeSqlBlock`) needs to call it for auto-execution of SELECT
+  // queries in live-DB mode, but `const` declarations aren't hoisted. The
+  // ref lets `sendMessage` reach the latest version without a TDZ error.
+  const executeSqlBlockRef = useRef<(messageId: string, sql: string, skipConfirm?: boolean) => void>(() => {})
 
   // Keep messagesRef in sync
   useEffect(() => {
@@ -510,6 +515,11 @@ function StudioPageInner({
       // When connected to an external DB, the AI responds with SQL code
       // blocks instead of BEGIN_GENERATION signals. Extract the SQL blocks
       // and attach them to the message so the UI can render Execute buttons.
+      //
+      // AUTO-EXECUTION: SELECT queries are auto-executed immediately so the
+      // user sees real rows inline (not just a "Run" button). Mutations
+      // (INSERT/UPDATE/DELETE/DDL) still require the user to click "Run on
+      // live DB" so they can confirm destructive operations.
       if (isLiveDbMode) {
         // BUGFIX (BUG-35): capture ALL sql blocks, not just the first.
         const sqlBlocks = extractAllSqlBlocks(fullContent)
@@ -550,6 +560,33 @@ function StudioPageInner({
         setCurrentReasoning('')
 
         saveConversation(userMessage.content, displayText || fullContent, lastAgentName)
+
+        // ─── AUTO-EXECUTE non-destructive SELECT queries ───
+        // The system prompt tells the AI that SELECT queries are
+        // auto-executed. So when the AI emits a SELECT (or WITH ... SELECT,
+        // or SHOW/DESCRIBE/EXPLAIN), we immediately run it against the live
+        // DB and display the rows inline — the user doesn't have to click
+        // anything. Mutations (INSERT/UPDATE/DELETE/DDL) still require an
+        // explicit click so destructive operations get a confirmation.
+        if (primarySqlBlock && activeConnectionId) {
+          const stripped = stripSqlComments(primarySqlBlock).trim()
+          const firstVerb = stripped.split(/\s+/)[0]?.toUpperCase() || ''
+          const isAutoExecutableRead =
+            firstVerb === 'SELECT' ||
+            firstVerb === 'WITH' ||
+            firstVerb === 'SHOW' ||
+            firstVerb === 'DESCRIBE' ||
+            firstVerb === 'EXPLAIN'
+
+          if (isAutoExecutableRead && !isDestructiveSQL(primarySqlBlock)) {
+            // Auto-execute in the background (don't block the return).
+            // Pass skipConfirm=true since we already verified it's a read.
+            // Use the ref because `executeSqlBlock` is defined below
+            // `sendMessage` in the source — `const` isn't hoisted.
+            executeSqlBlockRef.current(assistantId, primarySqlBlock, true)
+          }
+        }
+
         return
       }
 
@@ -810,6 +847,10 @@ function StudioPageInner({
   // Called from the chat message UI when the user clicks "Execute".
   // If the statement is destructive, ask for confirmation first.
   const executeSqlBlock = async (messageId: string, sql: string, skipConfirm = false) => {
+    // Keep the ref in sync so `sendMessage` (defined above) can call this
+    // function for auto-execution of SELECT queries.
+    executeSqlBlockRef.current = executeSqlBlock
+
     if (!activeConnectionId) {
       toast.error('No active DB connection')
       return
@@ -908,15 +949,21 @@ function StudioPageInner({
           toast.warning('Mutation succeeded, but the schema/data refresh failed. Reload the page to see the latest state.')
         }
       } else {
-        toast.success(`Returned ${result.rowCount || result.rows?.length || 0} row(s)`)
-        // If it's a SELECT, also surface the rows in the SQL tab results area
-        if (result.rows && result.rows.length > 0) {
-          setSqlResults({
-            rows: result.rows,
-            columns: result.columns || [],
-            executionTime: result.executionTime || 0,
-          })
-          setActiveTab('sql')
+        // For SELECT queries: only show a toast + switch to SQL tab when
+        // the USER manually clicked "Run on live DB". For auto-executed
+        // reads (skipConfirm=true), the results are already shown inline
+        // in the chat card — no toast needed (less noise).
+        if (!skipConfirm) {
+          toast.success(`Returned ${result.rowCount || result.rows?.length || 0} row(s)`)
+          // Also surface the rows in the SQL tab results area
+          if (result.rows && result.rows.length > 0) {
+            setSqlResults({
+              rows: result.rows,
+              columns: result.columns || [],
+              executionTime: result.executionTime || 0,
+            })
+            setActiveTab('sql')
+          }
         }
       }
     } catch (err) {

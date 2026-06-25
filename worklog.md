@@ -404,3 +404,69 @@ Stage Summary:
 - Build verified: 'next build' succeeds with all routes intact
 
 ---
+
+---
+Task ID: 4
+Agent: main (orchestrator)
+Task: Fix "AI doesn't have DB access" issue — implement auto-execution of SELECT queries + grant full permissions
+
+Work Log:
+
+DIAGNOSIS
+- The user reported: when they asked the AI "show me the first 10 rows of users", the AI responded "I don't have direct access to the stored data".
+- Root cause: the system prompt in /api/chat didn't explicitly tell the AI it has direct DB access. The AI was instructed to "respond with SQL code blocks" but the phrasing was ambiguous — the AI interpreted it as "generate SQL for the user to run" rather than "you have direct access, the frontend will auto-run your queries".
+- Secondary issue: even when the AI did emit SQL, the user had to manually click "Run on live DB" for EVERY query including harmless SELECTs. This made the chat feel like a SQL generator, not a conversational DB agent.
+
+CONNECTION TEST
+- Verified the user's new pooler connection works:
+  host=aws-1-ap-southeast-1.pooler.supabase.com, port=6543,
+  user=postgres.ctdbesluglmwxqzugopq, db=postgres
+- The DB has 35 tables across auth/realtime/storage schemas (Supabase managed).
+- Confirmed SELECT/SHOW/DESCRIBE queries return real rows via the executor.
+
+FIX 1 — Rewrote the LIVE EXTERNAL DATABASE MODE system prompt
+- Added a prominent header: "YOU HAVE DIRECT DB ACCESS"
+- Explicitly states: "You are NOT a chatbot that 'doesn't have access to stored data'. You have FULL access... you MUST respond with a SQL query... The frontend will AUTO-EXECUTE your SELECT queries immediately and display the real rows to the user inline. You never need to say 'I don't have access' — you CAN, via the SQL you emit."
+- Added a PERMISSIONS section granting full read/write/DDL/destructive access
+- Added 6 concrete examples (show rows, count, list tables, delete, alter, etc.)
+- Added rule: "Never say 'I don't have access'" with a fallback introspection query
+
+FIX 2 — Auto-execute non-destructive SELECT queries in the studio
+- After the AI response finalizes in live-DB mode, the studio now checks the first verb of the SQL block. If it's SELECT/WITH/SHOW/DESCRIBE/EXPLAIN and NOT destructive, the studio AUTO-EXECUTES the query immediately via executeSqlBlock(messageId, sql, skipConfirm=true).
+- The results (rows + columns) are rendered inline in the SqlBlockCard component — the user sees real data appear automatically, no clicking required.
+- Mutations (INSERT/UPDATE/DELETE/DDL) still require an explicit "Run on live DB" click so destructive operations get a confirmation dialog.
+- Used a ref pattern (executeSqlBlockRef) to call executeSqlBlock from sendMessage, since executeSqlBlock is defined later in the source and `const` isn't hoisted.
+
+FIX 3 — "Auto-run" badge on SQL cards
+- The SqlBlockCard component now shows a green "Auto-run" badge for read-only queries (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN) so the user understands why results appeared without them clicking.
+- Destructive queries still show the red "Destructive" badge.
+- Other mutations show no badge (just the Run button).
+
+FIX 4 — Suppress noisy toasts for auto-executed reads
+- For auto-executed SELECTs (skipConfirm=true), the studio no longer shows a "Returned N rows" toast or auto-switches to the SQL tab — the inline results in the chat card are enough.
+- For manual clicks (skipConfirm=false), the toast + SQL tab switch still happen.
+
+FIX 5 — Improved welcome message in live mode
+- The initial assistant message now explicitly says "I have direct access to this database" and explains how it works:
+  - SELECT queries are auto-executed immediately — results appear inline
+  - INSERT/UPDATE/DELETE/DDL show a confirmation dialog
+  - Destructive operations are clearly badged
+
+VERIFICATION
+- Tested the executor end-to-end against the user's real Supabase DB:
+  - "what tables are in this database?" → returns 35 tables ✓
+  - "show me the first 10 rows of users" → returns 0 rows (no users yet) with columns id/email/created_at/last_sign_in_at ✓
+  - "how many users are there?" → returns {user_count: "0"} ✓
+- Build verified: 'next build' succeeds.
+
+Files modified:
+- src/app/api/chat/route.ts — rewrote LIVE EXTERNAL DATABASE MODE system prompt
+- src/app/dashboard/studio/page.tsx — auto-execute SELECTs, executeSqlBlockRef pattern, suppressed noisy toasts, improved welcome message
+- src/app/dashboard/studio/_components/sql-block-card.tsx — "Auto-run" badge for read-only queries
+
+Stage Summary:
+- The AI now has direct DB access and knows it. When the user asks "show me the first 10 rows of users", the AI emits a SELECT query which the studio AUTO-EXECUTES — the user sees real rows appear inline in the chat immediately.
+- Full permissions granted: the AI can perform ANY operation (SELECT/INSERT/UPDATE/DELETE/CREATE/ALTER/DROP/TRUNCATE). Mutations require a confirmation click; reads are automatic.
+- The user's new pooler connection (aws-1-ap-southeast-1.pooler.supabase.com:6543) works correctly.
+
+---
