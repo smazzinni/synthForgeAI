@@ -593,3 +593,51 @@ Stage Summary:
 - Live-DB AI chat: WORKING (auto-execute ref fix, welcome message, error handling all fixed)
 - All fixes pushed to git main branch
 - The db_connections table does not exist in the user's Supabase project (migration not run) — the store falls back to in-memory which is fine for the single-process dev server. For production durability, run db-connections-migration.sql against Supabase.
+
+---
+Task ID: CRON-REVIEW-1
+Agent: Main Agent (Z.ai Code) — webDevReview cron
+Task: QA assessment, styling improvements, and new feature development
+
+Work Log:
+- Reviewed both worklogs (synthForgeAI + my-project) to understand prior progress
+- Performed comprehensive QA via agent-browser:
+  - Home page: renders correctly, all sections present
+  - Auth: session persisted from prior task, dashboard accessible
+  - Studio chat: sent "Generate a small e-commerce database" → multi-agent pipeline ran (Schema Architect → Data Generator → Quality Analyst) → generated 3 tables, 15 rows in 28.3s, no console errors
+  - Data tab: verified generated data displays correctly with rich column metadata (PK/FK badges, type info, descriptions)
+  - Connections page: accessible, "Open in AI Chat" flow works
+- Used VLM (glm-4.6v) to analyze screenshots and identify styling issues:
+  - Before: landing page rated "generic and unrefined", orange overused, flat buttons, weak typography hierarchy
+  - Studio: muted colors, cramped sidebar, competing panels
+
+Improvements implemented:
+
+1. Database Templates Gallery (NEW FEATURE — dashboard):
+   - Added 8 pre-built templates: E-Commerce, Healthcare, SaaS Billing, Social Media, FinTech, IoT Telemetry, Education, Real Estate
+   - Each card has: gradient icon, title, description, table count, row count, colored accent bar
+   - Clicking a template sends a structured prompt to the AI studio for instant generation
+   - Hover effects: icon scale+rotate, gradient glow, arrow slide
+
+2. Landing page hero enhancement (STYLING):
+   - Added 3 floating animated gradient orbs (amber/red/orange) with different pulse durations (8s/12s/10s) and delays
+   - Creates depth and a modern, dynamic feel behind the existing grid pattern
+
+3. Per-table export dropdown (FEATURE — studio data tab):
+   - Replaced single "Download as JSON" button with a dropdown offering JSON, CSV, and SQL Dump
+   - Works client-side for both synthetic data and live-DB data
+   - Uses the existing exportAsJSON/exportAsCSV/exportAsSQL helpers
+
+Verification:
+- Build passes cleanly (next build succeeds, no errors)
+- VLM re-rated landing page: 8/10 (up from "generic/unrefined")
+- VLM rated dashboard templates gallery: 8/10 ("well-designed, distinct icons, clear labels, consistent layout")
+- Template click correctly navigates to studio with pre-built prompt
+- No console errors during testing
+
+Stage Summary:
+- App is functionally stable: chat, generation, data display, connections all work
+- Added 1 major new feature (templates gallery with 8 templates)
+- Enhanced visual polish (animated hero background, template card design)
+- Added per-table multi-format export
+- All changes pushed to git main (commit 724d4cb)
