@@ -279,6 +279,74 @@ function StudioPageInner({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams])
 
+  // ─── Restore database + conversation history when ?databaseId=... is in the URL ───
+  // When the user navigates to /dashboard/studio?databaseId=<id> (e.g. from the
+  // dashboard's "Open" link on a database card), load the saved schema + data
+  // AND the conversation history so the chat is restored.
+  // BUGFIX: previously the studio only loaded connection mode (?connectionId=)
+  // but never restored a generated database's schema/data/messages on refresh.
+  useEffect(() => {
+    const dbId = searchParams.get('databaseId')
+    if (!dbId || currentDatabaseId === dbId) return
+    let cancelled = false
+
+    const loadDatabase = async () => {
+      try {
+        const result = await apiGet<{
+          database?: {
+            id: string
+            name: string
+            schema_json: SchemaTable[]
+            data_json: Record<string, unknown[]>
+            row_count: number
+            status: string
+          }
+        }>(`/api/databases?id=${dbId}`, { cacheTtl: 0, force: true, timeout: 15000 })
+
+        if (cancelled || !result.database) return
+
+        setCurrentDatabaseId(result.database.id)
+        setDatabaseName(result.database.name)
+        if (Array.isArray(result.database.schema_json) && result.database.schema_json.length > 0) {
+          setGeneratedSchema(result.database.schema_json)
+        }
+        if (result.database.data_json && Object.keys(result.database.data_json).length > 0) {
+          setGeneratedData(result.database.data_json)
+        }
+
+        // Also load the conversation history for this database
+        try {
+          const convResult = await apiGet<{ conversations: Array<{ id: string; title: string; messages: Array<{ role: string; content: string; agent_name: string | null }> }> }>(`/api/conversations?databaseId=${dbId}`, { cacheTtl: 0, force: true, timeout: 15000 })
+          if (cancelled) return
+          const conv = convResult.conversations?.[0]
+          if (conv && conv.messages && conv.messages.length > 0) {
+            setConversationId(conv.id)
+            // Convert the stored messages into the studio's Message format
+            const restoredMessages: Message[] = conv.messages.map((m, i) => ({
+              id: `restored-${i}-${Date.now()}`,
+              role: m.role as 'user' | 'assistant',
+              content: m.content,
+              agentName: m.agent_name || undefined,
+              timestamp: new Date(),
+            }))
+            // Keep the welcome message only if there are no stored messages
+            setMessages(restoredMessages)
+          }
+        } catch {
+          // Conversations are optional — don't fail the whole restore
+        }
+      } catch (err) {
+        if (!cancelled) {
+          console.warn('[Studio] Failed to restore database:', err)
+        }
+      }
+    }
+
+    loadDatabase()
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams])
+
   // Auto-select first table
   useEffect(() => {
     const tableNames = Object.keys(generatedData)
@@ -1672,7 +1740,7 @@ function StudioPageInner({
               <p className="text-[9px] text-muted-foreground truncate">
                 {isLiveDbMode
                   ? `LIVE ${activeConnectionDialect || 'postgres'} · CRUD mode`
-                  : 'SynthForge Multi-Agent · streaming'}
+                  : 'DeepSeek v4 · streaming'}
               </p>
             </div>
           </div>

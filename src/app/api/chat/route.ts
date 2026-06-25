@@ -1,5 +1,13 @@
 import { NextRequest } from 'next/server'
-import ZAI from 'z-ai-web-dev-sdk'
+
+// ─── DeepSeek v4 API configuration ───
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
+const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'
+const DEEPSEEK_REASONING_MODEL = process.env.DEEPSEEK_REASONING_MODEL || DEEPSEEK_MODEL
+const DEEPSEEK_MAX_TOKENS = parseInt(process.env.DEEPSEEK_MAX_TOKENS || '16000', 10)
+const DEEPSEEK_THINKING_ENABLED = process.env.DEEPSEEK_THINKING_ENABLED === 'true'
+const STREAM_THINKING_CONTENT = process.env.STREAM_THINKING_CONTENT === 'true'
 
 // ─── Rate limiter ───
 const chatRateLimiter = new Map<string, { count: number; resetAt: number }>()
@@ -133,15 +141,6 @@ You coordinate between sub-agents:
 - Quality Analyst: Validates data quality and consistency
 - Privacy Officer: Ensures privacy compliance (no real PII, GDPR/CCPA-safe)`
 
-// Reuse the ZAI instance across requests (the SDK initializes config from /etc/.z-ai-config)
-let zaiInstancePromise: Promise<unknown> | null = null
-async function getZai() {
-  if (!zaiInstancePromise) {
-    zaiInstancePromise = ZAI.create()
-  }
-  return zaiInstancePromise
-}
-
 /**
  * Sanitize AI output: unwrap JSON control signals that the model may have
  * wrapped in markdown code fences (```json ... ```). The frontend parser
@@ -154,12 +153,8 @@ async function getZai() {
  * left untouched.
  */
 function sanitizeAISignals(content: string): string {
-  // Match ```json ... ``` or ``` ... ``` blocks that contain ONLY a JSON signal
-  // (possibly with surrounding whitespace). We use a non-greedy match and then
-  // validate the inner content.
   return content.replace(/```(?:json)?\s*\n?([\s\S]*?)\n?```/g, (full, inner: string) => {
     const trimmed = inner.trim()
-    // Detect signal JSON objects by their opening markers
     const isSignal =
       trimmed.startsWith('{"type":"agent_status"') ||
       trimmed.startsWith('{"type": "agent_status"') ||
@@ -169,25 +164,19 @@ function sanitizeAISignals(content: string): string {
       trimmed.startsWith('{"action": "BEGIN_GENERATION"')
 
     if (!isSignal) {
-      // Not a signal — keep the original code block (e.g. SQL)
       return full
     }
 
-    // The inner content might contain MULTIPLE signal objects separated by
-    // whitespace or stray "json" text (some models emit ```json\n{...}\njson\n{...}```).
-    // Split on lines and re-emit each signal on its own line.
     const lines = trimmed.split(/\n/).filter(l => l.trim() && l.trim() !== 'json')
     const signals: string[] = []
     for (const line of lines) {
       const lt = line.trim()
-      // Only keep lines that look like a complete JSON signal object
       if (lt.startsWith('{') && lt.endsWith('}')) {
         signals.push(lt)
       }
     }
 
     if (signals.length === 0) return full
-    // Re-emit as inline signals separated by newlines (no code fence)
     return '\n' + signals.join('\n') + '\n'
   })
 }
@@ -241,6 +230,13 @@ export async function POST(request: NextRequest) {
     if (!message || typeof message !== 'string') {
       return new Response(JSON.stringify({ error: 'Message is required' }), {
         status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    if (!DEEPSEEK_API_KEY) {
+      return new Response(JSON.stringify({ error: 'DeepSeek API key not configured' }), {
+        status: 503,
         headers: { 'Content-Type': 'application/json' },
       })
     }
@@ -376,67 +372,68 @@ You are an autonomous agent. When given a complex task:
 
     messages.push({ role: 'user', content: message })
 
-    // Call z-ai-web-dev-sdk (non-streaming), then simulate streaming via SSE
-    const zai = (await getZai()) as {
-      chat: {
-        completions: {
-          create: (body: {
-            messages: ChatMessage[]
-            thinking?: { type: 'enabled' | 'disabled' }
-            stream?: boolean
-          }) => Promise<{
-            choices?: Array<{
-              message?: { content?: string; reasoning_content?: string }
-              finish_reason?: string
-            }>
-            usage?: unknown
-          }>
-        }
-      }
+    // ─── Call DeepSeek API with TRUE streaming ───
+    // Use the reasoning model if thinking is enabled, else the standard model.
+    const model = DEEPSEEK_THINKING_ENABLED ? DEEPSEEK_REASONING_MODEL : DEEPSEEK_MODEL
+
+    const deepseekBody: Record<string, unknown> = {
+      model,
+      messages,
+      stream: true,
+      max_tokens: DEEPSEEK_MAX_TOKENS,
+      stream_options: { include_usage: true },
     }
 
-    let completion
-    try {
-      completion = await zai.chat.completions.create({
-        messages,
-        thinking: { type: 'disabled' },
-      })
-    } catch (err) {
-      console.error('[Chat API] ZAI error:', err)
+    // DeepSeek v4 supports reasoning/thinking via the "thinking" field
+    if (DEEPSEEK_THINKING_ENABLED) {
+      deepseekBody.thinking = { type: 'enabled' }
+    }
+
+    const deepseekResponse = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+      },
+      body: JSON.stringify(deepseekBody),
+    })
+
+    if (!deepseekResponse.ok) {
+      const errorText = await deepseekResponse.text().catch(() => 'Unknown error')
+      console.error('[Chat API] DeepSeek error:', deepseekResponse.status, errorText)
       return new Response(JSON.stringify({
         error: 'AI service error',
         content: 'I encountered an error connecting to the AI service. Please try again.',
       }), {
-        status: 502,
+        status: deepseekResponse.status,
         headers: { 'Content-Type': 'application/json' },
       })
     }
 
-    const fullContent = sanitizeAISignals(completion.choices?.[0]?.message?.content || '')
-    const reasoning = completion.choices?.[0]?.message?.reasoning_content || ''
-    const finishReason = completion.choices?.[0]?.finish_reason || 'stop'
-    const usage = completion.usage || null
-
-    if (!fullContent) {
-      return new Response(JSON.stringify({
-        error: 'Empty AI response',
-        content: 'The AI returned an empty response. Please try rephrasing your request.',
-      }), {
-        status: 502,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    }
-
-    // ─── Stream the response back to the client via SSE ───
-    // The z-ai-web-dev-sdk returns the full completion at once, so we simulate
-    // a token-by-token stream by chunking the content. This preserves the
-    // frontend's streaming UX (progressive rendering, cancel support) without
-    // requiring a true streaming upstream.
+    // ─── Stream the response back to the client using SSE ───
+    // DeepSeek returns a true SSE stream, so we pipe it through, parsing each
+    // `data:` line and re-emitting normalized SSE events for the frontend.
     const encoder = new TextEncoder()
+    const reader = deepseekResponse.body?.getReader()
+
+    if (!reader) {
+      return new Response(JSON.stringify({ error: 'No response stream' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
 
     const stream = new ReadableStream({
       async start(controller) {
+        const decoder = new TextDecoder()
+        let buffer = ''
         let closed = false
+        let clientCancelled = false
+        // Accumulate content so we can sanitize signals before emitting to the
+        // frontend. We buffer incrementally and emit sanitized chunks.
+        let contentAccumulator = ''
+        let lastEmittedLen = 0
+
         const safeEnqueue = (data: Uint8Array) => {
           if (closed) return
           try {
@@ -446,41 +443,113 @@ You are an autonomous agent. When given a complex task:
           }
         }
 
-        try {
-          // 1. Emit reasoning first (if any) — shown collapsed in the UI
-          if (reasoning) {
-            safeEnqueue(encoder.encode(`data: ${JSON.stringify({
-              type: 'reasoning',
-              content: reasoning,
-            })}\n\n`))
-          }
-
-          // 2. Stream the main content in word-boundary chunks for a natural
-          //    typing effect. Chunk size ~3-6 words keeps the UX responsive
-          //    without overwhelming the SSE channel.
-          const chunks = fullContent.match(/(\S+\s*)/g) || [fullContent]
-          const CHUNK_GROUP = 4 // emit 4 "word+whitespace" tokens per SSE event
-          for (let i = 0; i < chunks.length; i += CHUNK_GROUP) {
-            const piece = chunks.slice(i, i + CHUNK_GROUP).join('')
-            if (piece) {
-              safeEnqueue(encoder.encode(`data: ${JSON.stringify({
-                type: 'content',
-                content: piece,
-              })}\n\n`))
+        // Emit sanitized content delta. We only emit text that is "safe" —
+        // i.e. not part of an in-progress code fence that might be a signal.
+        const flushSafe = () => {
+          if (contentAccumulator.length <= lastEmittedLen) return
+          // Find the last incomplete code fence boundary — anything after it
+          // is "in progress" and shouldn't be emitted yet (it might be a
+          // signal we need to unwrap).
+          const pending = contentAccumulator.slice(lastEmittedLen)
+          // Look for an opening ``` that hasn't been closed
+          const lastOpenFence = pending.lastIndexOf('```')
+          if (lastOpenFence !== -1) {
+            // Check if there's a closing ``` after it
+            const afterOpen = pending.slice(lastOpenFence + 3)
+            const closingFence = afterOpen.indexOf('```')
+            if (closingFence === -1) {
+              // The fence is still open — emit only up to the fence start
+              const safe = pending.slice(0, lastOpenFence)
+              if (safe) {
+                safeEnqueue(encoder.encode(`data: ${JSON.stringify({
+                  type: 'content',
+                  content: safe,
+                })}\n\n`))
+              }
+              lastEmittedLen += lastOpenFence
+              return
             }
-            // Small delay so the UI renders progressively (mimics streaming)
-            await new Promise(r => setTimeout(r, 12))
           }
-
-          // 3. Finish event
+          // No open fence — emit everything
           safeEnqueue(encoder.encode(`data: ${JSON.stringify({
-            type: 'finish',
-            reason: finishReason,
-            usage,
+            type: 'content',
+            content: pending,
           })}\n\n`))
+          lastEmittedLen = contentAccumulator.length
+        }
 
-          // 4. Done sentinel
-          safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`))
+        try {
+          while (true) {
+            if (clientCancelled) break
+            const { done, value } = await reader.read()
+            if (done) break
+
+            buffer += decoder.decode(value, { stream: true })
+            const lines = buffer.split('\n')
+            buffer = lines.pop() || ''
+
+            for (const line of lines) {
+              const trimmed = line.trim()
+              if (!trimmed || !trimmed.startsWith('data: ')) continue
+
+              const data = trimmed.slice(6)
+              if (data === '[DONE]') {
+                // Flush any remaining content, then send done
+                flushSafe()
+                // Also do a final sanitize pass on the full content and
+                // emit a correction if needed (rare — only if signals were
+                // wrapped in code fences)
+                const sanitized = sanitizeAISignals(contentAccumulator)
+                if (sanitized !== contentAccumulator && sanitized.length > lastEmittedLen) {
+                  // Emit the delta of the sanitized version
+                  const delta = sanitized.slice(lastEmittedLen)
+                  if (delta) {
+                    safeEnqueue(encoder.encode(`data: ${JSON.stringify({
+                      type: 'content',
+                      content: delta,
+                    })}\n\n`))
+                  }
+                }
+                safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`))
+                continue
+              }
+
+              try {
+                const parsed = JSON.parse(data)
+                const choice = parsed.choices?.[0]
+                if (!choice) continue
+
+                const delta = choice.delta
+
+                // Handle reasoning content (Chain of Thought)
+                if (delta?.reasoning_content && STREAM_THINKING_CONTENT) {
+                  safeEnqueue(encoder.encode(`data: ${JSON.stringify({
+                    type: 'reasoning',
+                    content: delta.reasoning_content,
+                  })}\n\n`))
+                }
+
+                // Handle main content (answer)
+                if (delta?.content) {
+                  contentAccumulator += delta.content
+                  flushSafe()
+                }
+
+                // Handle finish
+                if (choice.finish_reason) {
+                  // Final flush
+                  flushSafe()
+                  safeEnqueue(encoder.encode(`data: ${JSON.stringify({
+                    type: 'finish',
+                    reason: choice.finish_reason,
+                    usage: parsed.usage || null,
+                  })}\n\n`))
+                }
+              } catch {
+                // Skip unparseable chunks
+              }
+            }
+          }
         } catch (err) {
           console.error('[Chat API] Stream error:', err)
           safeEnqueue(encoder.encode(`data: ${JSON.stringify({
@@ -495,6 +564,19 @@ You are an autonomous agent. When given a complex task:
               // Already closed
             }
           }
+        }
+      },
+      async cancel() {
+        clientCancelled = true
+        try {
+          await reader.cancel()
+        } catch {
+          // Already released
+        }
+        try {
+          await reader.releaseLock()
+        } catch {
+          // Already released
         }
       },
     })
