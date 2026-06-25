@@ -11,6 +11,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import {
@@ -159,10 +160,41 @@ function StudioPageInner({
   const [sqlEditor, setSqlEditor] = useState('')
   const [sqlResults, setSqlResults] = useState<{ rows: Record<string, unknown>[]; columns: string[]; executionTime: number } | null>(null)
   const [sqlExecuting, setSqlExecuting] = useState(false)
-  const [queryHistory, setQueryHistory] = useState<string[]>([])
-  const [savedQueries, setSavedQueries] = useState<Array<{ name: string; sql: string }>>([])
+  // Persist query history + saved queries to localStorage so they survive
+  // page reloads. Previously these were in-memory only, so users lost their
+  // saved queries every time they navigated away from the studio.
+  const [queryHistory, setQueryHistory] = useState<string[]>(() => {
+    if (typeof window === 'undefined') return []
+    try {
+      const raw = localStorage.getItem('synthforge_query_history')
+      return raw ? JSON.parse(raw) : []
+    } catch {
+      return []
+    }
+  })
+  const [savedQueries, setSavedQueries] = useState<Array<{ name: string; sql: string }>>(() => {
+    if (typeof window === 'undefined') return []
+    try {
+      const raw = localStorage.getItem('synthforge_saved_queries')
+      return raw ? JSON.parse(raw) : []
+    } catch {
+      return []
+    }
+  })
   const [sqlConfirmOpen, setSqlConfirmOpen] = useState(false)
   const [sqlConfirmQuery, setSqlConfirmQuery] = useState('')
+
+  // Persist query history + saved queries whenever they change
+  useEffect(() => {
+    try {
+      localStorage.setItem('synthforge_query_history', JSON.stringify(queryHistory))
+    } catch { /* localStorage unavailable */ }
+  }, [queryHistory])
+  useEffect(() => {
+    try {
+      localStorage.setItem('synthforge_saved_queries', JSON.stringify(savedQueries))
+    } catch { /* localStorage unavailable */ }
+  }, [savedQueries])
 
   // Explorer state
   const [favoriteTables, setFavoriteTables] = useState<Set<string>>(new Set())
@@ -2581,11 +2613,24 @@ function StudioPageInner({
                       {queryHistory.length === 0 ? (
                         <DropdownMenuItem disabled>No queries yet</DropdownMenuItem>
                       ) : (
-                        queryHistory.map((q, i) => (
-                          <DropdownMenuItem key={i} onClick={() => setSqlEditor(q)}>
-                            <code className="text-[10px] truncate max-w-[280px]">{q}</code>
+                        <>
+                          {queryHistory.map((q, i) => (
+                            <DropdownMenuItem key={i} onClick={() => setSqlEditor(q)}>
+                              <code className="text-[10px] truncate max-w-[260px] flex-1">{q}</code>
+                            </DropdownMenuItem>
+                          ))}
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            className="text-destructive focus:text-destructive"
+                            onClick={() => {
+                              setQueryHistory([])
+                              toast.success('Query history cleared')
+                            }}
+                          >
+                            <Trash2 className="h-3 w-3 mr-2" />
+                            Clear History
                           </DropdownMenuItem>
-                        ))
+                        </>
                       )}
                     </DropdownMenuContent>
                   </DropdownMenu>
@@ -2597,6 +2642,14 @@ function StudioPageInner({
                         variant="ghost"
                         size="sm"
                         className="h-6 text-[10px] gap-0.5"
+                      >
+                        <Save className="h-2.5 w-2.5" />
+                        Saved ({savedQueries.length})
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-80">
+                      <DropdownMenuItem
+                        disabled={!sqlEditor.trim()}
                         onClick={() => {
                           if (sqlEditor.trim()) {
                             const name = prompt('Name this query:')
@@ -2607,19 +2660,29 @@ function StudioPageInner({
                           }
                         }}
                       >
-                        <Save className="h-2.5 w-2.5" />
-                        Save
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end" className="w-80">
+                        <Plus className="h-3 w-3 mr-2" />
+                        Save Current Query
+                      </DropdownMenuItem>
+                      {savedQueries.length > 0 && <DropdownMenuSeparator />}
                       {savedQueries.length === 0 ? (
-                        <DropdownMenuItem disabled>No saved queries</DropdownMenuItem>
+                        <DropdownMenuItem disabled>No saved queries yet</DropdownMenuItem>
                       ) : (
                         savedQueries.map((sq, i) => (
-                          <DropdownMenuItem key={i} onClick={() => setSqlEditor(sq.sql)}>
-                            <span className="text-[10px] font-medium mr-2">{sq.name}</span>
-                            <code className="text-[9px] text-muted-foreground truncate max-w-[200px]">{sq.sql}</code>
-                          </DropdownMenuItem>
+                          <div key={i} className="group flex items-center px-2 py-1.5 hover:bg-accent rounded-sm cursor-pointer" onClick={() => setSqlEditor(sq.sql)}>
+                            <span className="text-[10px] font-medium mr-2 truncate max-w-[100px]">{sq.name}</span>
+                            <code className="text-[9px] text-muted-foreground truncate flex-1 max-w-[140px]">{sq.sql}</code>
+                            <button
+                              className="ml-1 opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 transition-opacity shrink-0"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setSavedQueries(prev => prev.filter((_, idx) => idx !== i))
+                                toast.success(`Deleted "${sq.name}"`)
+                              }}
+                              title="Delete saved query"
+                            >
+                              <X className="h-3 w-3" />
+                            </button>
+                          </div>
                         ))
                       )}
                     </DropdownMenuContent>
