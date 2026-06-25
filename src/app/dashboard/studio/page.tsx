@@ -321,7 +321,6 @@ function StudioPageInner({
 
     loadConnection()
     return () => { cancelled = true }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams])
 
   // ─── Restore database + conversation history when ?databaseId=... is in the URL ───
@@ -389,7 +388,6 @@ function StudioPageInner({
 
     loadDatabase()
     return () => { cancelled = true }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams])
 
   // Auto-select first table
@@ -748,7 +746,6 @@ function StudioPageInner({
                 // block but can quickly click through.
                 // We pass skipConfirm=false so executeSqlBlock shows the
                 // native confirm() dialog.
-                // eslint-disable-next-line no-await-in-loop
                 await executeSqlBlockRef.current(assistantId, block, false)
               }
             }

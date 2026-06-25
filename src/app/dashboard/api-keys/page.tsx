@@ -84,8 +84,8 @@ function formatDate(iso: string): string {
 }
 
 export default function ApiKeysPage() {
-  const [keys, setKeys] = useState<ApiKey[]>([])
-  const [loading, setLoading] = useState(true)
+  const [keys, setKeys] = useState<ApiKey[]>(() => loadKeys())
+  const [loading, setLoading] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
   const [newKeyName, setNewKeyName] = useState('')
   const [creating, setCreating] = useState(false)
@@ -94,11 +94,6 @@ export default function ApiKeysPage() {
   const [visibleKeyIds, setVisibleKeyIds] = useState<Set<string>>(new Set())
   const [deleteId, setDeleteId] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
-
-  useEffect(() => {
-    setKeys(loadKeys())
-    setLoading(false)
-  }, [])
 
   const persistKeys = (updated: ApiKey[]) => {
     setKeys(updated)
