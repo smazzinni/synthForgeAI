@@ -56,7 +56,12 @@ import {
   PlugZap,
   Square,
   RotateCcw,
+  KeyRound,
+  Link2,
+  Layers,
+  MousePointerClick,
 } from 'lucide-react'
+import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
 import { apiPost, apiPatch, apiDelete, apiGet, invalidateCache } from '@/lib/api-client'
 import {
@@ -85,6 +90,9 @@ import {
   extractSqlBlock,
   generateSchemaSQL as generateSchemaSQLHelper,
   computeERLayout as computeERLayoutHelper,
+  getDataColumnKind,
+  humanizeColumnName,
+  columnPlainEnglishHint,
 } from './_lib/utils'
 import { AgentIcon } from './_components/agent-icon'
 import { ShowMoreText } from './_components/show-more-text'
@@ -1625,6 +1633,15 @@ function StudioPageInner({
   // ─── Current table data for display ───
   const currentTableData = selectedTable ? generatedData[selectedTable] || [] : []
   const currentTableColumns = currentTableData.length > 0 ? Object.keys(currentTableData[0] as Record<string, unknown>) : []
+  // Schema for the currently selected table. Lets us show column types and
+  // render the table header even when the table has no rows yet.
+  const currentTableSchema = selectedTable ? generatedSchema.find(t => t.name === selectedTable) : undefined
+  // Columns to render in the table header. Prefer the row-derived order
+  // (matches what the user sees when they edit), fall back to schema order
+  // so the empty-rows state still shows all columns.
+  const headerColumns = currentTableColumns.length > 0
+    ? currentTableColumns
+    : (currentTableSchema?.columns?.map(c => c.name) || [])
   const displayedRows = currentTableData.slice(0, visibleRows)
   const hasMoreRows = currentTableData.length > visibleRows
 
@@ -1655,7 +1672,7 @@ function StudioPageInner({
               <p className="text-[9px] text-muted-foreground truncate">
                 {isLiveDbMode
                   ? `LIVE ${activeConnectionDialect || 'postgres'} · CRUD mode`
-                  : 'DeepSeek Reasoner'}
+                  : 'SynthForge Multi-Agent · streaming'}
               </p>
             </div>
           </div>
@@ -2017,9 +2034,12 @@ function StudioPageInner({
             <TabsContent value="data" className="flex-1 overflow-hidden m-0">
               <div className="flex h-full">
                 {/* Table selector sidebar */}
-                <div className="w-40 border-r bg-muted/30 flex flex-col shrink-0">
+                <div className="w-44 border-r bg-muted/30 flex flex-col shrink-0">
                   <div className="px-2 py-1.5 border-b flex items-center justify-between">
-                    <p className="text-[9px] font-semibold text-muted-foreground uppercase tracking-wider">Tables</p>
+                    <div className="flex items-center gap-1 text-muted-foreground">
+                      <Layers className="h-3 w-3" />
+                      <span className="text-[10px] font-semibold uppercase tracking-wider">Tables</span>
+                    </div>
                     <div className="flex items-center gap-0.5">
                       {isLiveDbMode && (
                         <Button
@@ -2081,17 +2101,60 @@ function StudioPageInner({
 
                 {/* Data grid */}
                 <div className="flex-1 flex flex-col min-w-0">
-                  {selectedTable && currentTableData.length > 0 ? (
-                    <>
-                      <div className="px-2.5 py-1.5 border-b flex items-center justify-between shrink-0">
-                        <div className="flex items-center gap-1.5">
-                          <Table2 className="h-3 w-3 text-amber-600" />
-                          <span className="text-xs font-medium">{selectedTable}</span>
-                          <Badge variant="outline" className="text-[9px]">
-                            {currentTableData.length} rows
-                          </Badge>
+                  {!selectedTable ? (
+                    // ─── Empty state 1: no table selected ───
+                    <div className="flex-1 flex items-center justify-center p-4">
+                      <div className="text-center max-w-sm">
+                        <div className="mx-auto mb-3 h-10 w-10 rounded-full bg-primary/10 flex items-center justify-center">
+                          <Database className="h-5 w-5 text-primary" />
                         </div>
-                        <div className="flex items-center gap-0.5">
+                        <p className="text-sm font-medium text-foreground">Pick a table on the left</p>
+                        <p className="mt-1 text-[11px] text-muted-foreground">
+                          Tables you generate or import will appear in the sidebar. Column headers are tinted so you can spot relationships at a glance:
+                        </p>
+                        <div className="mt-3 flex items-center justify-center gap-1.5 text-[10px]">
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-primary/40 bg-primary/10 text-primary">
+                            <KeyRound className="h-2.5 w-2.5" />PK
+                          </span>
+                          <span className="text-muted-foreground">primary key</span>
+                          <span className="mx-0.5 text-muted-foreground/50">·</span>
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-400">
+                            <Link2 className="h-2.5 w-2.5" />FK
+                          </span>
+                          <span className="text-muted-foreground">foreign key</span>
+                        </div>
+                      </div>
+                    </div>
+                  ) : headerColumns.length === 0 ? (
+                    // ─── Empty state 2: table selected but no columns yet ───
+                    <div className="flex-1 flex items-center justify-center p-4">
+                      <div className="text-center max-w-sm">
+                        <div className="mx-auto mb-3 h-10 w-10 rounded-full bg-muted flex items-center justify-center">
+                          <Table2 className="h-5 w-5 text-muted-foreground" />
+                        </div>
+                        <p className="text-sm font-medium text-foreground">No columns in this table yet</p>
+                        <p className="mt-1 text-[11px] text-muted-foreground mb-3">
+                          Add a column to start building out the schema for &ldquo;{selectedTable}&rdquo;.
+                        </p>
+                        <Button variant="outline" size="sm" className="h-7 text-[11px] gap-1" onClick={() => setAddColumnDialogOpen(true)}>
+                          <Plus className="h-3 w-3" />Add Column
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    // ─── Table selected with columns (may have 0 rows) ───
+                    <>
+                      <div className="px-2.5 py-1.5 border-b flex items-center justify-between shrink-0 gap-2">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <Table2 className="h-3.5 w-3.5 text-amber-600 shrink-0" />
+                          <div className="flex flex-col min-w-0 leading-tight">
+                            <span className="text-xs font-semibold truncate">{selectedTable}</span>
+                            <Badge variant="outline" className="text-[9px] px-1 py-0 h-3.5 w-fit">
+                              {currentTableData.length} row{currentTableData.length === 1 ? '' : 's'}
+                            </Badge>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-0.5 shrink-0">
                           <Button variant="ghost" size="sm" className="h-5 text-[9px] gap-0.5 px-1" onClick={handleAddRow} title="Add Row">
                             <Plus className="h-2.5 w-2.5" />Row
                           </Button>
@@ -2103,19 +2166,23 @@ function StudioPageInner({
                               <Trash2 className="h-2.5 w-2.5" />Del
                             </Button>
                           )}
-                          <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => copyToClipboard(JSON.stringify(currentTableData, null, 2))}>
+                          <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => copyToClipboard(JSON.stringify(currentTableData, null, 2))} title="Copy as JSON">
                             <Copy className="h-2.5 w-2.5" />
                           </Button>
-                          <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => exportAsJSON(currentTableData, `${selectedTable}.json`)}>
+                          <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => exportAsJSON(currentTableData, `${selectedTable}.json`)} title="Download as JSON">
                             <Download className="h-2.5 w-2.5" />
                           </Button>
+                          <span className="hidden sm:inline-flex items-center gap-1 text-[9px] text-muted-foreground/80 border border-border rounded px-1.5 py-0.5 bg-muted/30 ml-1" title="Double-click any cell to edit it in place">
+                            <MousePointerClick className="h-2.5 w-2.5" />
+                            Double-click a cell to edit
+                          </span>
                         </div>
                       </div>
                       <div className="flex-1 overflow-auto">
                         <table className="w-full text-[11px] border-collapse">
                           <thead className="sticky top-0 z-10 bg-background">
                             <tr className="border-b">
-                              <th className="text-left py-1.5 px-1 font-medium text-muted-foreground bg-muted/50 border-r w-6">
+                              <th className="text-left py-1.5 px-1 font-medium text-muted-foreground bg-muted/50 border-r border-b border-border w-6">
                                 <input
                                   type="checkbox"
                                   className="h-3 w-3"
@@ -2129,79 +2196,130 @@ function StudioPageInner({
                                   }}
                                 />
                               </th>
-                              <th className="text-left py-1.5 px-2 font-medium text-muted-foreground bg-muted/50 border-r w-8">#</th>
-                              {currentTableColumns.map((col) => (
-                                <th key={col} className="text-left py-1.5 px-2 font-medium text-muted-foreground bg-muted/50 whitespace-nowrap border-r last:border-r-0 min-w-[90px]">
-                                  <div className="flex items-center gap-1">
-                                    <span className="font-mono text-[10px]">{col}</span>
-                                    {generatedSchema
-                                      .find(t => t.name === selectedTable)
-                                      ?.columns.find(c => c.name === col) && (
-                                      <Badge variant="secondary" className="text-[7px] px-0.5 py-0 font-mono">
-                                        {generatedSchema.find(t => t.name === selectedTable)?.columns.find(c => c.name === col)?.type}
-                                      </Badge>
+                              <th className="text-left py-1.5 px-2 font-medium text-muted-foreground bg-muted/50 border-r border-b border-border w-8">#</th>
+                              {headerColumns.map((col) => {
+                                const kind = getDataColumnKind(col)
+                                const colType = currentTableSchema?.columns.find(c => c.name === col)?.type
+                                const hint = columnPlainEnglishHint(col)
+                                return (
+                                  <th
+                                    key={col}
+                                    className={cn(
+                                      'text-left align-top py-1.5 px-2 font-medium whitespace-nowrap border-r last:border-r-0 min-w-[104px]',
+                                      kind === 'pk' && 'bg-primary/10 border-b-2 border-b-primary',
+                                      kind === 'fk' && 'bg-sky-500/10 dark:bg-sky-950/35 border-b-2 border-b-sky-500/55',
+                                      kind === 'regular' && 'bg-muted/40 border-b border-border',
                                     )}
-                                  </div>
-                                </th>
-                              ))}
+                                  >
+                                    <div className="flex flex-col gap-0.5">
+                                      <div className="flex items-center gap-1">
+                                        {kind === 'pk' && (
+                                          <Badge variant="outline" className="text-[7px] px-1 py-0 h-3.5 gap-0.5 border-primary/40 bg-primary/10 text-primary shrink-0">
+                                            <KeyRound className="h-2 w-2" />PK
+                                          </Badge>
+                                        )}
+                                        {kind === 'fk' && (
+                                          <Badge variant="outline" className="text-[7px] px-1 py-0 h-3.5 gap-0.5 border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-400 shrink-0">
+                                            <Link2 className="h-2 w-2" />FK
+                                          </Badge>
+                                        )}
+                                        <span className="text-[11px] font-semibold text-foreground">{humanizeColumnName(col)}</span>
+                                      </div>
+                                      <div className="flex items-center gap-1">
+                                        <span className="font-mono text-[9px] text-muted-foreground">{col}</span>
+                                        {colType && (
+                                          <Badge variant="outline" className="text-[7px] px-0.5 py-0 h-3 font-mono">
+                                            {colType}
+                                          </Badge>
+                                        )}
+                                      </div>
+                                      {hint && (
+                                        <p className="text-[8px] text-muted-foreground/80 leading-tight">{hint}</p>
+                                      )}
+                                    </div>
+                                  </th>
+                                )
+                              })}
                             </tr>
                           </thead>
                           <tbody>
-                            {displayedRows.map((row, i) => (
-                              <tr key={i} className={`border-b hover:bg-muted/30 transition-colors ${selectedRows.has(i) ? 'bg-amber-50 dark:bg-amber-950/20' : ''}`}>
-                                <td className="py-1 px-1 border-r bg-muted/20">
-                                  <input
-                                    type="checkbox"
-                                    className="h-3 w-3"
-                                    checked={selectedRows.has(i)}
-                                    onChange={(e) => {
-                                      setSelectedRows(prev => {
-                                        const next = new Set(prev)
-                                        if (e.target.checked) next.add(i)
-                                        else next.delete(i)
-                                        return next
-                                      })
-                                    }}
-                                  />
+                            {displayedRows.length === 0 ? (
+                              // ─── Empty state 3: table selected, columns exist, no rows ───
+                              <tr>
+                                <td colSpan={headerColumns.length + 2} className="py-6 text-center text-xs text-muted-foreground italic">
+                                  No rows yet. Click <span className="font-semibold not-italic text-foreground">Row</span> above to add one.
                                 </td>
-                                <td className="py-1 px-2 text-muted-foreground font-mono text-[9px] border-r bg-muted/20">
-                                  {i + 1}
-                                </td>
-                                {Object.entries(row as Record<string, unknown>).map(([colName, val], j) => (
-                                  <td key={j} className="py-1 px-2 font-mono text-[10px] whitespace-nowrap max-w-[180px] truncate border-r last:border-r-0"
-                                    onDoubleClick={() => {
-                                      setEditingCell({ row: i, col: colName })
-                                      setEditingCellValue(val === null ? '' : String(val))
-                                    }}
-                                  >
-                                    {editingCell?.row === i && editingCell?.col === colName ? (
-                                      <input
-                                        type="text"
-                                        className="w-full h-5 text-[10px] font-mono px-1 border border-amber-400 rounded bg-background focus:outline-none"
-                                        value={editingCellValue}
-                                        autoFocus
-                                        onChange={(e) => setEditingCellValue(e.target.value)}
-                                        onBlur={() => handleCellEdit(i, colName, editingCellValue)}
-                                        onKeyDown={(e) => {
-                                          if (e.key === 'Enter') handleCellEdit(i, colName, editingCellValue)
-                                          if (e.key === 'Escape') setEditingCell(null)
-                                        }}
-                                      />
-                                    ) : val === null ? (
-                                      <span className="text-muted-foreground italic">NULL</span>
-                                    ) : typeof val === 'boolean' ? (
-                                      <Badge variant={val ? 'default' : 'secondary'} className="text-[8px] px-1 py-0">
-                                        {String(val)}
-                                      </Badge>
-                                    ) : typeof val === 'number' ? (
-                                      <span className="text-blue-600 dark:text-blue-400">{String(val)}</span>
-                                    ) : (
-                                      String(val ?? '')
-                                    )}
-                                  </td>
-                                ))}
                               </tr>
-                            ))}
+                            ) : (
+                              displayedRows.map((row, i) => (
+                                <tr key={i} className={cn(
+                                  'border-b hover:bg-muted/30 transition-colors',
+                                  selectedRows.has(i) && 'bg-amber-50 dark:bg-amber-950/20',
+                                )}>
+                                  <td className="py-1 px-1 border-r bg-muted/20">
+                                    <input
+                                      type="checkbox"
+                                      className="h-3 w-3"
+                                      checked={selectedRows.has(i)}
+                                      onChange={(e) => {
+                                        setSelectedRows(prev => {
+                                          const next = new Set(prev)
+                                          if (e.target.checked) next.add(i)
+                                          else next.delete(i)
+                                          return next
+                                        })
+                                      }}
+                                    />
+                                  </td>
+                                  <td className="py-1 px-2 text-muted-foreground font-mono text-[9px] border-r bg-muted/20">
+                                    {i + 1}
+                                  </td>
+                                  {currentTableColumns.map((colName) => {
+                                    const val = (row as Record<string, unknown>)[colName]
+                                    const kind = getDataColumnKind(colName)
+                                    return (
+                                      <td
+                                        key={colName}
+                                        className={cn(
+                                          'py-1 px-2 font-mono text-[10px] whitespace-nowrap max-w-[180px] truncate border-r last:border-r-0',
+                                          kind === 'pk' && 'bg-primary/[0.07]',
+                                          kind === 'fk' && 'bg-sky-500/[0.08] dark:bg-sky-950/25',
+                                        )}
+                                        onDoubleClick={() => {
+                                          setEditingCell({ row: i, col: colName })
+                                          setEditingCellValue(val === null ? '' : String(val))
+                                        }}
+                                      >
+                                        {editingCell?.row === i && editingCell?.col === colName ? (
+                                          <input
+                                            type="text"
+                                            className="w-full h-5 text-[10px] font-mono px-1 border border-amber-400 rounded bg-background focus:outline-none"
+                                            value={editingCellValue}
+                                            autoFocus
+                                            onChange={(e) => setEditingCellValue(e.target.value)}
+                                            onBlur={() => handleCellEdit(i, colName, editingCellValue)}
+                                            onKeyDown={(e) => {
+                                              if (e.key === 'Enter') handleCellEdit(i, colName, editingCellValue)
+                                              if (e.key === 'Escape') setEditingCell(null)
+                                            }}
+                                          />
+                                        ) : val === null ? (
+                                          <span className="text-muted-foreground italic">NULL</span>
+                                        ) : typeof val === 'boolean' ? (
+                                          <Badge variant={val ? 'default' : 'secondary'} className="text-[8px] px-1 py-0">
+                                            {String(val)}
+                                          </Badge>
+                                        ) : typeof val === 'number' ? (
+                                          <span className="text-blue-600 dark:text-blue-400">{String(val)}</span>
+                                        ) : (
+                                          String(val ?? '')
+                                        )}
+                                      </td>
+                                    )
+                                  })}
+                                </tr>
+                              ))
+                            )}
                           </tbody>
                         </table>
                       </div>
@@ -2219,10 +2337,6 @@ function StudioPageInner({
                         </div>
                       )}
                     </>
-                  ) : (
-                    <div className="flex-1 flex items-center justify-center text-muted-foreground">
-                      <p className="text-xs">Select a table to view data</p>
-                    </div>
                   )}
                 </div>
               </div>

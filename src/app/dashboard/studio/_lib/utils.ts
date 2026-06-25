@@ -5,6 +5,121 @@
 import { cleanDisplayText } from '@/lib/ai-agents'
 import type { SchemaTable } from './types'
 
+// ─── Data-grid column helpers (ported from Eram branch) ───
+// These power the PK/FK-tinted column headers in the Data tab.
+
+/**
+ * Classify a column name as a primary key, foreign key, or regular column.
+ *  - 'id' (exact) → 'pk'
+ *  - ends with '_id' (and not 'id') → 'fk'
+ *  - everything else → 'regular'
+ */
+export function getDataColumnKind(columnName: string): 'pk' | 'fk' | 'regular' {
+  if (columnName === 'id') return 'pk'
+  if (columnName.endsWith('_id')) return 'fk'
+  return 'regular'
+}
+
+/**
+ * Convert a snake_case column name to a human-friendly Title Case label.
+ * Also handles a few common acronyms (id → ID, url → URL, sku → SKU).
+ *
+ *   humanizeColumnName('user_id')    // "User ID"
+ *   humanizeColumnName('created_at') // "Created At"
+ *   humanizeColumnName('email')      // "Email"
+ *   humanizeColumnName('sku')        // "SKU"
+ */
+export function humanizeColumnName(name: string): string {
+  if (!name) return ''
+  const exact: Record<string, string> = {
+    id: 'ID',
+    url: 'URL',
+    urls: 'URLs',
+    sku: 'SKU',
+    skus: 'SKUs',
+    uuid: 'UUID',
+    ip: 'IP',
+    api: 'API',
+    html: 'HTML',
+    json: 'JSON',
+    sql: 'SQL',
+    ssl: 'SSL',
+  }
+  return name
+    .split('_')
+    .map(part => {
+      const lower = part.toLowerCase()
+      if (exact[lower]) return exact[lower]
+      if (!part) return ''
+      return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()
+    })
+    .filter(Boolean)
+    .join(' ')
+}
+
+/**
+ * Return a short plain-English description for common columns.
+ * Returns '' for unknown columns so the UI can omit the hint cleanly.
+ *
+ *   columnPlainEnglishHint('id')         // "Unique identifier"
+ *   columnPlainEnglishHint('created_at') // "When this row was created"
+ *   columnPlainEnglishHint('user_id')    // "Points to another table"
+ */
+export function columnPlainEnglishHint(name: string): string {
+  if (!name) return ''
+  const exact: Record<string, string> = {
+    id: 'Unique identifier',
+    created_at: 'When this row was created',
+    updated_at: 'Last modification time',
+    deleted_at: 'Soft-delete timestamp',
+    email: 'Contact email address',
+    phone: 'Phone number',
+    name: 'Display name',
+    first_name: 'Given name',
+    last_name: 'Family name',
+    full_name: 'Full name',
+    username: 'Unique handle',
+    password: 'Hashed password',
+    status: 'Current state',
+    role: 'Authorization role',
+    is_active: 'Active flag',
+    is_admin: 'Admin flag',
+    description: 'Long-form description',
+    notes: 'Internal notes',
+    title: 'Title or heading',
+    price: 'Monetary value',
+    amount: 'Monetary value',
+    total: 'Monetary total',
+    quantity: 'Number of items',
+    count: 'Number of items',
+    currency: 'Currency code',
+    address: 'Street address',
+    city: 'City',
+    state: 'State / province',
+    country: 'Country',
+    zip: 'Postal code',
+    postal_code: 'Postal code',
+    latitude: 'Latitude',
+    longitude: 'Longitude',
+    avatar_url: 'Avatar image URL',
+    image_url: 'Image URL',
+    website: 'Website URL',
+    url: 'Web URL',
+    token: 'Opaque token',
+    api_key: 'API key',
+    expires_at: 'When this expires',
+    started_at: 'When this started',
+    ended_at: 'When this ended',
+  }
+  if (exact[name]) return exact[name]
+  if (name.endsWith('_id')) return 'Points to another table'
+  if (name.endsWith('_at')) return 'Timestamp'
+  if (name.endsWith('_date') || name.endsWith('_time')) return 'Date / time'
+  if (name.startsWith('is_')) return 'True / false flag'
+  if (name.endsWith('_url')) return 'Resource URL'
+  return ''
+}
+
 // ─── Export helpers (client-side) ───
 
 export function exportAsCSV(data: Record<string, unknown>[], filename: string) {

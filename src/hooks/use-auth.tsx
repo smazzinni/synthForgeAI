@@ -45,8 +45,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const supabase = getSupabaseBrowserClient()
 
     if (!supabase) {
-      // No Supabase client - run without auth
-      setLoading(false)
+      // No Supabase client - run without auth. Defer the setState so we don't
+      // trigger a synchronous re-render inside the effect body (React 19 lint).
+      queueMicrotask(() => setLoading(false))
       return
     }
 

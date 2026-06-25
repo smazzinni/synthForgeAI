@@ -1,14 +1,22 @@
 import { NextRequest } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import ZAI from 'z-ai-web-dev-sdk'
 
 // ─── Streaming Database Generation API ───
 // Receives a generation signal (schema + row counts + instructions),
 // calls the AI to produce NDJSON records, parses them line-by-line,
 // batch-inserts into the database, and streams SSE progress to the frontend.
 
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
-const DEEPSEEK_API_URL = process.env.DEEPSEEK_API_URL || 'https://api.deepseek.com'
 const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
+
+// Reuse the ZAI instance across requests
+let zaiInstancePromise: Promise<unknown> | null = null
+async function getZai() {
+  if (!zaiInstancePromise) {
+    zaiInstancePromise = ZAI.create()
+  }
+  return zaiInstancePromise
+}
 
 const BATCH_SIZE = 200          // rows per batch insert
 const FLUSH_INTERVAL_MS = 300   // flush batch at least every 300ms
@@ -136,13 +144,6 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    if (!DEEPSEEK_API_KEY) {
-      return new Response(JSON.stringify({ error: 'DeepSeek API key not configured' }), {
-        status: 503,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    }
-
     const userId = getUserIdFromCookies(request) || body.userId || DEFAULT_USER_ID
     const startTime = Date.now()
 
@@ -202,41 +203,45 @@ export async function POST(request: NextRequest) {
       content: `Generate the data now. ${totalRows} total rows across ${body.schema.length} tables. Begin with ###TABLE:${body.schema[0]?.name}###`,
     })
 
-    // ─── Call DeepSeek API with streaming ───
-    const deepseekResponse = await fetch(`${DEEPSEEK_API_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'deepseek-reasoner',
-        messages,
-        stream: true,
-        max_tokens: 65536,
-        stream_options: { include_usage: true },
-      }),
-    })
+    // ─── Call z-ai-web-dev-sdk (non-streaming) to generate NDJSON data ───
+    const zai = (await getZai()) as {
+      chat: {
+        completions: {
+          create: (body: {
+            messages: Array<{ role: string; content: string }>
+            thinking?: { type: 'enabled' | 'disabled' }
+            stream?: boolean
+          }) => Promise<{
+            choices?: Array<{ message?: { content?: string }; finish_reason?: string }>
+          }>
+        }
+      }
+    }
 
-    if (!deepseekResponse.ok) {
-      const errorText = await deepseekResponse.text().catch(() => 'Unknown error')
-      console.error('[Generate-Stream] DeepSeek error:', deepseekResponse.status, errorText)
+    let fullContent = ''
+    try {
+      const completion = await zai.chat.completions.create({
+        messages: messages as Array<{ role: string; content: string }>,
+        thinking: { type: 'disabled' },
+      })
+      fullContent = completion.choices?.[0]?.message?.content || ''
+    } catch (err) {
+      console.error('[Generate-Stream] ZAI error:', err)
       return new Response(JSON.stringify({ error: 'AI service error' }), {
-        status: deepseekResponse.status,
+        status: 502,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    if (!fullContent) {
+      return new Response(JSON.stringify({ error: 'AI returned empty response' }), {
+        status: 502,
         headers: { 'Content-Type': 'application/json' },
       })
     }
 
     // ─── Set up SSE stream ───
     const encoder = new TextEncoder()
-    const reader = deepseekResponse.body?.getReader()
-
-    if (!reader) {
-      return new Response(JSON.stringify({ error: 'No response stream' }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    }
 
     // ─── Data accumulation state ───
     const allTableData: Record<string, unknown[]> = {}
@@ -293,19 +298,17 @@ export async function POST(request: NextRequest) {
     }
 
     // ─── Create the SSE ReadableStream ───
+    // `clientCancelled` lives in the outer scope so the cancel() handler can
+    // signal the start() loop to stop processing.
+    let clientCancelled = false
     const stream = new ReadableStream({
       async start(controller) {
-        const decoder = new TextDecoder()
-        let aiBuffer = ''
-        let contentBuffer = ''    // accumulated AI content (non-reasoning)
-        let closed = false
-
         const safeEnqueue = (data: Uint8Array) => {
-          if (closed) return
+          if (clientCancelled) return
           try {
             controller.enqueue(data)
           } catch {
-            closed = true
+            // controller already closed
           }
         }
 
@@ -325,122 +328,90 @@ export async function POST(request: NextRequest) {
         }
 
         try {
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
+          // Process the full NDJSON content line-by-line. Since z-ai-web-dev-sdk
+          // returns the whole response at once, we iterate synchronously and
+          // emit SSE progress events as we go (with small yields so the SSE
+          // channel flushes to the client progressively).
+          const contentLines = fullContent.split('\n')
 
-            aiBuffer += decoder.decode(value, { stream: true })
-            const aiLines = aiBuffer.split('\n')
-            aiBuffer = aiLines.pop() || ''
+          for (const contentLine of contentLines) {
+            if (clientCancelled) break
+            const line = contentLine.trim()
+            if (!line) continue
 
-            for (const aiLine of aiLines) {
-              const trimmed = aiLine.trim()
-              if (!trimmed || !trimmed.startsWith('data: ')) continue
+            // Check for table marker
+            const tableMarker = line.match(/^###TABLE:(.+?)###$/)
+            if (tableMarker) {
+              // Flush any pending records for the previous table
+              if (insertQueue.length > 0 && currentTable) {
+                await flushBatch(currentTable, insertQueue.splice(0))
+                safeEnqueue(sendSSE({
+                  type: 'progress',
+                  table: currentTable,
+                  rowsInserted: currentTableInserted,
+                  totalInserted,
+                  targetRows: body.rowCounts[currentTable] || 0,
+                }))
+              }
 
-              const aiData = trimmed.slice(6)
-              if (aiData === '[DONE]') continue
+              // Switch to new table
+              currentTable = tableMarker[1]
+              currentTableInserted = (allTableData[currentTable]?.length) || 0
+              safeEnqueue(sendSSE({
+                type: 'progress',
+                table: currentTable,
+                rowsInserted: 0,
+                totalInserted,
+                targetRows: body.rowCounts[currentTable] || 0,
+                message: `Streaming records into [${currentTable}]`,
+              }))
+              continue
+            }
 
+            // Try to parse as NDJSON record
+            if (currentTable) {
               try {
-                const parsed = JSON.parse(aiData)
-                const choice = parsed.choices?.[0]
-                if (!choice) continue
+                const record = JSON.parse(line)
+                if (typeof record === 'object' && record !== null && !Array.isArray(record)) {
+                  insertQueue.push(record)
 
-                const delta = choice.delta
-
-                // Only process the main content (skip reasoning)
-                if (delta?.content) {
-                  contentBuffer += delta.content
-
-                  // Process the content buffer line by line for NDJSON
-                  const contentLines = contentBuffer.split('\n')
-                  contentBuffer = contentLines.pop() || ''
-
-                  for (const contentLine of contentLines) {
-                    const line = contentLine.trim()
-                    if (!line) continue
-
-                    // Check for table marker
-                    const tableMarker = line.match(/^###TABLE:(.+?)###$/)
-                    if (tableMarker) {
-                      // Flush any pending records for the previous table
-                      if (insertQueue.length > 0 && currentTable) {
-                        await flushBatch(currentTable, insertQueue.splice(0))
-                        safeEnqueue(sendSSE({
-                          type: 'progress',
-                          table: currentTable,
-                          rowsInserted: currentTableInserted,
-                          totalInserted,
-                          targetRows: body.rowCounts[currentTable] || 0,
-                        }))
-                      }
-
-                      // Switch to new table
-                      currentTable = tableMarker[1]
-                      currentTableInserted = (allTableData[currentTable]?.length) || 0
-                      safeEnqueue(sendSSE({
-                        type: 'progress',
-                        table: currentTable,
-                        rowsInserted: 0,
-                        totalInserted,
-                        targetRows: body.rowCounts[currentTable] || 0,
-                        message: `Streaming records into [${currentTable}]`,
-                      }))
-                      continue
-                    }
-
-                    // Try to parse as NDJSON record
-                    if (currentTable) {
-                      try {
-                        const record = JSON.parse(line)
-                        if (typeof record === 'object' && record !== null && !Array.isArray(record)) {
-                          insertQueue.push(record)
-
-                          // Flush if batch is full or interval elapsed
-                          const now = Date.now()
-                          if (insertQueue.length >= BATCH_SIZE || now - lastFlushTime >= FLUSH_INTERVAL_MS) {
-                            await flushBatch(currentTable, insertQueue.splice(0))
-                            lastFlushTime = now
-
-                            safeEnqueue(sendSSE({
-                              type: 'progress',
-                              table: currentTable,
-                              rowsInserted: currentTableInserted,
-                              totalInserted,
-                              targetRows: body.rowCounts[currentTable] || 0,
-                            }))
-                          }
-                        }
-                      } catch {
-                        // Malformed line — skip and continue
-                        malformedLines++
-                        if (malformedLines <= 5) {
-                          console.warn('[Generate-Stream] Malformed NDJSON line:', line.substring(0, 100))
-                        }
-                      }
-                    }
-                  }
-                }
-
-                // Handle finish
-                if (choice.finish_reason) {
-                  // Flush remaining records
-                  if (insertQueue.length > 0 && currentTable) {
+                  // Flush if batch is full or interval elapsed
+                  const now = Date.now()
+                  if (insertQueue.length >= BATCH_SIZE || now - lastFlushTime >= FLUSH_INTERVAL_MS) {
                     await flushBatch(currentTable, insertQueue.splice(0))
-                  }
+                    lastFlushTime = now
 
-                  // Mark current table complete
-                  if (currentTable) {
                     safeEnqueue(sendSSE({
-                      type: 'table_complete',
+                      type: 'progress',
                       table: currentTable,
-                      totalRows: currentTableInserted,
+                      rowsInserted: currentTableInserted,
+                      totalInserted,
+                      targetRows: body.rowCounts[currentTable] || 0,
                     }))
                   }
                 }
               } catch {
-                // Skip unparseable AI chunks
+                // Malformed line — skip and continue
+                malformedLines++
+                if (malformedLines <= 5) {
+                  console.warn('[Generate-Stream] Malformed NDJSON line:', line.substring(0, 100))
+                }
               }
             }
+          }
+
+          // Flush remaining records after processing all lines
+          if (insertQueue.length > 0 && currentTable) {
+            await flushBatch(currentTable, insertQueue.splice(0))
+          }
+
+          // Mark current table complete
+          if (currentTable) {
+            safeEnqueue(sendSSE({
+              type: 'table_complete',
+              table: currentTable,
+              totalRows: currentTableInserted,
+            }))
           }
         } catch (err) {
           console.error('[Generate-Stream] Stream error:', err)
@@ -508,7 +479,7 @@ export async function POST(request: NextRequest) {
             durationMs,
           }))
 
-          if (!closed) {
+          if (!clientCancelled) {
             try {
               controller.close()
             } catch {
@@ -517,19 +488,10 @@ export async function POST(request: NextRequest) {
           }
         }
       },
-      // BUGFIX (BUG-1): cancel the upstream DeepSeek stream when the client
-      // disconnects so tokens don't keep being billed after navigation.
+      // No upstream reader to cancel (z-ai-web-dev-sdk returns synchronously),
+      // but we keep the cancel handler so the client disconnect is clean.
       async cancel() {
-        try {
-          await reader.cancel()
-        } catch {
-          // already released
-        }
-        try {
-          await reader.releaseLock()
-        } catch {
-          // already released
-        }
+        clientCancelled = true
       },
     })
 

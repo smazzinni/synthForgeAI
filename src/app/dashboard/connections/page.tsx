@@ -30,6 +30,8 @@ import {
   AlertCircle,
   Pencil,
   ArrowRight,
+  RefreshCw,
+  Lightbulb,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { apiGet, apiPost, apiPatch, apiDelete, invalidateCache } from '@/lib/api-client'
@@ -55,6 +57,67 @@ interface SafeDbConnection {
 const DEFAULT_PORTS: Record<'postgres' | 'mysql', number> = {
   postgres: 5432,
   mysql: 3306,
+}
+
+// ─── Client-side "how to fix" hint derivation ───
+// Mirrors the server-side explainConnectionError so the actionable hint
+// appears on the connection card (not just in the ephemeral toast).
+function deriveFixHint(conn: SafeDbConnection): string | null {
+  if (conn.status !== 'failed' || !conn.error_message) return null
+  const m = conn.error_message.toLowerCase()
+  const host = conn.host || ''
+
+  // Supabase pooler ENOIDENTIFIER — the #1 issue users hit
+  if (m.includes('enoidentifier') || m.includes('no tenant identifier provided') || (m.includes('external_id') && m.includes('sni_hostname'))) {
+    if (/\.pooler\.supabase\.com$/i.test(host)) {
+      const hasRef = /^postgres\.[a-zA-Z0-9]{10,30}$/.test(conn.username)
+      if (!hasRef) {
+        return `Change the Username from "${conn.username}" to "postgres.<project-ref>" (e.g. postgres.abcdefghijklmnopqrst). Find the project ref in your Supabase dashboard → Project Settings → Database → Connection string (pooling).`
+      }
+      return `Try toggling SSL on, or switch to the direct host "db.<project-ref>.supabase.co" on port 5432 with SSL enabled.`
+    }
+  }
+
+  // DNS / hostname resolution
+  if (m.includes('enotfound') || m.includes('getaddrinfo')) {
+    if (host.endsWith('.supabase.co')) {
+      return `The Supabase project could not be found — it may be paused. Log into your Supabase dashboard to restore it, or use the pooler hostname (aws-0-<region>.pooler.supabase.com).`
+    }
+    return `Hostname "${host}" could not be resolved. Check for typos.`
+  }
+
+  // Connection refused
+  if (m.includes('econnrefused')) {
+    return `Connection refused on ${host}:${conn.port}. The database may not be running, or the port may be blocked. For Supabase, use port 6543 (pooler) or 5432 (direct).`
+  }
+
+  // Timeout
+  if (m.includes('etimedout') || m.includes('timeout')) {
+    return `Connection timed out. The host may be unreachable, or a firewall is blocking port ${conn.port}. For cloud DBs, verify the IP allowlist includes this server's IP.`
+  }
+
+  // Auth failure
+  if (m.includes('password authentication failed') || m.includes('28p01') || m.includes('access denied')) {
+    return `Authentication failed — the username or password is incorrect. Click Edit to update the credentials.`
+  }
+
+  // Database doesn't exist
+  if (m.includes('3d000') || (m.includes('database') && m.includes('does not exist'))) {
+    return `Database "${conn.database}" does not exist on the server. Check the database name.`
+  }
+
+  // SSL
+  if (m.includes('ssl') || m.includes('tls') || m.includes('certificate')) {
+    return `SSL/TLS handshake failed. Try toggling the "Use SSL" option.`
+  }
+
+  return null
+}
+
+// Detect when the user is filling in a Supabase pooler connection so we can
+// show an inline hint in the form.
+function isSupabasePoolerHost(host: string): boolean {
+  return /\.pooler\.supabase\.com$/i.test(host || '')
 }
 
 export default function DatabaseConnectionsPage() {
@@ -221,6 +284,33 @@ export default function DatabaseConnectionsPage() {
     }
   }
 
+  // Re-test an existing connection (PATCH with test=true) without re-entering
+  // credentials. Useful after the user fixes network/credentials issues.
+  const [retesting, setRetesting] = useState<string | null>(null)
+  const handleRetest = async (conn: SafeDbConnection) => {
+    setRetesting(conn.id)
+    try {
+      const result = await apiPatch<{ connection: SafeDbConnection; test?: { ok: boolean; error?: string; hint?: string; latencyMs?: number } }>(`/api/connections/${conn.id}`, { test: true })
+      invalidateCache('/api/connections')
+      if (result.test?.ok) {
+        toast.success(`Connection verified (${result.test.latencyMs ?? 0}ms)`)
+      } else {
+        const errMsg = result.test?.error || 'Unknown error'
+        const hint = result.test?.hint
+        if (hint) {
+          toast.warning(`Test failed: ${errMsg}`, { description: hint, duration: 10000 })
+        } else {
+          toast.warning(`Test failed: ${errMsg}`)
+        }
+      }
+      await loadConnections()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to re-test connection')
+    } finally {
+      setRetesting(null)
+    }
+  }
+
   const handleOpenInStudio = (conn: SafeDbConnection) => {
     // Route to studio with ?connectionId=... so it loads the external DB
     router.push(`/dashboard/studio?connectionId=${conn.id}`)
@@ -368,6 +458,25 @@ export default function DatabaseConnectionsPage() {
                 />
                 Use SSL (recommended for remote DBs)
               </label>
+
+              {/* Inline Supabase pooler hint — catches the ENOIDENTIFIER error
+                  before the user even submits, by detecting a pooler host with
+                  a bare "postgres" username. */}
+              {form.dialect === 'postgres' && isSupabasePoolerHost(form.host) && !/^postgres\.[a-zA-Z0-9]{10,30}$/.test(form.username) && (
+                <div className="rounded-md border border-amber-300 dark:border-amber-800/50 bg-amber-50 dark:bg-amber-950/40 px-3 py-2">
+                  <div className="flex items-start gap-2">
+                    <Lightbulb className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                    <div className="text-xs text-amber-900 dark:text-amber-200 space-y-1">
+                      <p className="font-medium">Supabase pooler detected</p>
+                      <p>
+                        The host <code className="px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 font-mono text-[10px]">{form.host}</code> is a Supabase connection pooler.
+                        The username must be in the format <code className="px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 font-mono text-[10px]">postgres.&lt;project-ref&gt;</code> (e.g. <code className="px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 font-mono text-[10px]">postgres.abcdefghijklmnopqrst</code>).
+                      </p>
+                      <p>Find your project ref in the Supabase dashboard → Project Settings → Database → Connection string (pooling). SSL is required and will be auto-enabled.</p>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
 
             <DialogFooter className="gap-2">
@@ -459,8 +568,10 @@ export default function DatabaseConnectionsPage() {
         </Card>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-          {connections.map((conn) => (
-            <Card key={conn.id} className="hover:shadow-md transition-shadow group">
+          {connections.map((conn) => {
+            const fixHint = deriveFixHint(conn)
+            return (
+            <Card key={conn.id} className={`hover:shadow-md transition-shadow group ${conn.status === 'failed' ? 'border-rose-300 dark:border-rose-900/50' : ''}`}>
               <CardContent className="pt-5">
                 <div className="flex items-start gap-3">
                   <div className={`h-9 w-9 rounded-lg flex items-center justify-center text-white shrink-0 ${
@@ -499,6 +610,17 @@ export default function DatabaseConnectionsPage() {
                         {conn.error_message}
                       </p>
                     )}
+                    {/* Actionable "how to fix" hint — mirrors the server-side hint */}
+                    {fixHint && (
+                      <div className="mt-2 rounded-md border border-amber-200 dark:border-amber-900/40 bg-amber-50 dark:bg-amber-950/30 px-2 py-1.5">
+                        <div className="flex items-start gap-1.5">
+                          <Lightbulb className="h-3 w-3 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                          <p className="text-[10px] text-amber-900 dark:text-amber-200 leading-snug">
+                            {fixHint}
+                          </p>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -514,6 +636,16 @@ export default function DatabaseConnectionsPage() {
                     <MessageSquare className="mr-1 h-3 w-3" />
                     Open in AI Chat
                     <ArrowRight className="ml-1 h-2.5 w-2.5" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 w-7 p-0"
+                    onClick={() => handleRetest(conn)}
+                    disabled={retesting === conn.id}
+                    title="Re-test connection"
+                  >
+                    {retesting === conn.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
                   </Button>
                   <Button
                     variant="ghost"
@@ -537,7 +669,8 @@ export default function DatabaseConnectionsPage() {
                 </div>
               </CardContent>
             </Card>
-          ))}
+            )
+          })}
         </div>
       )}
 

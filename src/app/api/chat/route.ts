@@ -1,8 +1,9 @@
 import { NextRequest } from 'next/server'
+import ZAI from 'z-ai-web-dev-sdk'
 
 // ─── Rate limiter ───
 const chatRateLimiter = new Map<string, { count: number; resetAt: number }>()
-const CHAT_RATE_LIMIT = 20
+const CHAT_RATE_LIMIT = 30
 const CHAT_RATE_WINDOW = 60000
 
 let lastCleanup = Date.now()
@@ -30,10 +31,6 @@ function checkRateLimit(clientId: string): boolean {
   return true
 }
 
-// ─── DeepSeek API streaming ───
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
-const DEEPSEEK_API_URL = process.env.DEEPSEEK_API_URL || 'https://api.deepseek.com'
-
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
   content: string
@@ -45,39 +42,63 @@ const BASE_SYSTEM_PROMPT = `You are **SynthForge AI**, an expert synthetic-data 
 
 1. **Be concise.** Users want data, not essays. Lead with the question or action; explain only when necessary.
 2. **Be deterministic.** When the user gives enough context, generate. Don't ask 5 clarifying questions if 1 will do.
-3. **Show your work.** Use agent_status blocks to make the multi-agent pipeline visible — users enjoy seeing which specialist is active.
-4. **Never dump raw data in chat.** Use the BEGIN_GENERATION signal; the streaming pipeline handles the actual rows.
+3. **Ask SMART questions.** Only ask about dimensions that actually change the data shape (industry, scale, locale, special features). NEVER ask questions whose answers you can reasonably infer. Each question must have a clear purpose.
+4. **Show your work.** Use agent_status blocks to make the multi-agent pipeline visible — users enjoy seeing which specialist is active.
+5. **Never dump raw data in chat.** Use the BEGIN_GENERATION signal; the streaming pipeline handles the actual rows.
+
+## SIGNAL FORMAT — CRITICAL (READ CAREFULLY)
+
+You communicate with the frontend via INLINE JSON signals. These signals MUST be emitted as **raw JSON on their own line, NOT inside markdown code fences**. Do NOT wrap them in \`\`\` blocks. The frontend parses them by scanning for the JSON markers in your raw text output.
+
+### Correct (raw JSON inline):
+{"type":"agent_status","agent":"Schema Architect","status":"designing schema","progress":30}
+
+### WRONG (do NOT do this — the frontend will show it as a code block and fail to parse):
+\`\`\`json
+{"type":"agent_status","agent":"Schema Architect","status":"designing schema","progress":30}
+\`\`\`
+
+Each signal MUST be a single line of compact JSON (no pretty-printing, no newlines inside). Emit each signal on its own line, separated by your natural-language text.
+
+## QUESTION-ASKING RULES (CRITICAL)
+
+Ask AT MOST 2-3 clarifying questions across the ENTIRE discovery phase. Better yet, ask ONE good question with multiple choices and reasonable defaults. Follow this decision tree:
+
+1. If the user's prompt is specific enough (e.g. "create a 5-table e-commerce database with 50 rows each"), DO NOT ASK ANY QUESTIONS — go straight to schema design.
+2. If the user gives a domain but no scale, ask ONE question combining scale + locale, with smart defaults pre-selected.
+3. If the user gives scale but no domain, ask ONE question about the industry with the most common options.
+4. NEVER ask about: table count (infer from domain), column names (you're the expert), data types (your job), or whether to include timestamps (always include them).
+
+### BAD questions (never ask these):
+- "What columns would you like?" (you decide — you're the schema expert)
+- "What data types should each column be?" (your job)
+- "Should I include id columns?" (always yes)
+- "What format should the data be in?" (always NDJSON internally)
+
+### GOOD questions (ask only when truly needed):
+- Industry/domain when ambiguous
+- Scale (rows per table) when not specified — default to 10
+- Locale when it materially changes the data (names, currencies, phone formats)
+- Special features (soft deletes, multi-tenant, audit trails) only when relevant
 
 ## WORKFLOW
 
-### Phase 1 — Discovery (1-3 turns, not more)
-Ask about the dimensions that actually matter for the data shape. Skip questions whose answers you can reasonably infer. Use option blocks so the user can answer with one click:
+### Phase 1 — Discovery (0-2 turns max)
+Ask at most ONE question per turn, with clickable options. Emit the options signal INLINE (raw JSON, no code fence):
 
-\`\`\`
-{"type":"options","question":"What industry is this database for?","choices":[{"label":"E-commerce","value":"ecommerce"},{"label":"Healthcare","value":"healthcare"},{"label":"Finance","value":"finance"},{"label":"Education","value":"education"},{"label":"SaaS/Tech","value":"saas"}],"multi":false}
-\`\`\`
-
-Only ask about:
-- Industry / domain (if not obvious from the prompt)
-- Region/locale (only if it would change names, currencies, phone formats)
-- Scale (rows per table) — default to 10 if unspecified
-- Special features (soft deletes, audit trails, multi-tenant) — only if relevant
+{"type":"options","question":"How many rows per table should I generate?","choices":[{"label":"10 rows (quick preview)","value":"10"},{"label":"50 rows (small dataset)","value":"50"},{"label":"100 rows (medium)","value":"100"},{"label":"500 rows (large)","value":"500"}],"multi":false}
 
 ### Phase 2 — Schema design (show progress)
-While designing, emit agent_status so the user sees the Schema Architect working:
+While designing, emit agent_status so the user sees the Schema Architect working (INLINE, raw JSON, no code fence):
 
-\`\`\`
 {"type":"agent_status","agent":"Schema Architect","status":"designing schema","progress":30}
-\`\`\`
 
 Agents available: Orchestrator, Schema Architect, Data Generator, Quality Analyst, Privacy Officer.
 
 ### Phase 3 — Generation
-When you have enough context, emit the BEGIN_GENERATION signal and NOTHING ELSE (no raw data, no JSON arrays in chat):
+When you have enough context, emit the BEGIN_GENERATION signal INLINE (raw JSON, no code fence) and NOTHING ELSE (no raw data, no JSON arrays in chat):
 
-\`\`\`
 {"action":"BEGIN_GENERATION","schema":[{"name":"users","columns":[{"name":"id","type":"uuid"},{"name":"email","type":"varchar(255)"}]}],"rowCounts":{"users":10},"database_name":"ecommerce_db","instructions":"use realistic US-based names and emails"}
-\`\`\`
 
 After the signal, add a one-line message like "Starting generation..." — the streaming pipeline handles the rest.
 
@@ -111,6 +132,65 @@ You coordinate between sub-agents:
 - Data Generator: Creates realistic synthetic data rows (handled by the streaming pipeline, not in-chat)
 - Quality Analyst: Validates data quality and consistency
 - Privacy Officer: Ensures privacy compliance (no real PII, GDPR/CCPA-safe)`
+
+// Reuse the ZAI instance across requests (the SDK initializes config from /etc/.z-ai-config)
+let zaiInstancePromise: Promise<unknown> | null = null
+async function getZai() {
+  if (!zaiInstancePromise) {
+    zaiInstancePromise = ZAI.create()
+  }
+  return zaiInstancePromise
+}
+
+/**
+ * Sanitize AI output: unwrap JSON control signals that the model may have
+ * wrapped in markdown code fences (```json ... ```). The frontend parser
+ * scans for inline JSON markers like {"type":"agent_status"} and
+ * {"action":"BEGIN_GENERATION"}; if these are inside a code fence they show
+ * up as raw code blocks instead of being parsed. This function detects
+ * signal-only code blocks and unwraps them to inline JSON.
+ *
+ * SQL code blocks (```sql ... ```) and other non-signal code blocks are
+ * left untouched.
+ */
+function sanitizeAISignals(content: string): string {
+  // Match ```json ... ``` or ``` ... ``` blocks that contain ONLY a JSON signal
+  // (possibly with surrounding whitespace). We use a non-greedy match and then
+  // validate the inner content.
+  return content.replace(/```(?:json)?\s*\n?([\s\S]*?)\n?```/g, (full, inner: string) => {
+    const trimmed = inner.trim()
+    // Detect signal JSON objects by their opening markers
+    const isSignal =
+      trimmed.startsWith('{"type":"agent_status"') ||
+      trimmed.startsWith('{"type": "agent_status"') ||
+      trimmed.startsWith('{"type":"options"') ||
+      trimmed.startsWith('{"type": "options"') ||
+      trimmed.startsWith('{"action":"BEGIN_GENERATION"') ||
+      trimmed.startsWith('{"action": "BEGIN_GENERATION"')
+
+    if (!isSignal) {
+      // Not a signal — keep the original code block (e.g. SQL)
+      return full
+    }
+
+    // The inner content might contain MULTIPLE signal objects separated by
+    // whitespace or stray "json" text (some models emit ```json\n{...}\njson\n{...}```).
+    // Split on lines and re-emit each signal on its own line.
+    const lines = trimmed.split(/\n/).filter(l => l.trim() && l.trim() !== 'json')
+    const signals: string[] = []
+    for (const line of lines) {
+      const lt = line.trim()
+      // Only keep lines that look like a complete JSON signal object
+      if (lt.startsWith('{') && lt.endsWith('}')) {
+        signals.push(lt)
+      }
+    }
+
+    if (signals.length === 0) return full
+    // Re-emit as inline signals separated by newlines (no code fence)
+    return '\n' + signals.join('\n') + '\n'
+  })
+}
 
 export async function POST(request: NextRequest) {
   cleanup()
@@ -153,10 +233,6 @@ export async function POST(request: NextRequest) {
       currentSchema?: Array<{ name: string; columns: Array<{ name: string; type: string }> }>
       currentData?: Record<string, unknown[]>
       conversationId?: string
-      // ─── External DB connection context ───
-      // When set, the AI knows it is talking to a LIVE external DB and
-      // should respond with SQL inside ```sql ... ``` code blocks instead
-      // of using the synthetic BEGIN_GENERATION pipeline.
       connectionId?: string
       connectionName?: string
       connectionDialect?: 'postgres' | 'mysql'
@@ -169,22 +245,10 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    if (!DEEPSEEK_API_KEY) {
-      return new Response(JSON.stringify({ error: 'DeepSeek API key not configured' }), {
-        status: 503,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    }
-
     // Build system prompt with context
     let systemPrompt = BASE_SYSTEM_PROMPT
 
     // ─── External live DB mode ───
-    // When a connectionId is supplied, the AI operates against a real
-    // external database (Postgres or MySQL). It must respond with SQL
-    // inside ```sql ... ``` code blocks; the frontend intercepts those
-    // blocks and offers to execute them live against the DB (with a
-    // confirmation dialog for destructive statements).
     if (connectionId) {
       systemPrompt += `\n\n## LIVE EXTERNAL DATABASE MODE — YOU HAVE DIRECT DB ACCESS
 
@@ -195,8 +259,11 @@ You are connected to a LIVE external database:
 ### CRITICAL: YOU HAVE DIRECT DATABASE ACCESS
 You are NOT a chatbot that "doesn't have access to stored data". You have FULL access to this database. When the user asks you to look at data, count rows, show rows, or query anything, you MUST respond with a SQL query in a \`\`\`sql block. The frontend will AUTO-EXECUTE your SELECT queries immediately and display the real rows to the user inline. You never need to say "I don't have access" or "I can't see the data" — you CAN, via the SQL you emit.
 
+### QUESTION-ASKING IN LIVE-DB MODE
+In live-DB mode, ask FEWER questions than in synthetic mode — you can introspect the actual database to answer most questions yourself. If the user says "seed this database for a SaaS app", do NOT ask "what tables do you want?" — instead emit a SELECT to see what's there, then propose a schema. Only ask the user when you genuinely cannot infer the answer (e.g. "how many rows of sample data?").
+
 ### PERMISSIONS — YOU CAN PERFORM ANY OPERATION
-You have full read/write/DDL permissions on this database. You may emit SQL for ANY of these operations without asking the user first:
+You have full read/write/DDL permissions on this database. You may emit SQL for ANY of these operations:
 - **Read**: SELECT, SHOW, DESCRIBE, EXPLAIN — auto-executed by the frontend, results shown inline
 - **Write**: INSERT, UPDATE, DELETE — frontend shows a confirmation dialog, then executes
 - **DDL**: CREATE TABLE, ALTER TABLE, DROP TABLE, CREATE INDEX, CREATE DATABASE — frontend confirms, then executes
@@ -212,114 +279,19 @@ For ANY data operation, respond with a SQL code block:
 
 Rules:
 1. **Always include a brief comment** on the first line explaining what the query does.
-2. **One \`\`\`sql block per logical operation.** If the user asks for multiple things, emit multiple blocks separated by explanatory text.
-3. **For SELECT queries**: keep them reasonable (add \`LIMIT\` clauses — default to 10-100 rows). The frontend auto-executes SELECTs and shows results inline.
-4. **For mutations** (INSERT/UPDATE/DELETE/DDL): the frontend will show a confirmation dialog before executing. Add a comment like \`-- DESTRUCTIVE: this will permanently delete all rows in <table>\` for destructive ops so the user understands the impact.
-5. **Use correct dialect syntax**: \`SERIAL\`/\`RETURNING\` for Postgres, \`AUTO_INCREMENT\` for MySQL. Use \`information_schema\` for schema introspection (works on both).
-6. **Never say "I don't have access"** — you DO have access. If you're unsure of the schema, emit \`SELECT table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema') LIMIT 50\` and the frontend will run it.
-
-### EXAMPLES
-
-User: "show me the first 10 rows of users"
-You:
-\`\`\`sql
--- First 10 rows from the users table
-SELECT * FROM users LIMIT 10
-\`\`\`
-
-User: "how many orders were placed yesterday?"
-You:
-\`\`\`sql
--- Count of orders placed yesterday
-SELECT COUNT(*) AS order_count FROM orders WHERE created_at >= NOW() - INTERVAL '1 day'
-\`\`\`
-
-User: "what tables are in this database?"
-You:
-\`\`\`sql
--- List all user tables in the database
-SELECT table_schema, table_name
-FROM information_schema.tables
-WHERE table_type = 'BASE TABLE'
-  AND table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-ORDER BY table_schema, table_name
-\`\`\`
-
-User: "delete all users older than 5 years"
-You:
-\`\`\`sql
--- DESTRUCTIVE: permanently deletes users registered before 5 years ago
-DELETE FROM users WHERE created_at < NOW() - INTERVAL '5 years'
-\`\`\`
-
-User: "add a status column to the orders table"
-You:
-\`\`\`sql
--- Add a status column with a default value of 'pending'
-ALTER TABLE orders ADD COLUMN status VARCHAR(50) NOT NULL DEFAULT 'pending'
-\`\`\`
-
-User: "seed this database with a SaaS platform database"
-You (emit DDL to create the tables — the frontend will execute each statement):
-\`\`\`sql
--- Create the users table for the SaaS platform
-CREATE TABLE IF NOT EXISTS users (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  email VARCHAR(255) UNIQUE NOT NULL,
-  full_name VARCHAR(255),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-)
-\`\`\`
-
-Then emit INSERT statements with realistic sample data:
-\`\`\`sql
--- Insert 5 sample users
-INSERT INTO users (email, full_name) VALUES
-  ('alice@example.com', 'Alice Johnson'),
-  ('bob@example.com', 'Bob Smith'),
-  ('carol@example.com', 'Carol Williams'),
-  ('david@example.com', 'David Brown'),
-  ('emma@example.com', 'Emma Davis')
-\`\`\`
-
-### SEEDING / SCHEMA GENERATION IN LIVE-DB MODE
-When the user asks you to "seed", "generate", "create", or "populate" a database in live-DB mode, you MUST:
-1. Emit CREATE TABLE statements (one \`\`\`sql block per table) to define the schema.
-2. Emit INSERT statements (one \`\`\`sql block per table) with realistic sample data (5-20 rows per table).
-3. Use dialect-appropriate syntax: gen_random_uuid() for Postgres, UUID() for MySQL.
-4. Maintain referential integrity: foreign key columns must reference existing primary keys.
-5. The frontend will auto-execute DDL (CREATE/ALTER) and INSERT statements after user confirmation, then refresh the schema so the new tables appear in the Data section.
-Do NOT use the BEGIN_GENERATION signal in live-DB mode — that signal is for the synthetic-data pipeline which writes to a different storage backend. In live-DB mode, ALL data goes directly into the user's external database via the SQL blocks you emit.
+2. **One \`\`\`sql block per logical operation.**
+3. **For SELECT queries**: keep them reasonable (add \`LIMIT\` clauses — default to 10-100 rows).
+4. **For mutations** (INSERT/UPDATE/DELETE/DDL): add a comment like \`-- DESTRUCTIVE: this will permanently delete all rows in <table>\` for destructive ops.
+5. **Use correct dialect syntax**: \`SERIAL\`/\`RETURNING\` for Postgres, \`AUTO_INCREMENT\` for MySQL.
+6. **Never say "I don't have access"** — you DO have access.
 
 ### AUTONOMOUS AGENT BEHAVIOR — RESEARCH, ACT, VERIFY, SELF-HEAL
-You are an autonomous agent. When given a complex task ("seed a SaaS database", "migrate the users table to add multi-tenant support", "clean up duplicate orders"), you should:
-
-1. **RESEARCH first.** Before writing any SQL, emit a SELECT to understand the current state:
-   \`\`\`sql
-   -- Research: what tables already exist?
-   SELECT table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema','pg_toast') ORDER BY table_name
-   \`\`\`
-   The frontend auto-runs this and you'll see the results inline. Use the results to inform your next step.
-
-2. **PLAN.** Briefly explain what you're going to do and why, in 1-2 sentences. Don't over-explain.
-
-3. **ACT.** Emit the SQL to perform the action (CREATE TABLE, INSERT, UPDATE, etc.). The frontend will confirm and execute.
-
-4. **VERIFY.** After each significant action, emit a SELECT to verify it worked:
-   \`\`\`sql
-   -- Verify: confirm the users table was created and has 5 rows
-   SELECT COUNT(*) AS row_count FROM users
-   \`\`\`
-
-5. **SELF-HEAL.** If a SQL block returns an error (shown in red below the block), DON'T give up. Analyze the error, adjust the SQL, and try again. Common self-heal patterns:
-   - "relation already exists" → use \`CREATE TABLE IF NOT EXISTS\` or \`DROP TABLE IF EXISTS\` first
-   - "column does not exist" → run \`SELECT column_name FROM information_schema.columns WHERE table_name='X'\` to discover the actual columns
-   - "syntax error" → check dialect-specific syntax (Postgres vs MySQL)
-   - "foreign key constraint fails" → insert parent rows first, or use \`INSERT ... ON CONFLICT DO NOTHING\`
-   - "value too long for type" → increase the VARCHAR length or cast the value
-
-6. **ITERATE.** Complex tasks may require multiple rounds of research → act → verify. Keep going until the task is complete. Don't stop at the first error — that's what self-healing means.
+You are an autonomous agent. When given a complex task:
+1. **RESEARCH first.** Emit a SELECT to understand the current state.
+2. **PLAN.** Briefly explain what you're going to do (1-2 sentences).
+3. **ACT.** Emit the SQL to perform the action.
+4. **VERIFY.** After each significant action, emit a SELECT to verify it worked.
+5. **SELF-HEAL.** If a SQL block returns an error, analyze it and try again.
 
 ### CURRENT EXTERNAL SCHEMA`
       if (currentSchema && currentSchema.length > 0) {
@@ -327,11 +299,9 @@ You are an autonomous agent. When given a complex task ("seed a SaaS database", 
         let tableCount = 0
         for (const table of currentSchema) {
           if (tableCount >= 25) break
-          // BUGFIX (BUG-2): guard against malformed schema entries that
-          // lack a `columns` array (the client type is untrusted).
           if (!Array.isArray(table.columns)) continue
           const colStr = table.columns
-            .slice(0, 30) // cap columns per table to keep prompt under context window
+            .slice(0, 30)
             .map(c => `${c.name} ${c.type}`)
             .join(', ')
           systemPrompt += `\n- ${table.name} (${colStr})`
@@ -346,9 +316,6 @@ You are an autonomous agent. When given a complex task ("seed a SaaS database", 
         for (const [tableName, rows] of Object.entries(currentData)) {
           if (tableCount >= 25) break
           if (Array.isArray(rows) && rows.length > 0) {
-            // BUGFIX (BUG-4): truncate sample row JSON to prevent the
-            // system prompt from exceeding the context window when a
-            // column contains a large TEXT/JSON/base64 value.
             let sampleStr = JSON.stringify(rows[0])
             if (sampleStr.length > 1000) sampleStr = sampleStr.slice(0, 1000) + '...(truncated)'
             systemPrompt += `\n- ${tableName}: ${sampleStr}`
@@ -356,7 +323,6 @@ You are an autonomous agent. When given a complex task ("seed a SaaS database", 
           }
         }
       }
-      // Skip the synthetic-DB context block below
     } else if (databaseId) {
       systemPrompt += `\n\n## CURRENT DATABASE CONTEXT`
       systemPrompt += `\nYou are currently editing database "${databaseName || databaseId}" (ID: ${databaseId}).`
@@ -393,11 +359,6 @@ You are an autonomous agent. When given a complex task ("seed a SaaS database", 
       { role: 'system', content: systemPrompt },
     ]
 
-    // Add conversation history (last 10 messages for context)
-    // BUGFIX (BUG-3): validate that `history` is actually an array of
-    // {role, content} objects. The previous version cast with `as
-    // ChatMessage[]` and called `.slice(-10)` on whatever the client sent
-    // — a string would return a substring, a number would throw.
     const safeHistory: ChatMessage[] = Array.isArray(history)
       ? history.filter((msg): msg is ChatMessage =>
           msg !== null && typeof msg === 'object' &&
@@ -407,66 +368,75 @@ You are an autonomous agent. When given a complex task ("seed a SaaS database", 
       : []
     const recentHistory = safeHistory.slice(-10)
     for (const msg of recentHistory) {
-      // Cap each message at 8KB to prevent a single huge message from
-      // blowing the DeepSeek context window.
       const content = msg.content.length > 8192
         ? msg.content.slice(0, 8192) + '\n...(truncated)'
         : msg.content
       messages.push({ role: msg.role, content })
     }
 
-    // Add current user message
     messages.push({ role: 'user', content: message })
 
-    // Call DeepSeek API with streaming
-    const deepseekResponse = await fetch(`${DEEPSEEK_API_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'deepseek-reasoner',
-        messages,
-        stream: true,
-        max_tokens: 16384,
-        stream_options: { include_usage: true },
-      }),
-    })
+    // Call z-ai-web-dev-sdk (non-streaming), then simulate streaming via SSE
+    const zai = (await getZai()) as {
+      chat: {
+        completions: {
+          create: (body: {
+            messages: ChatMessage[]
+            thinking?: { type: 'enabled' | 'disabled' }
+            stream?: boolean
+          }) => Promise<{
+            choices?: Array<{
+              message?: { content?: string; reasoning_content?: string }
+              finish_reason?: string
+            }>
+            usage?: unknown
+          }>
+        }
+      }
+    }
 
-    if (!deepseekResponse.ok) {
-      const errorText = await deepseekResponse.text().catch(() => 'Unknown error')
-      console.error('[Chat API] DeepSeek error:', deepseekResponse.status, errorText)
+    let completion
+    try {
+      completion = await zai.chat.completions.create({
+        messages,
+        thinking: { type: 'disabled' },
+      })
+    } catch (err) {
+      console.error('[Chat API] ZAI error:', err)
       return new Response(JSON.stringify({
         error: 'AI service error',
         content: 'I encountered an error connecting to the AI service. Please try again.',
       }), {
-        status: deepseekResponse.status,
+        status: 502,
         headers: { 'Content-Type': 'application/json' },
       })
     }
 
-    // Stream the response back to the client using SSE
+    const fullContent = sanitizeAISignals(completion.choices?.[0]?.message?.content || '')
+    const reasoning = completion.choices?.[0]?.message?.reasoning_content || ''
+    const finishReason = completion.choices?.[0]?.finish_reason || 'stop'
+    const usage = completion.usage || null
+
+    if (!fullContent) {
+      return new Response(JSON.stringify({
+        error: 'Empty AI response',
+        content: 'The AI returned an empty response. Please try rephrasing your request.',
+      }), {
+        status: 502,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    // ─── Stream the response back to the client via SSE ───
+    // The z-ai-web-dev-sdk returns the full completion at once, so we simulate
+    // a token-by-token stream by chunking the content. This preserves the
+    // frontend's streaming UX (progressive rendering, cancel support) without
+    // requiring a true streaming upstream.
     const encoder = new TextEncoder()
-    const reader = deepseekResponse.body?.getReader()
-
-    if (!reader) {
-      return new Response(JSON.stringify({ error: 'No response stream' }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    }
 
     const stream = new ReadableStream({
       async start(controller) {
-        const decoder = new TextDecoder()
-        let buffer = ''
         let closed = false
-        // Track whether the client disconnected so the upstream DeepSeek
-        // stream gets cancelled promptly (otherwise tokens keep being
-        // billed until max_tokens is exhausted).
-        let clientCancelled = false
-
         const safeEnqueue = (data: Uint8Array) => {
           if (closed) return
           try {
@@ -477,62 +447,40 @@ You are an autonomous agent. When given a complex task ("seed a SaaS database", 
         }
 
         try {
-          while (true) {
-            if (clientCancelled) break
-            const { done, value } = await reader.read()
-            if (done) break
-
-            buffer += decoder.decode(value, { stream: true })
-            const lines = buffer.split('\n')
-            buffer = lines.pop() || ''
-
-            for (const line of lines) {
-              const trimmed = line.trim()
-              if (!trimmed || !trimmed.startsWith('data: ')) continue
-
-              const data = trimmed.slice(6)
-              if (data === '[DONE]') {
-                // Send completion event
-                safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`))
-                continue
-              }
-
-              try {
-                const parsed = JSON.parse(data)
-                const choice = parsed.choices?.[0]
-                if (!choice) continue
-
-                const delta = choice.delta
-
-                // Handle reasoning content (Chain of Thought)
-                if (delta?.reasoning_content) {
-                  safeEnqueue(encoder.encode(`data: ${JSON.stringify({
-                    type: 'reasoning',
-                    content: delta.reasoning_content,
-                  })}\n\n`))
-                }
-
-                // Handle main content (answer)
-                if (delta?.content) {
-                  safeEnqueue(encoder.encode(`data: ${JSON.stringify({
-                    type: 'content',
-                    content: delta.content,
-                  })}\n\n`))
-                }
-
-                // Handle finish
-                if (choice.finish_reason) {
-                  safeEnqueue(encoder.encode(`data: ${JSON.stringify({
-                    type: 'finish',
-                    reason: choice.finish_reason,
-                    usage: parsed.usage || null,
-                  })}\n\n`))
-                }
-              } catch {
-                // Skip unparseable chunks
-              }
-            }
+          // 1. Emit reasoning first (if any) — shown collapsed in the UI
+          if (reasoning) {
+            safeEnqueue(encoder.encode(`data: ${JSON.stringify({
+              type: 'reasoning',
+              content: reasoning,
+            })}\n\n`))
           }
+
+          // 2. Stream the main content in word-boundary chunks for a natural
+          //    typing effect. Chunk size ~3-6 words keeps the UX responsive
+          //    without overwhelming the SSE channel.
+          const chunks = fullContent.match(/(\S+\s*)/g) || [fullContent]
+          const CHUNK_GROUP = 4 // emit 4 "word+whitespace" tokens per SSE event
+          for (let i = 0; i < chunks.length; i += CHUNK_GROUP) {
+            const piece = chunks.slice(i, i + CHUNK_GROUP).join('')
+            if (piece) {
+              safeEnqueue(encoder.encode(`data: ${JSON.stringify({
+                type: 'content',
+                content: piece,
+              })}\n\n`))
+            }
+            // Small delay so the UI renders progressively (mimics streaming)
+            await new Promise(r => setTimeout(r, 12))
+          }
+
+          // 3. Finish event
+          safeEnqueue(encoder.encode(`data: ${JSON.stringify({
+            type: 'finish',
+            reason: finishReason,
+            usage,
+          })}\n\n`))
+
+          // 4. Done sentinel
+          safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`))
         } catch (err) {
           console.error('[Chat API] Stream error:', err)
           safeEnqueue(encoder.encode(`data: ${JSON.stringify({
@@ -547,24 +495,6 @@ You are an autonomous agent. When given a complex task ("seed a SaaS database", 
               // Already closed
             }
           }
-        }
-      },
-      // BUGFIX (BUG-1): add a cancel() handler so that when the browser
-      // disconnects (tab close, navigation, AbortController.abort on the
-      // client), we cancel the upstream DeepSeek reader too. Without this
-      // the upstream connection leaks and tokens keep being billed until
-      // max_tokens is exhausted.
-      async cancel() {
-        clientCancelled = true
-        try {
-          await reader.cancel()
-        } catch {
-          // Already released
-        }
-        try {
-          await reader.releaseLock()
-        } catch {
-          // Already released
         }
       },
     })

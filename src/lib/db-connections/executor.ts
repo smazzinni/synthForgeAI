@@ -58,6 +58,61 @@ function evictExpired() {
   }
 }
 
+// ─── Supabase pooler helpers ───
+// Supabase's connection pooler (Supavisor) at `*.pooler.supabase.com:6543`
+// identifies the target project/tenant in one of two ways:
+//   1. `external_id`  — embedded in the username as `postgres.<project-ref>`
+//   2. `sni_hostname` — the TLS SNI extension set to `<project-ref>.supabase.com`
+// If neither is present, Supavisor rejects the connection with:
+//   "(ENOIDENTIFIER) no tenant identifier provided (external_id or sni_hostname required)"
+//
+// The `pg` driver sets SNI to the connected host by default, but the pooler
+// host is generic (aws-X-<region>.pooler.supabase.com) so Supavisor can't
+// derive the project from it. We therefore extract the project-ref from the
+// username (when present) and explicitly set `ssl.servername` to the
+// project-specific host so SNI routes correctly.
+function isSupabasePoolerHost(host: string): boolean {
+  return /\.pooler\.supabase\.com$/i.test(host || '')
+}
+
+/**
+ * Extract the Supabase project reference from a pooler username.
+ * Supabase pooler usernames have the format `postgres.<project-ref>` where
+ * `<project-ref>` is a 20-char alphanumeric string.
+ * Returns the project ref, or null if the username is the bare `postgres`.
+ */
+function extractSupabaseProjectRef(username: string): string | null {
+  if (!username) return null
+  // Format: postgres.<project-ref>
+  const match = username.match(/^postgres\.([a-zA-Z0-9]{10,30})$/)
+  if (match) return match[1]
+  // Some users paste the full `postgres.project-ref` — also accept a 2nd dot segment
+  const match2 = username.match(/^postgres\.([a-zA-Z0-9]+)\./)
+  if (match2) return match2[1]
+  return null
+}
+
+/**
+ * Build the SSL options for a Postgres connection. For Supabase pooler hosts
+ * we always enable SSL and set `servername` (SNI) to the project-specific
+ * host so Supavisor can route the connection.
+ */
+function buildPostgresSslOptions(conn: DbConnectionRecord): false | { rejectUnauthorized: boolean; servername?: string } {
+  if (conn.dialect !== 'postgres') return false
+  if (isSupabasePoolerHost(conn.host)) {
+    // Supabase pooler REQUIRES SSL with the correct SNI servername.
+    const projectRef = extractSupabaseProjectRef(conn.username)
+    return {
+      rejectUnauthorized: false,
+      // When we know the project ref, set SNI to the project-specific host.
+      // This is what makes Supavisor route to the right tenant.
+      ...(projectRef ? { servername: `${projectRef}.supabase.com` } : {}),
+    }
+  }
+  // Non-pooler: respect the user's SSL toggle.
+  return conn.ssl ? { rejectUnauthorized: false } : false
+}
+
 async function getPool(conn: DbConnectionRecord): Promise<PoolEntry> {
   evictExpired() // lazy cleanup of expired pools
   const existing = poolCache.get(conn.id)
@@ -68,16 +123,19 @@ async function getPool(conn: DbConnectionRecord): Promise<PoolEntry> {
 
   if (conn.dialect === 'postgres') {
     const Pool = await getPostgresPool()
+    const sslOptions = buildPostgresSslOptions(conn)
     const pool = new Pool({
       host: conn.host,
       port: conn.port,
       user: conn.username,
       password: conn.password,
       database: conn.database,
-      ssl: conn.ssl ? { rejectUnauthorized: false } : false,
+      ssl: sslOptions,
       max: 5,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 10000,
+      // Allow longer query timeouts for AI-driven complex operations
+      statement_timeout: 60000,
     })
     const entry: PoolEntry = {
       pool,
@@ -127,6 +185,24 @@ async function getPool(conn: DbConnectionRecord): Promise<PoolEntry> {
  */
 export async function testConnection(conn: DbConnectionRecord): Promise<{ ok: boolean; error?: string; hint?: string; latencyMs?: number }> {
   const start = Date.now()
+
+  // ─── Pre-flight validation for Supabase pooler connections ───
+  // The Supabase pooler (Supavisor) requires either a project-ref in the
+  // username ("postgres.<ref>") or an SNI servername. If the user supplied a
+  // bare "postgres" username against a pooler host, we fail fast with a clear
+  // message instead of letting the TLS handshake fail cryptically.
+  if (conn.dialect === 'postgres' && isSupabasePoolerHost(conn.host)) {
+    const ref = extractSupabaseProjectRef(conn.username)
+    if (!ref) {
+      return {
+        ok: false,
+        error: '(ENOIDENTIFIER) no tenant identifier provided (external_id or sni_hostname required)',
+        hint: `The Supabase pooler requires the project reference in the username. Change the Username from "${conn.username}" to "postgres.<project-ref>" (e.g. "postgres.abcdefghijklmnopqrst"). You can find the project ref in your Supabase dashboard under Project Settings → Database → Connection string (pooling). The bare username "postgres" only works with the direct host "db.<project-ref>.supabase.co", not with the pooler host ${conn.host}.`,
+        latencyMs: Date.now() - start,
+      }
+    }
+  }
+
   try {
     const entry = await getPool(conn)
     if (entry.dialect === 'postgres') {
@@ -197,6 +273,22 @@ function explainConnectionError(message: string, conn: DbConnectionRecord): stri
   // Pooler-specific Supavisor errors
   if (m.includes('tenant/user') && m.includes('not found')) {
     return `The Supabase pooler does not recognize this project. The pooler username should be "postgres.<project-ref>" (e.g. postgres.abcdefghij). Check the username format.`
+  }
+
+  // ENOIDENTIFIER — Supavisor can't determine which project to route to.
+  // This is THE most common Supabase pooler error. It means the username
+  // is the bare "postgres" (missing the ".<project-ref>" suffix) AND we
+  // couldn't set an SNI servername. Tell the user exactly how to fix it.
+  if (m.includes('enoidentifier') || m.includes('no tenant identifier provided') || (m.includes('external_id') && m.includes('sni_hostname'))) {
+    if (isSupabasePoolerHost(conn.host)) {
+      const hasRef = !!extractSupabaseProjectRef(conn.username)
+      if (!hasRef) {
+        return `The Supabase pooler could not identify your project. The Username field must be in the format "postgres.<project-ref>" — for example "postgres.abcdefghijklmnopqrst". Find your project ref in the Supabase dashboard (Project Settings → Database → Connection string → pooling). The bare username "postgres" does not work with the pooler host ${conn.host}.`
+      }
+      // The username had a ref but SNI still failed — rare; suggest retry / direct host.
+      return `The Supabase pooler rejected the connection even though the username looks correct. Try toggling SSL on, or switch to the direct (non-pooler) host "db.<project-ref>.supabase.co" on port 5432 with SSL enabled.`
+    }
+    return `The connection requires a tenant identifier. If this is a Supabase database, use the pooler hostname and a username of the form "postgres.<project-ref>".`
   }
 
   return ''
