@@ -5,6 +5,10 @@ import {
   createDatabaseInMemory,
   updateDatabaseInMemory,
 } from '@/lib/in-memory-store'
+import {
+  createDatabasePrisma,
+  updateDatabasePrisma,
+} from '@/lib/prisma-store'
 
 // ─── Streaming Database Generation API ───
 // Receives a generation signal (schema + row counts + instructions),
@@ -177,18 +181,31 @@ export async function POST(request: NextRequest) {
           databaseId = newDb.id
         }
       } else {
-        // In-memory fallback — create a database record so the studio can
-        // load the generated data back via /api/databases?id=...
-        const newDb = createDatabaseInMemory(userId, {
-          name: dbName,
-          db_type: 'postgresql',
-          schema_json: body.schema,
-          data_json: {},
-          row_count: 0,
-          quality_score: 0.85,
-          status: 'generating',
-        })
-        databaseId = newDb.id
+        // Prisma-backed durable storage (survives server restarts)
+        try {
+          const newDb = await createDatabasePrisma(userId, {
+            name: dbName,
+            db_type: 'postgresql',
+            schema_json: body.schema,
+            data_json: {},
+            row_count: 0,
+            quality_score: 0.85,
+            status: 'generating',
+          })
+          databaseId = newDb.id
+        } catch (err) {
+          console.warn('[Generate-Stream] Prisma create failed, falling back to in-memory:', err)
+          const newDb = createDatabaseInMemory(userId, {
+            name: dbName,
+            db_type: 'postgresql',
+            schema_json: body.schema,
+            data_json: {},
+            row_count: 0,
+            quality_score: 0.85,
+            status: 'generating',
+          })
+          databaseId = newDb.id
+        }
       }
     } else if (databaseId) {
       // Update existing database status
@@ -198,7 +215,11 @@ export async function POST(request: NextRequest) {
           .update({ status: 'generating' })
           .eq('id', databaseId)
       } else {
-        updateDatabaseInMemory(userId, databaseId, { status: 'generating' })
+        try {
+          await updateDatabasePrisma(userId, databaseId, { status: 'generating' })
+        } catch {
+          updateDatabaseInMemory(userId, databaseId, { status: 'generating' })
+        }
       }
     }
 
@@ -316,20 +337,25 @@ export async function POST(request: NextRequest) {
             console.warn('[Generate-Stream] DB update failed:', err)
           }
         } else {
-          // In-memory fallback — merge the new records into the stored data_json
+          // Prisma-backed durable storage (with in-memory fallback)
           try {
-            const existing = (allTableData[tableName] || []).slice(0, -records.length)
             const merged: Record<string, unknown[]> = {}
             for (const [t, rows] of Object.entries(allTableData)) {
               merged[t] = rows
             }
-            updateDatabaseInMemory(userId, databaseId, {
-              data_json: merged,
-              row_count: totalInserted + records.length,
-            })
-            void existing // (kept for clarity; allTableData already has the merged data)
+            try {
+              updateDatabasePrisma(userId, databaseId, {
+                data_json: merged,
+                row_count: totalInserted + records.length,
+              }).catch(() => {})
+            } catch {
+              updateDatabaseInMemory(userId, databaseId, {
+                data_json: merged,
+                row_count: totalInserted + records.length,
+              })
+            }
           } catch (err) {
-            console.warn('[Generate-Stream] In-memory DB update failed:', err)
+            console.warn('[Generate-Stream] DB update failed:', err)
           }
         }
       }
@@ -499,18 +525,28 @@ export async function POST(request: NextRequest) {
                 console.warn('[Generate-Stream] Final DB update failed:', err)
               }
             } else {
-              // In-memory fallback — persist the final data so the studio
-              // can load it via /api/databases?id=...
+              // Prisma-backed durable storage — persist the final data so the
+              // studio can load it via /api/databases?id=... (with in-memory fallback)
               try {
-                updateDatabaseInMemory(userId, databaseId, {
-                  status: 'ready',
-                  data_json: allTableData,
-                  schema_json: body.schema,
-                  row_count: totalInserted,
-                  quality_score: 0.85,
-                })
+                try {
+                  await updateDatabasePrisma(userId, databaseId, {
+                    status: 'ready',
+                    data_json: allTableData,
+                    schema_json: body.schema,
+                    row_count: totalInserted,
+                    quality_score: 0.85,
+                  })
+                } catch {
+                  updateDatabaseInMemory(userId, databaseId, {
+                    status: 'ready',
+                    data_json: allTableData,
+                    schema_json: body.schema,
+                    row_count: totalInserted,
+                    quality_score: 0.85,
+                  })
+                }
               } catch (err) {
-                console.warn('[Generate-Stream] In-memory final DB update failed:', err)
+                console.warn('[Generate-Stream] Final DB update failed:', err)
               }
             }
           }

@@ -6,6 +6,12 @@ import {
   addMessagesInMemory,
   deleteConversationInMemory,
 } from '@/lib/in-memory-store'
+import {
+  listConversationsPrisma,
+  createConversationPrisma,
+  addMessagesPrisma,
+  deleteConversationPrisma,
+} from '@/lib/prisma-store'
 
 const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
 
@@ -46,12 +52,21 @@ export async function GET(request: NextRequest) {
 
     const admin = getSupabaseAdmin()
     if (!admin) {
-      // In-memory fallback
-      let conversations = listConversationsInMemory(userId)
-      if (databaseId) {
-        conversations = conversations.filter(c => c.database_id === databaseId)
+      // Prisma-backed durable storage (survives server restarts)
+      try {
+        let conversations = await listConversationsPrisma(userId)
+        if (databaseId) {
+          conversations = conversations.filter(c => c.database_id === databaseId)
+        }
+        return NextResponse.json({ conversations })
+      } catch (err) {
+        console.warn('[Conversations API] Prisma failed, falling back to in-memory:', err)
+        let conversations = listConversationsInMemory(userId)
+        if (databaseId) {
+          conversations = conversations.filter(c => c.database_id === databaseId)
+        }
+        return NextResponse.json({ conversations })
       }
-      return NextResponse.json({ conversations })
     }
 
     let query = admin
@@ -103,22 +118,41 @@ export async function POST(request: NextRequest) {
 
     const admin = getSupabaseAdmin()
     if (!admin) {
-      // In-memory fallback — create conversation + add messages
+      // Prisma-backed durable storage
       let conversationId = id
-      if (!conversationId) {
-        const conv = createConversationInMemory(userId, {
-          database_id: databaseId || null,
-          title: title || 'New Conversation',
-          user_id: bodyUserId || userId,
-          status: 'active',
-          agent_mode: 'orchestrator',
-        })
-        conversationId = conv.id
+      try {
+        if (!conversationId) {
+          const conv = await createConversationPrisma(userId, {
+            database_id: databaseId || null,
+            title: title || 'New Conversation',
+            user_id: bodyUserId || userId,
+            status: 'active',
+            agent_mode: 'orchestrator',
+          })
+          conversationId = conv.id
+        }
+        if (messageData && Array.isArray(messageData) && messageData.length > 0) {
+          await addMessagesPrisma(userId, conversationId, messageData)
+        }
+        return NextResponse.json({ conversationId })
+      } catch (err) {
+        console.warn('[Conversations API] Prisma failed, falling back to in-memory:', err)
+        // In-memory fallback
+        if (!conversationId) {
+          const conv = createConversationInMemory(userId, {
+            database_id: databaseId || null,
+            title: title || 'New Conversation',
+            user_id: bodyUserId || userId,
+            status: 'active',
+            agent_mode: 'orchestrator',
+          })
+          conversationId = conv.id
+        }
+        if (messageData && Array.isArray(messageData) && messageData.length > 0) {
+          addMessagesInMemory(userId, conversationId, messageData)
+        }
+        return NextResponse.json({ conversationId })
       }
-      if (messageData && Array.isArray(messageData) && messageData.length > 0) {
-        addMessagesInMemory(userId, conversationId, messageData)
-      }
-      return NextResponse.json({ conversationId })
     }
 
     let conversationId = id
@@ -182,12 +216,25 @@ export async function DELETE(request: NextRequest) {
 
     const admin = getSupabaseAdmin()
     if (!admin) {
-      // In-memory fallback
-      const ok = deleteConversationInMemory(userId, id)
-      if (!ok) {
-        return NextResponse.json({ error: 'Conversation not found' }, { status: 404 })
+      // Prisma-backed durable storage
+      try {
+        const ok = await deleteConversationPrisma(userId, id)
+        if (!ok) {
+          // Try in-memory as fallback
+          const okInMem = deleteConversationInMemory(userId, id)
+          if (!okInMem) {
+            return NextResponse.json({ error: 'Conversation not found' }, { status: 404 })
+          }
+        }
+        return NextResponse.json({ success: true })
+      } catch (err) {
+        console.warn('[Conversations API] Prisma delete failed, falling back to in-memory:', err)
+        const okInMem = deleteConversationInMemory(userId, id)
+        if (!okInMem) {
+          return NextResponse.json({ error: 'Conversation not found' }, { status: 404 })
+        }
+        return NextResponse.json({ success: true })
       }
-      return NextResponse.json({ success: true })
     }
 
     // Delete messages first

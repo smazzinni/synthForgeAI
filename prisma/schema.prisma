@@ -1,0 +1,83 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Post {
+  id        String   @id @default(cuid())
+  title     String
+  content   String?
+  published Boolean  @default(false)
+  authorId  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── SynthForge AI models ───
+// Durable persistence for generated synthetic databases, conversations,
+// and messages. Used as a fallback when Supabase is not configured — the
+// in-memory store (src/lib/in-memory-store.ts) handles hot-reloads, but
+// this Prisma store handles server restarts.
+
+model SyntheticDatabase {
+  id           String   @id @default(cuid())
+  name         String
+  dbType       String   @default("postgresql")
+  schemaJson   String   @default("[]") // JSON-encoded schema array
+  dataJson     String   @default("{}") // JSON-encoded data object
+  rowCount     Int      @default(0)
+  qualityScore Float?
+  status       String   @default("draft")
+  userId       String   @default("default")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  conversations Conversation[]
+
+  @@index([userId])
+}
+
+model Conversation {
+  id         String   @id @default(cuid())
+  databaseId String?
+  title      String   @default("New Conversation")
+  userId     String?
+  status     String   @default("active")
+  agentMode  String   @default("orchestrator")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  database      SyntheticDatabase? @relation(fields: [databaseId], references: [id], onDelete: SetNull)
+  messages      Message[]
+
+  @@index([userId])
+  @@index([databaseId])
+}
+
+model Message {
+  id             String   @id @default(cuid())
+  conversationId String
+  role           String
+  content        String
+  agentName      String?
+  createdAt      DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+}

@@ -31,6 +31,7 @@ import {
   Server,
   ArrowUpFromLine,
   PlugZap,
+  Table2,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { apiDelete } from '@/lib/api-client'
@@ -227,10 +228,29 @@ export default function DashboardPage() {
   return (
     <div className="p-4 md:p-8 max-w-7xl mx-auto min-h-screen">
       {/* Header */}
-      <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-6">
+      <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-8">
         <div>
-          <h1 className="text-2xl md:text-3xl font-bold">Dashboard</h1>
-          <p className="text-muted-foreground mt-1">Welcome back, {userName}!</p>
+          <div className="flex items-center gap-2 mb-1">
+            <div className="h-8 w-8 rounded-lg bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center shadow-md">
+              <Sparkles className="h-4 w-4 text-white" />
+            </div>
+            <h1 className="text-2xl md:text-3xl font-bold tracking-tight">Dashboard</h1>
+          </div>
+          <p className="text-muted-foreground mt-1 text-sm">Welcome back, <span className="font-medium text-foreground">{userName}</span> — here&apos;s your synthetic data overview.</p>
+        </div>
+        <div className="hidden md:flex items-center gap-2 mt-4 md:mt-0">
+          <Button asChild variant="outline" size="sm" className="h-8">
+            <Link href="/dashboard/databases">
+              <Database className="mr-1.5 h-3.5 w-3.5" />
+              My Databases
+            </Link>
+          </Button>
+          <Button asChild size="sm" className="h-8 bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white">
+            <Link href="/dashboard/studio">
+              <Plus className="mr-1.5 h-3.5 w-3.5" />
+              New Database
+            </Link>
+          </Button>
         </div>
       </div>
 
@@ -308,18 +328,18 @@ export default function DashboardPage() {
       </Card>
 
       {/* Stats Grid */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         {stats.map((stat) => (
-          <Card key={stat.label} className="hover:shadow-md transition-shadow">
-            <CardContent className="pt-4 pb-4">
+          <Card key={stat.label} className="relative overflow-hidden hover:shadow-lg transition-all duration-300 group">
+            <CardContent className="pt-5 pb-5">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
-                  <div className={`h-10 w-10 rounded-xl ${stat.bgColor} flex items-center justify-center`}>
+                  <div className={`h-11 w-11 rounded-xl ${stat.bgColor} flex items-center justify-center group-hover:scale-110 transition-transform`}>
                     <stat.icon className={`h-5 w-5 ${stat.color}`} />
                   </div>
                   <div>
-                    <p className="text-xs text-muted-foreground">{stat.label}</p>
-                    <p className="text-xl font-bold">{stat.value}</p>
+                    <p className="text-[11px] text-muted-foreground uppercase tracking-wide font-medium">{stat.label}</p>
+                    <p className="text-2xl font-bold tabular-nums">{stat.value}</p>
                   </div>
                 </div>
                 {stat.sparkline && (
@@ -464,24 +484,31 @@ export default function DashboardPage() {
               </CardContent>
             </Card>
           ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {databases.slice(0, 6).map((db) => (
-                <Card key={db.id} className="hover:shadow-md transition-shadow group">
+                <Card key={db.id} className="group relative hover:shadow-lg transition-all duration-300 overflow-hidden">
+                  {/* Gradient accent bar */}
+                  <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-amber-500 to-red-600 opacity-0 group-hover:opacity-100 transition-opacity" />
                   <CardHeader className="pb-2">
                     <div className="flex items-center justify-between">
-                      <CardTitle className="text-base">{db.name}</CardTitle>
-                      <div className="flex items-center gap-1">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <div className="h-8 w-8 rounded-lg bg-gradient-to-br from-amber-500/10 to-red-600/10 dark:from-amber-500/15 dark:to-red-600/15 flex items-center justify-center shrink-0">
+                          <Database className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+                        </div>
+                        <CardTitle className="text-base truncate">{db.name}</CardTitle>
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
                         <Badge
                           variant={db.status === 'ready' ? 'default' : db.status === 'generating' ? 'secondary' : 'outline'}
                           className={
                             db.status === 'ready'
-                              ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
+                              ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 text-[9px]'
                               : db.status === 'generating'
-                              ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
-                              : ''
+                              ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 text-[9px]'
+                              : 'text-[9px]'
                           }
                         >
-                          {db.status === 'generating' && <Loader2 className="mr-1 h-3 w-3 animate-spin" />}
+                          {db.status === 'generating' && <Loader2 className="mr-1 h-2.5 w-2.5 animate-spin" />}
                           {db.status}
                         </Badge>
                         <Button
@@ -495,26 +522,35 @@ export default function DashboardPage() {
                         </Button>
                       </div>
                     </div>
-                    <CardDescription>
-                      {db.db_type} &middot; {(db.row_count || 0).toLocaleString()} rows
-                      {db.quality_score ? ` · ${Math.round(db.quality_score * 100)}% quality` : ''}
+                    <CardDescription className="flex items-center gap-2 text-xs">
+                      <span className="font-mono">{db.db_type}</span>
+                      <span className="text-muted-foreground/50">·</span>
+                      <span className="tabular-nums">{(db.row_count || 0).toLocaleString()} rows</span>
+                      {db.quality_score ? (
+                        <>
+                          <span className="text-muted-foreground/50">·</span>
+                          <span className="text-emerald-600 dark:text-emerald-400">{Math.round(db.quality_score * 100)}% quality</span>
+                        </>
+                      ) : null}
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="pt-0">
-                    <div className="flex items-center justify-between">
-                      <div className="flex gap-1.5">
+                    {/* Table pills preview */}
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex gap-1.5 flex-wrap min-w-0">
                         {Array.isArray(db.schema_json) && db.schema_json.slice(0, 3).map((table) => (
-                          <Badge key={table.name} variant="outline" className="text-[10px]">
+                          <Badge key={table.name} variant="outline" className="text-[10px] font-mono px-1.5 py-0">
+                            <Table2 className="mr-0.5 h-2.5 w-2.5 text-muted-foreground" />
                             {table.name}
                           </Badge>
                         ))}
                         {Array.isArray(db.schema_json) && db.schema_json.length > 3 && (
-                          <Badge variant="outline" className="text-[10px]">
+                          <Badge variant="outline" className="text-[10px] px-1.5 py-0">
                             +{db.schema_json.length - 3}
                           </Badge>
                         )}
                       </div>
-                      <Button variant="ghost" size="sm" asChild className="text-xs">
+                      <Button variant="ghost" size="sm" asChild className="text-xs shrink-0 h-7">
                         <Link href={`/dashboard/studio/${db.id}`}>
                           Open <ArrowRight className="ml-1 h-3 w-3" />
                         </Link>
@@ -531,25 +567,46 @@ export default function DashboardPage() {
       {/* Recent Activity Feed */}
       {recentActivity.length > 0 && (
         <div className="mb-6">
-          <h2 className="text-lg font-semibold mb-3">Recent Activity</h2>
+          <div className="flex items-center gap-2 mb-3">
+            <Activity className="h-4 w-4 text-muted-foreground" />
+            <h2 className="text-lg font-semibold">Recent Activity</h2>
+          </div>
           <Card>
             <CardContent className="pt-4 pb-2">
-              <div className="space-y-2">
-                {recentActivity.map((activity) => (
-                  <div key={activity.id} className="flex items-center gap-3 py-1.5">
-                    <div className="h-7 w-7 rounded-lg bg-muted flex items-center justify-center shrink-0">
-                      <Clock className="h-3.5 w-3.5 text-muted-foreground" />
+              <div className="space-y-1">
+                {recentActivity.map((activity, idx) => (
+                  <div key={activity.id} className="flex items-center gap-3 py-2 px-2 rounded-lg hover:bg-muted/40 transition-colors">
+                    <div className={`h-8 w-8 rounded-lg flex items-center justify-center shrink-0 ${
+                      activity.status === 'ready'
+                        ? 'bg-emerald-100 dark:bg-emerald-900/30'
+                        : 'bg-amber-100 dark:bg-amber-900/30'
+                    }`}>
+                      <Database className={`h-3.5 w-3.5 ${
+                        activity.status === 'ready'
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : 'text-amber-600 dark:text-amber-400'
+                      }`} />
                     </div>
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-medium truncate">{activity.name}</p>
-                      <p className="text-[11px] text-muted-foreground">
-                        {activity.rows} rows · {activity.status}
+                      <p className="text-[11px] text-muted-foreground tabular-nums">
+                        {activity.rows.toLocaleString()} rows · {activity.status}
                         {activity.time && ` · ${new Date(activity.time).toLocaleDateString()}`}
                       </p>
                     </div>
-                    <Badge variant={activity.status === 'ready' ? 'default' : 'secondary'} className="text-[9px]">
+                    <Badge
+                      variant={activity.status === 'ready' ? 'default' : 'secondary'}
+                      className={`text-[9px] ${
+                        activity.status === 'ready'
+                          ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
+                          : ''
+                      }`}
+                    >
                       {activity.status}
                     </Badge>
+                    {idx < recentActivity.length - 1 && (
+                      <ArrowRight className="h-3 w-3 text-muted-foreground/30 ml-1" />
+                    )}
                   </div>
                 ))}
               </div>

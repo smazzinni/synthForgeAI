@@ -7,6 +7,13 @@ import {
   updateDatabaseInMemory,
   deleteDatabaseInMemory,
 } from '@/lib/in-memory-store'
+import {
+  listDatabasesPrisma,
+  getDatabasePrisma,
+  createDatabasePrisma,
+  updateDatabasePrisma,
+  deleteDatabasePrisma,
+} from '@/lib/prisma-store'
 
 // ─── Default user ID for fallback when auth is not available ───
 const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
@@ -130,12 +137,22 @@ export async function GET(request: NextRequest) {
 
     const admin = getSupabaseAdmin()
     if (!admin) {
-      // In-memory fallback
-      if (id) {
-        const db = getDatabaseInMemory(userId, id)
-        return NextResponse.json({ database: db })
+      // Prisma-backed durable storage (survives server restarts)
+      try {
+        if (id) {
+          const database = await getDatabasePrisma(userId, id)
+          return NextResponse.json({ database })
+        }
+        const databases = await listDatabasesPrisma(userId)
+        return NextResponse.json({ databases })
+      } catch (err) {
+        console.warn('[Databases API] Prisma failed, falling back to in-memory:', err)
+        if (id) {
+          const dbRecord = getDatabaseInMemory(userId, id)
+          return NextResponse.json({ database: dbRecord })
+        }
+        return NextResponse.json({ databases: listDatabasesInMemory(userId) })
       }
-      return NextResponse.json({ databases: listDatabasesInMemory(userId) })
     }
 
     // Check cache for list queries (not individual ID queries)
@@ -228,17 +245,31 @@ export async function POST(request: NextRequest) {
     const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
 
     if (!admin) {
-      // In-memory fallback
-      const record = createDatabaseInMemory(userId, {
-        name,
-        db_type,
-        status,
-        schema_json,
-        data_json,
-        row_count: row_count || 0,
-        quality_score,
-      })
-      return NextResponse.json({ database: record })
+      // Prisma-backed durable storage
+      try {
+        const record = await createDatabasePrisma(userId, {
+          name,
+          db_type,
+          status,
+          schema_json,
+          data_json,
+          row_count: row_count || 0,
+          quality_score,
+        })
+        return NextResponse.json({ database: record })
+      } catch (err) {
+        console.warn('[Databases API] Prisma create failed, falling back to in-memory:', err)
+        const record = createDatabaseInMemory(userId, {
+          name,
+          db_type,
+          status,
+          schema_json,
+          data_json,
+          row_count: row_count || 0,
+          quality_score,
+        })
+        return NextResponse.json({ database: record })
+      }
     }
 
     const insertData: Record<string, unknown> = {
@@ -310,19 +341,29 @@ export async function PATCH(request: NextRequest) {
     const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
 
     if (!admin) {
-      // In-memory fallback
-      const patch: Record<string, unknown> = {}
+      // Prisma-backed durable storage
+      const patch: Partial<{ data_json: unknown; schema_json: unknown; row_count: number; quality_score: number | null; status: string; name: string; db_type: string }> = {}
       if (data_json !== undefined) patch.data_json = data_json
       if (schema_json !== undefined) patch.schema_json = schema_json
       if (row_count !== undefined) patch.row_count = row_count
       if (quality_score !== undefined) patch.quality_score = quality_score
       if (status !== undefined) patch.status = status
       if (name !== undefined) patch.name = name
-      const updated = updateDatabaseInMemory(userId, id, patch)
-      if (!updated) {
-        return NextResponse.json({ error: 'Database not found' }, { status: 404 })
+
+      try {
+        const updated = await updateDatabasePrisma(userId, id, patch)
+        if (!updated) {
+          return NextResponse.json({ error: 'Database not found' }, { status: 404 })
+        }
+        return NextResponse.json({ database: updated })
+      } catch (err) {
+        console.warn('[Databases API] Prisma patch failed, falling back to in-memory:', err)
+        const updatedInMem = updateDatabaseInMemory(userId, id, patch)
+        if (!updatedInMem) {
+          return NextResponse.json({ error: 'Database not found' }, { status: 404 })
+        }
+        return NextResponse.json({ database: updatedInMem })
       }
-      return NextResponse.json({ database: updated })
     }
 
     const updateData: Record<string, unknown> = {}
@@ -383,12 +424,25 @@ export async function DELETE(request: NextRequest) {
     const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
 
     if (!admin) {
-      // In-memory fallback
-      const ok = deleteDatabaseInMemory(userId, id)
-      if (!ok) {
-        return NextResponse.json({ error: 'Database not found' }, { status: 404 })
+      // Prisma-backed durable storage
+      try {
+        const ok = await deleteDatabasePrisma(userId, id)
+        if (!ok) {
+          // Try in-memory as fallback
+          const okInMem = deleteDatabaseInMemory(userId, id)
+          if (!okInMem) {
+            return NextResponse.json({ error: 'Database not found' }, { status: 404 })
+          }
+        }
+        return NextResponse.json({ success: true })
+      } catch (err) {
+        console.warn('[Databases API] Prisma delete failed, falling back to in-memory:', err)
+        const okInMem = deleteDatabaseInMemory(userId, id)
+        if (!okInMem) {
+          return NextResponse.json({ error: 'Database not found' }, { status: 404 })
+        }
+        return NextResponse.json({ success: true })
       }
-      return NextResponse.json({ success: true })
     }
 
     const { error } = await admin
