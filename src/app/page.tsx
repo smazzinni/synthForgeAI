@@ -138,8 +138,13 @@ export default function LandingPage() {
 
       {/* Hero Section */}
       <section className="relative overflow-hidden">
+        {/* Animated gradient mesh background */}
         <div className="absolute inset-0 bg-gradient-to-br from-amber-50 via-background to-red-50 dark:from-amber-950/20 dark:via-background dark:to-red-950/20" />
         <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-amber-200/20 via-transparent to-transparent dark:from-amber-900/10" />
+        {/* Floating gradient orbs */}
+        <div className="absolute top-20 -left-20 h-72 w-72 rounded-full bg-amber-400/10 dark:bg-amber-500/5 blur-3xl animate-pulse" style={{ animationDuration: '8s' }} />
+        <div className="absolute top-40 right-10 h-96 w-96 rounded-full bg-red-400/10 dark:bg-red-500/5 blur-3xl animate-pulse" style={{ animationDuration: '12s', animationDelay: '2s' }} />
+        <div className="absolute bottom-0 left-1/3 h-80 w-80 rounded-full bg-orange-400/8 dark:bg-orange-500/5 blur-3xl animate-pulse" style={{ animationDuration: '10s', animationDelay: '4s' }} />
         {/* Subtle grid pattern overlay */}
         <div
           className="absolute inset-0 opacity-[0.03] dark:opacity-[0.05]"

@@ -2286,9 +2286,31 @@ function StudioPageInner({
                           <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => copyToClipboard(JSON.stringify(currentTableData, null, 2))} title="Copy as JSON">
                             <Copy className="h-2.5 w-2.5" />
                           </Button>
-                          <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => exportAsJSON(currentTableData, `${selectedTable}.json`)} title="Download as JSON">
-                            <Download className="h-2.5 w-2.5" />
-                          </Button>
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button variant="ghost" size="sm" className="h-5 w-5 p-0" title="Download table">
+                                <Download className="h-2.5 w-2.5" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end" className="text-xs">
+                              <DropdownMenuItem onClick={() => exportAsJSON(currentTableData, `${selectedTable}.json`)}>
+                                <FileJson className="mr-2 h-3 w-3" />
+                                JSON (.json)
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => exportAsCSV(currentTableData as Record<string, unknown>[], `${selectedTable}.csv`)}>
+                                <FileSpreadsheet className="mr-2 h-3 w-3" />
+                                CSV (.csv)
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => {
+                                const singleSchema = generatedSchema.find(s => s.name === selectedTable)
+                                const singleData = selectedTable ? { [selectedTable]: generatedData[selectedTable] || [] } : {}
+                                exportAsSQL(singleSchema ? [singleSchema] : [], singleData, `${selectedTable}.sql`)
+                              }}>
+                                <FileText className="mr-2 h-3 w-3" />
+                                SQL Dump (.sql)
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
                           <span className="hidden sm:inline-flex items-center gap-1 text-[9px] text-muted-foreground/80 border border-border rounded px-1.5 py-0.5 bg-muted/30 ml-1" title="Double-click any cell to edit it in place">
                             <MousePointerClick className="h-2.5 w-2.5" />
                             Double-click a cell to edit
