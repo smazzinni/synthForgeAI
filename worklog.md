@@ -688,3 +688,35 @@ Stage Summary:
 - App functionally stable across all flows
 - 2 pages significantly improved
 - All changes pushed to git main (commit 4f67032)
+
+---
+Task ID: CRON-REVIEW-3
+Agent: Main Agent (Z.ai Code) — webDevReview cron
+Task: QA assessment, ER diagram FK fix, login/signup page enhancements
+
+Work Log:
+- Reviewed worklogs for prior context
+- Performed QA via agent-browser: studio chat works, Explorer ER diagram rated 6/10 (no relationship arrows), login page rated 7/10 (no password toggle)
+
+Issues fixed:
+
+1. ER diagram FK matching (BUG FIX, 6/10 → 8/10):
+   - Root cause: computeERLayout matched FK columns to tables by exact singular name only (customer_id → customer), but AI generates plural table names (customers), so no edges detected
+   - Fix: Added plural/singular matching (+s, +es, -ies→-y, reverse singularization)
+   - VLM confirmed: 'relationship lines/arrows connect the tables' (8/10)
+
+2. Login page (STYLING, 7/10 → 8/10):
+   - Two-panel split layout with branding panel (animated orbs, headline, feature checklist)
+   - Password show/hide toggle, h-11 buttons, shadow-xl card
+
+3. Signup page (FEATURE):
+   - Password show/hide toggle
+   - 3-segment password strength indicator (red→amber→emerald, Weak/Good/Strong)
+
+Verification:
+- Build passes cleanly
+- VLM rated ER diagram 8/10
+- All toggles/indicators tested
+
+Stage Summary:
+- 3 improvements pushed to git main (commit 91cc541)
