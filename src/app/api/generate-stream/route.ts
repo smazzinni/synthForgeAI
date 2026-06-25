@@ -20,7 +20,7 @@ const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'
-const DEEPSEEK_MAX_TOKENS = parseInt(process.env.DEEPSEEK_MAX_TOKENS || '16000', 10)
+const DEEPSEEK_MAX_TOKENS = parseInt(process.env.DEEPSEEK_MAX_TOKENS || '32000', 10)
 
 const BATCH_SIZE = 200          // rows per batch insert
 const FLUSH_INTERVAL_MS = 300   // flush batch at least every 300ms
@@ -94,21 +94,38 @@ function buildGenerationPrompt(req: GenerationRequest): string {
     return `Table: ${table.name} (${rowCount} rows)\n${colDefs}`
   }).join('\n\n')
 
+  const totalRows = Object.values(req.rowCounts).reduce((sum, n) => sum + n, 0)
+  const tableOrder = req.schema.map(s => s.name).join(' → ')
+
   return `You are a data generation engine. Generate realistic synthetic data for the following database schema.
 
 DATABASE: ${req.databaseName || 'synthetic_db'}
 
-SCHEMA:
+SCHEMA (${req.schema.length} tables):
 ${tableDescriptions}
 
 ${req.instructions ? `ADDITIONAL INSTRUCTIONS:\n${req.instructions}\n` : ''}
 
-RULES:
+═══════════════════════════════════════════════════════════
+CRITICAL REQUIREMENTS — READ CAREFULLY:
+═══════════════════════════════════════════════════════════
+1. You MUST generate data for ALL ${req.schema.length} tables listed above. Do NOT stop after the first table.
+2. Table generation order: ${tableOrder}
+3. After completing one table's records, IMMEDIATELY output the next ###TABLE:xxx### marker and continue with that table's records.
+4. Do NOT end your response until EVERY table has been generated.
+5. Total tables to generate: ${req.schema.length}
+6. Total records to generate: ${totalRows}
+═══════════════════════════════════════════════════════════
+
+OUTPUT FORMAT:
 - Output ONLY raw NDJSON — one JSON object per line.
 - No arrays. No wrapper keys like {"tables":...}. No markdown. No explanation. No code fences.
 - Each line must be a complete, valid JSON record for the CURRENT table.
 - Generate records for each table sequentially: first ALL records for the first table, then ALL for the next, etc.
 - Before each table's records, output a single marker line: ###TABLE:table_name###
+- After the last record of the final table, you may stop.
+
+DATA QUALITY:
 - Use realistic values (real-looking names, emails, addresses, phone numbers, cities, companies).
 - Use proper data types (numbers for quantities, ISO 8601 dates for timestamps, UUIDs for IDs).
 - Always include an "id" column as a UUID string for each record.
@@ -117,16 +134,43 @@ RULES:
 - Maintain referential integrity between tables (foreign key values must reference existing primary keys).
 - For localized data, use appropriate names, phone formats, currencies, and addresses.
 
-Begin immediately. Do not confirm or summarize first.
+Begin immediately. Do not confirm or summarize first. Generate ALL ${req.schema.length} tables in this single response.
 
-Example output format:
+Example output format (2-table example):
 ###TABLE:users###
 {"id":"a1b2c3d4-5678-9012-abcd-ef1234567890","name":"Alice Johnson","email":"alice@example.com","created_at":"2024-01-15T10:30:00Z"}
 {"id":"b2c3d4e5-6789-0123-bcde-f12345678901","name":"Bob Smith","email":"bob@example.com","created_at":"2024-01-16T14:22:00Z"}
 ###TABLE:orders###
 {"id":"c3d4e5f6-7890-1234-cdef-123456789012","user_id":"a1b2c3d4-5678-9012-abcd-ef1234567890","total":99.99,"created_at":"2024-02-01T09:15:00Z"}
 
+REMINDER: You MUST generate ALL ${req.schema.length} tables. Do NOT stop early.
+
 Now generate the data. Start with ###TABLE:${req.schema[0]?.name || 'table1'}###`
+}
+
+// ─── Build a focused continuation prompt for a single table ───
+function buildContinuationPrompt(
+  tableName: string,
+  rowCount: number,
+  columns: Array<{ name: string; type: string }>,
+): string {
+  const colDefs = columns.map(c => `  ${c.name}: ${c.type}`).join('\n')
+  return `Generate ${rowCount} realistic records for the "${tableName}" table.
+
+COLUMNS:
+${colDefs}
+
+RULES:
+- Output ONLY raw NDJSON — one JSON object per line.
+- No arrays. No wrapper keys. No markdown. No explanation. No code fences.
+- Start with a single marker line: ###TABLE:${tableName}###
+- Each line after the marker must be a complete, valid JSON record.
+- Use realistic values. Include UUIDs for IDs and ISO 8601 timestamps.
+- Always include an "id" column as a UUID string for each record.
+- Generate exactly ${rowCount} records — no more, no less.
+- Do not output anything after the last record.
+
+Begin now:`
 }
 
 export async function POST(request: NextRequest) {
@@ -240,8 +284,10 @@ export async function POST(request: NextRequest) {
     const totalRows = Object.values(body.rowCounts).reduce((sum, n) => sum + n, 0)
     messages.push({
       role: 'user',
-      content: `Generate the data now. ${totalRows} total rows across ${body.schema.length} tables. Begin with ###TABLE:${body.schema[0]?.name}###`,
+      content: `Generate the data now. ${totalRows} total rows across ${body.schema.length} tables. You MUST generate ALL ${body.schema.length} tables — do not stop after the first. Begin with ###TABLE:${body.schema[0]?.name}###`,
     })
+
+    console.log(`[Generate-Stream] Starting generation: ${body.schema.length} tables, ${totalRows} total rows. Tables: [${body.schema.map(s => s.name).join(', ')}]`)
 
     // ─── Call DeepSeek v4 API with TRUE streaming to generate NDJSON data ───
     if (!DEEPSEEK_API_KEY) {
@@ -294,6 +340,7 @@ export async function POST(request: NextRequest) {
     let currentTableInserted = 0
     let lastFlushTime = Date.now()
     let malformedLines = 0
+    let lastFinishReason = ''
 
     const sendSSE = (event: SSEEvent): Uint8Array => {
       return encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
@@ -500,6 +547,9 @@ export async function POST(request: NextRequest) {
 
                 // Handle finish reason
                 if (choice.finish_reason) {
+                  lastFinishReason = choice.finish_reason
+                  console.log(`[Generate-Stream] Main stream finished. Reason: ${choice.finish_reason}`)
+
                   // Process any remaining content in the buffer
                   if (contentBuffer.trim()) {
                     const line = contentBuffer.trim()
@@ -535,6 +585,245 @@ export async function POST(request: NextRequest) {
               table: currentTable,
               totalRows: currentTableInserted,
             }))
+          }
+
+          // ═══════════════════════════════════════════════════════════
+          // CONTINUATION MECHANISM (Fix 2)
+          // After the main stream ends, check if all expected tables got
+          // data. If any are missing, make focused follow-up API calls for
+          // each missing table and stream the resulting records through the
+          // same SSE stream.
+          // ═══════════════════════════════════════════════════════════
+          if (!clientCancelled) {
+            const expectedTables = body.schema.map(s => s.name)
+            const generatedTables = Object.keys(allTableData)
+            const missingTables = expectedTables.filter(
+              t => !generatedTables.includes(t) || (allTableData[t]?.length || 0) === 0
+            )
+
+            console.log(`[Generate-Stream] Expected tables: [${expectedTables.join(', ')}]`)
+            console.log(`[Generate-Stream] Generated tables: [${generatedTables.join(', ')}] (rows: ${generatedTables.map(t => `${t}=${allTableData[t]?.length || 0}`).join(', ')})`)
+
+            if (missingTables.length > 0) {
+              console.warn(`[Generate-Stream] ⚠️ ${missingTables.length} table(s) missing data. Triggering continuation: [${missingTables.join(', ')}]`)
+
+              safeEnqueue(sendSSE({
+                type: 'progress',
+                table: '',
+                message: `Continuing generation for ${missingTables.length} remaining table${missingTables.length === 1 ? '' : 's'}...`,
+                totalInserted,
+                targetRows: totalRows,
+              }))
+
+              // Wrap the entire continuation phase in a top-level try/catch
+              // so a failure never propagates to the outer catch (best-effort).
+              try {
+                for (const missingTable of missingTables) {
+                  if (clientCancelled) break
+
+                  const tableSchema = body.schema.find(s => s.name === missingTable)
+                  if (!tableSchema) {
+                    console.warn(`[Generate-Stream] Continuation: schema not found for ${missingTable}, skipping.`)
+                    continue
+                  }
+
+                  const rowCount = body.rowCounts[missingTable] || 10
+                  console.log(`[Generate-Stream] Continuation: generating ${rowCount} rows for [${missingTable}]`)
+
+                  const continuationPrompt = buildContinuationPrompt(
+                    missingTable,
+                    rowCount,
+                    tableSchema.columns,
+                  )
+
+                  let contResponse: Response
+                  try {
+                    contResponse = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
+                      method: 'POST',
+                      headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+                      },
+                      body: JSON.stringify({
+                        model: DEEPSEEK_MODEL,
+                        messages: [
+                          { role: 'system', content: continuationPrompt },
+                          { role: 'user', content: `Generate ${rowCount} records for ${missingTable} now.` },
+                        ],
+                        stream: true,
+                        max_tokens: DEEPSEEK_MAX_TOKENS,
+                        stream_options: { include_usage: true },
+                      }),
+                    })
+                  } catch (fetchErr) {
+                    console.warn(`[Generate-Stream] Continuation fetch failed for ${missingTable}:`, fetchErr)
+                    continue
+                  }
+
+                  if (!contResponse.ok) {
+                    const contErrText = await contResponse.text().catch(() => 'Unknown error')
+                    console.warn(`[Generate-Stream] Continuation HTTP ${contResponse.status} for ${missingTable}:`, contErrText)
+                    continue
+                  }
+
+                  const contReader = contResponse.body?.getReader()
+                  if (!contReader) {
+                    console.warn(`[Generate-Stream] Continuation: no response body for ${missingTable}`)
+                    continue
+                  }
+
+                  // Set currentTable to the missing table and reset counters
+                  currentTable = missingTable
+                  currentTableInserted = (allTableData[missingTable]?.length) || 0
+                  lastFlushTime = Date.now()
+
+                  safeEnqueue(sendSSE({
+                    type: 'progress',
+                    table: missingTable,
+                    message: `Streaming records into [${missingTable}]`,
+                    rowsInserted: 0,
+                    totalInserted,
+                    targetRows: rowCount,
+                  }))
+
+                  // Process the continuation stream (same NDJSON parsing logic)
+                  const contDecoder = new TextDecoder()
+                  let contAiBuffer = ''
+                  let contContentBuffer = ''
+                  let contFinishReason = ''
+
+                  try {
+                    while (true) {
+                      if (clientCancelled) break
+                      const { done: contDone, value: contValue } = await contReader.read()
+                      if (contDone) break
+
+                      contAiBuffer += contDecoder.decode(contValue, { stream: true })
+                      const contAiLines = contAiBuffer.split('\n')
+                      contAiBuffer = contAiLines.pop() || ''
+
+                      for (const contAiLine of contAiLines) {
+                        const trimmedCont = contAiLine.trim()
+                        if (!trimmedCont || !trimmedCont.startsWith('data: ')) continue
+                        const contData = trimmedCont.slice(6)
+                        if (contData === '[DONE]') continue
+
+                        try {
+                          const parsed = JSON.parse(contData)
+                          const choice = parsed.choices?.[0]
+                          if (!choice) continue
+                          const delta = choice.delta
+                          if (delta?.content) {
+                            contContentBuffer += delta.content
+                            const contentLines = contContentBuffer.split('\n')
+                            contContentBuffer = contentLines.pop() || ''
+
+                            for (const contentLine of contentLines) {
+                              if (clientCancelled) break
+                              const line = contentLine.trim()
+                              if (!line) continue
+
+                              const tableMarker = line.match(/^###TABLE:(.+?)###$/)
+                              if (tableMarker) {
+                                // Flush the current queue before switching tables
+                                if (insertQueue.length > 0 && currentTable) {
+                                  await flushBatch(currentTable, insertQueue.splice(0))
+                                  safeEnqueue(sendSSE({
+                                    type: 'progress',
+                                    table: currentTable,
+                                    rowsInserted: currentTableInserted,
+                                    totalInserted,
+                                    targetRows: rowCount,
+                                  }))
+                                }
+                                currentTable = tableMarker[1]
+                                currentTableInserted = (allTableData[currentTable]?.length) || 0
+                                continue
+                              }
+
+                              if (currentTable) {
+                                try {
+                                  const record = JSON.parse(line)
+                                  if (typeof record === 'object' && record !== null && !Array.isArray(record)) {
+                                    insertQueue.push(record)
+                                    const now = Date.now()
+                                    if (insertQueue.length >= BATCH_SIZE || now - lastFlushTime >= FLUSH_INTERVAL_MS) {
+                                      await flushBatch(currentTable, insertQueue.splice(0))
+                                      lastFlushTime = now
+                                      safeEnqueue(sendSSE({
+                                        type: 'progress',
+                                        table: currentTable,
+                                        rowsInserted: currentTableInserted,
+                                        totalInserted,
+                                        targetRows: rowCount,
+                                      }))
+                                    }
+                                  }
+                                } catch {
+                                  // skip malformed line in continuation
+                                }
+                              }
+                            }
+                          }
+
+                          if (choice.finish_reason) {
+                            contFinishReason = choice.finish_reason
+                            // Process any remaining content in the buffer
+                            if (contContentBuffer.trim()) {
+                              const line = contContentBuffer.trim()
+                              const tableMarker = line.match(/^###TABLE:(.+?)###$/)
+                              if (!tableMarker && currentTable) {
+                                try {
+                                  const record = JSON.parse(line)
+                                  if (typeof record === 'object' && record !== null && !Array.isArray(record)) {
+                                    insertQueue.push(record)
+                                  }
+                                } catch {
+                                  // skip
+                                }
+                              }
+                              contContentBuffer = ''
+                            }
+                          }
+                        } catch {
+                          // skip unparseable chunk
+                        }
+                      }
+                    }
+                  } catch (contErr) {
+                    console.warn(`[Generate-Stream] Continuation stream error for ${missingTable}:`, contErr)
+                  }
+
+                  // Flush any remaining records queued for this table
+                  if (insertQueue.length > 0 && currentTable) {
+                    try {
+                      await flushBatch(currentTable, insertQueue.splice(0))
+                    } catch {
+                      // best effort
+                    }
+                  }
+
+                  const finalCount = allTableData[missingTable]?.length || 0
+                  console.log(`[Generate-Stream] Continuation complete for [${missingTable}]: ${finalCount} rows (finish_reason: ${contFinishReason || 'n/a'})`)
+
+                  // Mark this continuation table complete
+                  safeEnqueue(sendSSE({
+                    type: 'table_complete',
+                    table: missingTable,
+                    totalRows: finalCount,
+                  }))
+
+                  try { contReader.cancel() } catch { /* already released */ }
+                  try { contReader.releaseLock() } catch { /* already released */ }
+                }
+
+                console.log(`[Generate-Stream] Continuation phase finished.`)
+              } catch (contOuterErr) {
+                console.warn('[Generate-Stream] Continuation phase encountered an error (continuing with what we have):', contOuterErr)
+              }
+            } else {
+              console.log(`[Generate-Stream] ✓ All ${expectedTables.length} table(s) generated in main pass — no continuation needed.`)
+            }
           }
         } catch (err) {
           console.error('[Generate-Stream] Stream error:', err)
@@ -610,7 +899,10 @@ export async function POST(request: NextRequest) {
           const durationMs = Date.now() - startTime
           const tablesGenerated = Object.keys(allTableData).length
 
-          // Mark any tables with data as complete
+          console.log(`[Generate-Stream] Generation complete: ${totalInserted} rows across ${tablesGenerated}/${body.schema.length} tables in ${(durationMs / 1000).toFixed(1)}s (finish_reason: ${lastFinishReason || 'n/a'})`)
+
+          // Mark any tables with data as complete (covers tables that were
+          // processed by the main stream but not explicitly marked above).
           for (const tableName of Object.keys(allTableData)) {
             if (tableName !== currentTable) {
               safeEnqueue(sendSSE({

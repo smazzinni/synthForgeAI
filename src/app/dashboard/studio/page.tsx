@@ -5,7 +5,30 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { Card, CardContent } from '@/components/ui/card'
+import { Separator } from '@/components/ui/separator'
 import { ScrollArea } from '@/components/ui/scroll-area'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   DropdownMenu,
@@ -61,6 +84,11 @@ import {
   Link2,
   Layers,
   MousePointerClick,
+  RefreshCw,
+  Search,
+  ArrowRight,
+  Columns,
+  ChevronRight,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
@@ -1689,6 +1717,88 @@ function StudioPageInner({
   const [newColumnType, setNewColumnType] = useState('varchar(255)')
   const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set())
 
+  // ─── Schema preview + data viz enhancement state ───
+  // Collapsible "Schema" panel in the right panel area (defaults open so the
+  // user immediately sees table/column/row totals once data is generated).
+  const [schemaPanelOpen, setSchemaPanelOpen] = useState(true)
+  // Confirmation dialog for "Regenerate Data" — replacing all existing rows
+  // with fresh synthetic data using the same schema + row counts.
+  const [regenerateConfirmOpen, setRegenerateConfirmOpen] = useState(false)
+  // Per-table row search filter in the Data tab. Filters the displayedRows by
+  // matching the query against any cell's stringified value.
+  const [dataSearchQuery, setDataSearchQuery] = useState('')
+
+  // ─── Schema-wide stats for the preview panel ───
+  // Computed once per render from generatedSchema + generatedData. Cheap
+  // because schemas are small (<100 tables typically).
+  const schemaStats = (() => {
+    const tableCount = generatedSchema.length
+    let columnCount = 0
+    let rowCount = 0
+    const typeBreakdown = new Map<string, number>()
+    for (const table of generatedSchema) {
+      columnCount += table.columns.length
+      for (const col of table.columns) {
+        // Normalize the type (strip length like varchar(255) -> varchar) so
+        // the breakdown reads "3 varchar" rather than "2 varchar(255), 1 varchar(100)".
+        const normalized = col.type.toLowerCase().replace(/\(.*\)/g, '').trim() || col.type
+        typeBreakdown.set(normalized, (typeBreakdown.get(normalized) || 0) + 1)
+      }
+    }
+    for (const rows of Object.values(generatedData)) {
+      rowCount += Array.isArray(rows) ? rows.length : 0
+    }
+    return { tableCount, columnCount, rowCount, typeBreakdown }
+  })()
+
+  // ─── Regenerate Data ───
+  // Rebuilds a BeginGenerationSignal from the current schema + row counts and
+  // kicks off the streaming generation pipeline, replacing all existing data.
+  // Reuses the same mechanism the AI uses when it first emits BEGIN_GENERATION.
+  const regenerateData = async () => {
+    if (generatedSchema.length === 0) {
+      toast.error('No schema to regenerate from')
+      return
+    }
+
+    // Build row counts from the current data (fall back to 10 rows per table
+    // if a table exists in schema but not in data yet).
+    const rowCounts: Record<string, number> = {}
+    for (const table of generatedSchema) {
+      const rows = generatedData[table.name]
+      rowCounts[table.name] = Array.isArray(rows) && rows.length > 0 ? rows.length : 10
+    }
+
+    const signal: BeginGenerationSignal = {
+      action: 'BEGIN_GENERATION',
+      schema: generatedSchema,
+      rowCounts,
+      instructions: 'Regenerate fresh synthetic data for the existing schema. Produce realistic, varied values.',
+      databaseName: databaseName || generatedSchema[0]?.name || 'Regenerated Database',
+    }
+
+    // Clear existing data so the new generation starts clean. The schema is
+    // preserved (it's the same schema the user is regenerating from).
+    setGeneratedData({})
+
+    // Add a chat message so the user sees the regeneration happening in-line
+    // with the rest of their conversation history.
+    const assistantId = (Date.now() + 100).toString()
+    setMessages(prev => [...prev, {
+      id: assistantId,
+      role: 'assistant',
+      content: 'Regenerating data with the same schema and row counts…',
+      agentName: 'Data Generator',
+      timestamp: new Date(),
+      isStreaming: false,
+    }])
+
+    setRegenerateConfirmOpen(false)
+    toast.info('Regenerating data — this will replace all existing rows')
+
+    await startStreamingGeneration(signal, assistantId)
+  }
+
   const handleAddTable = () => {
     if (!newTableName.trim()) return
     const cols = newTableColumns.split(',').map(c => c.trim()).filter(Boolean)
@@ -1788,8 +1898,23 @@ function StudioPageInner({
   const headerColumns = currentTableColumns.length > 0
     ? currentTableColumns
     : (currentTableSchema?.columns?.map(c => c.name) || [])
-  const displayedRows = currentTableData.slice(0, visibleRows)
-  const hasMoreRows = currentTableData.length > visibleRows
+  // ─── Search filter for the data grid ───
+  // When the user types in the per-table search box, filter the rows to those
+  // whose stringified cell values include the (case-insensitive) query. The
+  // filtered set is what gets sliced by visibleRows so "Load more" still works.
+  const filteredTableData = (() => {
+    const q = dataSearchQuery.trim().toLowerCase()
+    if (!q) return currentTableData
+    return currentTableData.filter((row) => {
+      const r = row as Record<string, unknown>
+      return Object.values(r).some(v => {
+        if (v === null || v === undefined) return false
+        return String(v).toLowerCase().includes(q)
+      })
+    })
+  })()
+  const displayedRows = filteredTableData.slice(0, visibleRows)
+  const hasMoreRows = filteredTableData.length > visibleRows
 
   // ─── ER Diagram Layout ───
   // Delegates to the extracted helper in ./_lib/utils.
@@ -2152,10 +2277,157 @@ function StudioPageInner({
                     Delete
                   </Button>
                 )}
+
+                {/* Copy SQL — copies the current SQL editor content (or the
+                    generated schema SQL if the editor is empty) to the
+                    clipboard so it can be pasted into an external tool. */}
+                <TooltipProvider delayDuration={300}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-6 text-[10px] gap-1"
+                        onClick={() => {
+                          const content = sqlEditor.trim() || generateSchemaSQL()
+                          navigator.clipboard.writeText(content)
+                          toast.success('SQL copied to clipboard')
+                        }}
+                      >
+                        <Copy className="h-2.5 w-2.5" />
+                        Copy SQL
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom">
+                      <p className="text-xs">Copy current SQL (or schema DDL if editor is empty) to clipboard</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+
+                {/* Regenerate Data — replaces all existing rows with fresh
+                    synthetic data using the same schema + per-table row
+                    counts. Disabled in live-DB mode (data lives in the
+                    external DB, not synthforge) and while a generation is
+                    already running. */}
+                {!isLiveDbMode && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 text-[10px] gap-1 text-amber-700 dark:text-amber-400 border-amber-300 dark:border-amber-700 hover:bg-amber-50 dark:hover:bg-amber-950/30"
+                    onClick={() => setRegenerateConfirmOpen(true)}
+                    disabled={generationProgress.isGenerating || loading}
+                    title="Regenerate all data using the current schema and row counts"
+                  >
+                    <RefreshCw className={`h-2.5 w-2.5 ${generationProgress.isGenerating ? 'animate-spin' : ''}`} />
+                    Regenerate
+                  </Button>
+                )}
               </>
             )}
           </div>
         </div>
+
+        {/* ─── Schema Preview Panel (collapsible) ───
+            Shown once a database has been generated. Replaces the "No Data
+            Generated Yet" empty state in spirit — when data exists the user
+            gets a compact at-a-glance summary of the schema (tables, columns,
+            rows) plus clickable table chips that select the table in the Data
+            tab. Defaults open so the totals are visible immediately. */}
+        {hasGeneratedData && (
+          <Collapsible
+            open={schemaPanelOpen}
+            onOpenChange={setSchemaPanelOpen}
+            className="border-b bg-gradient-to-r from-amber-50/60 to-red-50/40 dark:from-amber-950/20 dark:to-red-950/10 shrink-0"
+          >
+            <CollapsibleTrigger asChild>
+              <button
+                type="button"
+                className="w-full flex items-center gap-2 px-3 py-1.5 hover:bg-amber-100/50 dark:hover:bg-amber-950/30 transition-colors text-left"
+              >
+                <div className="h-5 w-5 rounded-md bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center shrink-0">
+                  <Database className="h-2.5 w-2.5 text-white" />
+                </div>
+                <span className="text-[11px] font-semibold text-foreground">Schema</span>
+                {/* Totals summary — always visible so the user sees counts even
+                    when the panel is collapsed. */}
+                <div className="flex items-center gap-1 ml-1">
+                  <Badge variant="outline" className="text-[9px] gap-0.5 h-4 px-1 border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30">
+                    <Table2 className="h-2 w-2" />
+                    {schemaStats.tableCount} tables
+                  </Badge>
+                  <Badge variant="outline" className="text-[9px] gap-0.5 h-4 px-1 border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30">
+                    <Columns className="h-2 w-2" />
+                    {schemaStats.columnCount} cols
+                  </Badge>
+                  <Badge variant="outline" className="text-[9px] gap-0.5 h-4 px-1 border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30">
+                    <Database className="h-2 w-2" />
+                    {schemaStats.rowCount.toLocaleString()} rows
+                  </Badge>
+                </div>
+                <ChevronDown className={`h-3 w-3 ml-auto text-muted-foreground transition-transform ${schemaPanelOpen ? 'rotate-180' : ''}`} />
+              </button>
+            </CollapsibleTrigger>
+            <CollapsibleContent>
+              <div className="px-3 pb-2 pt-0.5">
+                {/* Column-type breakdown — e.g. "3 uuid, 2 varchar, 1 timestamp" */}
+                {schemaStats.typeBreakdown.size > 0 && (
+                  <div className="flex items-center gap-1 flex-wrap mb-1.5">
+                    <span className="text-[9px] text-muted-foreground uppercase tracking-wider">Types:</span>
+                    {[...schemaStats.typeBreakdown.entries()]
+                      .sort((a, b) => b[1] - a[1])
+                      .slice(0, 8)
+                      .map(([type, count]) => (
+                        <Badge key={type} variant="secondary" className="text-[8px] font-mono px-1 py-0 h-3.5 bg-amber-100/80 dark:bg-amber-900/30 text-amber-800 dark:text-amber-300">
+                          {count} {type}
+                        </Badge>
+                      ))}
+                  </div>
+                )}
+                <Separator className="mb-1.5 bg-amber-200/50 dark:bg-amber-800/30" />
+                {/* Compact scrollable list of tables — clickable to select in Data tab */}
+                <div className="max-h-32 overflow-y-auto pr-1 space-y-0.5
+                                [&::-webkit-scrollbar]:w-1.5
+                                [&::-webkit-scrollbar-thumb]:rounded-full
+                                [&::-webkit-scrollbar-thumb]:bg-amber-300/60
+                                dark:[&::-webkit-scrollbar-thumb]:bg-amber-700/50">
+                  {generatedSchema.map((table) => {
+                    const rows = generatedData[table.name]
+                    const rowCount = Array.isArray(rows) ? rows.length : 0
+                    const isActive = selectedTable === table.name
+                    return (
+                      <button
+                        key={table.name}
+                        type="button"
+                        onClick={() => {
+                          setSelectedTable(table.name)
+                          setVisibleRows(20)
+                          setDataSearchQuery('')
+                          setActiveTab('data')
+                        }}
+                        className={`w-full flex items-center gap-1.5 px-1.5 py-1 rounded text-[10px] transition-colors group ${
+                          isActive
+                            ? 'bg-amber-100 dark:bg-amber-900/40 text-amber-900 dark:text-amber-200'
+                            : 'hover:bg-amber-50 dark:hover:bg-amber-950/30 text-foreground/80'
+                        }`}
+                        title={`${table.name} — ${table.columns.length} columns, ${rowCount} rows`}
+                      >
+                        <Table2 className={`h-2.5 w-2.5 shrink-0 ${isActive ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground'}`} />
+                        <span className="font-mono font-medium truncate flex-1 text-left">{table.name}</span>
+                        <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 gap-0.5 border-amber-300/60 dark:border-amber-700/50 text-muted-foreground shrink-0">
+                          <Columns className="h-2 w-2" />
+                          {table.columns.length}
+                        </Badge>
+                        <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 min-w-[20px] text-center shrink-0 border-amber-300/60 dark:border-amber-700/50 text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30">
+                          {rowCount}
+                        </Badge>
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+        )}
 
         {hasGeneratedData ? (
           <Tabs value={activeTab} onValueChange={setActiveTab} className="flex flex-col flex-1 min-h-0">
@@ -2225,23 +2497,37 @@ function StudioPageInner({
                     </div>
                   </div>
                   <div className="flex-1 overflow-y-auto p-1 space-y-0.5 max-h-96">
-                    {Object.entries(generatedData).map(([tableName, rows]) => (
-                      <button
-                        key={tableName}
-                        onClick={() => { setSelectedTable(tableName); setVisibleRows(20) }}
-                        className={`w-full text-left px-2 py-1 rounded text-[11px] font-medium transition-colors flex items-center gap-1.5 group ${
-                          selectedTable === tableName
-                            ? 'bg-accent text-accent-foreground'
-                            : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
-                        }`}
-                      >
-                        <Table2 className="h-2.5 w-2.5 shrink-0" />
-                        <span className="truncate">{tableName}</span>
-                        <Badge variant="outline" className="ml-auto text-[8px] px-0.5 py-0 min-w-[16px] text-center">
-                          {rows.length}
-                        </Badge>
-                      </button>
-                    ))}
+                    {Object.entries(generatedData).map(([tableName, rows]) => {
+                      const rowCount = Array.isArray(rows) ? rows.length : 0
+                      const isActive = selectedTable === tableName
+                      return (
+                        <button
+                          key={tableName}
+                          onClick={() => { setSelectedTable(tableName); setVisibleRows(20); setDataSearchQuery('') }}
+                          className={`w-full text-left px-2 py-1 rounded text-[11px] font-medium transition-colors flex items-center gap-1.5 group ${
+                            isActive
+                              ? 'bg-accent text-accent-foreground'
+                              : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
+                          }`}
+                          title={`${tableName} — ${rowCount} row${rowCount === 1 ? '' : 's'}`}
+                        >
+                          <Table2 className={`h-2.5 w-2.5 shrink-0 ${isActive ? 'text-amber-600 dark:text-amber-400' : ''}`} />
+                          <span className="truncate">{tableName}</span>
+                          {/* Row count badge — amber-tinted so it reads as a row
+                              count at a glance (matches the example "users (10)"). */}
+                          <Badge
+                            variant="outline"
+                            className={`ml-auto text-[8px] px-1 py-0 min-w-[20px] text-center h-3.5 shrink-0 transition-colors ${
+                              isActive
+                                ? 'border-amber-400 dark:border-amber-600 bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300'
+                                : 'border-amber-300/60 dark:border-amber-700/40 bg-amber-50 dark:bg-amber-950/20 text-amber-700 dark:text-amber-400 group-hover:bg-amber-100 dark:group-hover:bg-amber-900/40'
+                            }`}
+                          >
+                            {rowCount}
+                          </Badge>
+                        </button>
+                      )
+                    })}
                   </div>
                 </div>
 
@@ -2346,7 +2632,76 @@ function StudioPageInner({
                           </span>
                         </div>
                       </div>
-                      <div className="flex-1 overflow-auto">
+
+                      {/* ─── Table Info card + row search ───
+                          Compact at-a-glance summary of the selected table
+                          (column count, row count, type breakdown) plus a
+                          "View in Explorer" shortcut, and a search box that
+                          filters rows within this table by any cell value. */}
+                      <div className="px-2.5 py-1.5 border-b bg-muted/20 shrink-0 flex items-center gap-2 flex-wrap">
+                        <Card className="px-2 py-1 shadow-none border-amber-200/60 dark:border-amber-800/40 bg-amber-50/40 dark:bg-amber-950/20">
+                          <CardContent className="p-0 flex items-center gap-2">
+                            <Table2 className="h-3 w-3 text-amber-600 dark:text-amber-400 shrink-0" />
+                            <span className="text-[11px] font-bold text-foreground truncate max-w-[120px]">{selectedTable}</span>
+                            <Separator orientation="vertical" className="h-3.5 bg-amber-300/50 dark:bg-amber-700/40" />
+                            <span className="text-[9px] text-muted-foreground">
+                              <span className="font-semibold text-foreground">{currentTableSchema?.columns.length || headerColumns.length}</span> cols
+                            </span>
+                            <span className="text-[9px] text-muted-foreground">
+                              <span className="font-semibold text-foreground">{currentTableData.length.toLocaleString()}</span> rows
+                            </span>
+                            {currentTableSchema && currentTableSchema.columns.length > 0 && (
+                              <>
+                                <Separator orientation="vertical" className="h-3.5 bg-amber-300/50 dark:bg-amber-700/40" />
+                                <div className="flex items-center gap-0.5 flex-wrap max-w-[280px]">
+                                  {(() => {
+                                    const counts = new Map<string, number>()
+                                    for (const c of currentTableSchema.columns) {
+                                      const norm = c.type.toLowerCase().replace(/\(.*\)/g, '').trim() || c.type
+                                      counts.set(norm, (counts.get(norm) || 0) + 1)
+                                    }
+                                    return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([t, n]) => (
+                                      <Badge key={t} variant="outline" className="text-[8px] font-mono px-1 py-0 h-3 border-amber-300/60 dark:border-amber-700/40 text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30">
+                                        {n} {t}
+                                      </Badge>
+                                    ))
+                                  })()}
+                                </div>
+                              </>
+                            )}
+                          </CardContent>
+                        </Card>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-5 text-[9px] gap-0.5 px-1.5 text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/30 ml-auto"
+                          onClick={() => setActiveTab('explorer')}
+                          title="View this table in the Explorer tab"
+                        >
+                          <ArrowRight className="h-2.5 w-2.5" />
+                          View in Explorer
+                        </Button>
+                        <div className="relative w-40">
+                          <Search className="absolute left-1.5 top-1/2 -translate-y-1/2 h-2.5 w-2.5 text-muted-foreground pointer-events-none" />
+                          <Input
+                            value={dataSearchQuery}
+                            onChange={(e) => { setDataSearchQuery(e.target.value); setVisibleRows(20) }}
+                            placeholder="Filter rows…"
+                            className="h-5 text-[10px] pl-6 pr-5"
+                          />
+                          {dataSearchQuery && (
+                            <button
+                              onClick={() => setDataSearchQuery('')}
+                              className="absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                              title="Clear filter"
+                            >
+                              <X className="h-2.5 w-2.5" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex-1 overflow-auto max-h-[500px]">
                         <table className="w-full text-[11px] border-collapse">
                           <thead className="sticky top-0 z-10 bg-background">
                             <tr className="border-b">
@@ -2415,14 +2770,21 @@ function StudioPageInner({
                               // ─── Empty state 3: table selected, columns exist, no rows ───
                               <tr>
                                 <td colSpan={headerColumns.length + 2} className="py-6 text-center text-xs text-muted-foreground italic">
-                                  No rows yet. Click <span className="font-semibold not-italic text-foreground">Row</span> above to add one.
+                                  {dataSearchQuery
+                                    ? <>No rows match <span className="font-semibold not-italic text-foreground">&ldquo;{dataSearchQuery}&rdquo;</span>. <button onClick={() => setDataSearchQuery('')} className="text-amber-600 dark:text-amber-400 underline not-italic">Clear filter</button></>
+                                    : <>No rows yet. Click <span className="font-semibold not-italic text-foreground">Row</span> above to add one.</>}
                                 </td>
                               </tr>
                             ) : (
                               displayedRows.map((row, i) => (
                                 <tr key={i} className={cn(
-                                  'border-b hover:bg-muted/30 transition-colors',
-                                  selectedRows.has(i) && 'bg-amber-50 dark:bg-amber-950/20',
+                                  'border-b transition-colors',
+                                  // Zebra striping — alternate rows get a subtle
+                                  // muted background so wide tables are easier to
+                                  // scan. Selected rows override with amber tint.
+                                  i % 2 === 1 ? 'bg-muted/30' : 'bg-background',
+                                  'hover:bg-amber-50/60 dark:hover:bg-amber-950/20',
+                                  selectedRows.has(i) && 'bg-amber-50 dark:bg-amber-950/30',
                                 )}>
                                   <td className="py-1 px-1 border-r bg-muted/20">
                                     <input
@@ -2491,19 +2853,38 @@ function StudioPageInner({
                           </tbody>
                         </table>
                       </div>
-                      {hasMoreRows && (
-                        <div className="px-2.5 py-1.5 border-t bg-muted/30 text-center shrink-0">
+                      {/* ─── Data grid footer ───
+                          Always-visible "Rows: X of Y" counter so the user
+                          knows how many rows are shown vs. the total (after
+                          any search filter is applied). When more rows are
+                          available below the visibleRows cap, also shows a
+                          "Load more" button on the right. */}
+                      <div className="px-2.5 py-1.5 border-t bg-muted/30 shrink-0 flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground min-w-0">
+                          <span className="shrink-0">
+                            Rows: <span className="font-semibold text-foreground">{displayedRows.length.toLocaleString()}</span>
+                            {' '}of{' '}
+                            <span className="font-semibold text-foreground">{filteredTableData.length.toLocaleString()}</span>
+                          </span>
+                          {dataSearchQuery && currentTableData.length !== filteredTableData.length && (
+                            <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 gap-0.5 border-amber-300/60 dark:border-amber-700/40 text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30 shrink-0">
+                              <Search className="h-2 w-2" />
+                              filtered from {currentTableData.length.toLocaleString()}
+                            </Badge>
+                          )}
+                        </div>
+                        {hasMoreRows && (
                           <Button
                             variant="ghost"
                             size="sm"
-                            className="text-[10px] h-6"
+                            className="text-[10px] h-6 shrink-0"
                             onClick={() => setVisibleRows(prev => prev + 20)}
                           >
-                            Load more ({currentTableData.length - visibleRows} remaining)
+                            Load more ({filteredTableData.length - visibleRows} remaining)
                             <ChevronDown className="ml-1 h-2.5 w-2.5" />
                           </Button>
-                        </div>
-                      )}
+                        )}
+                      </div>
                     </>
                   )}
                 </div>
@@ -3249,6 +3630,45 @@ function StudioPageInner({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* ─── Regenerate Data Confirmation ───
+          AlertDialog (not a plain Dialog) so it blocks interaction with the
+          rest of the studio until the user confirms or cancels. The
+          destructive action button calls regenerateData() which clears all
+          existing rows and re-runs the streaming generation pipeline with
+          the same schema + per-table row counts. */}
+      <AlertDialog open={regenerateConfirmOpen} onOpenChange={setRegenerateConfirmOpen}>
+        <AlertDialogContent className="sm:max-w-md">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2">
+              <RefreshCw className="h-5 w-5 text-amber-600" />
+              Regenerate Data?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This will replace all existing data with new synthetic data. The current schema
+              ({schemaStats.tableCount} table{schemaStats.tableCount === 1 ? '' : 's'},{' '}
+              {schemaStats.rowCount.toLocaleString()} row{schemaStats.rowCount === 1 ? '' : 's'}) and per-table
+              row counts will be preserved, but every row will be regenerated with fresh values.
+              <br /><br />
+              <span className="text-amber-700 dark:text-amber-400 font-medium">This action cannot be undone.</span> Save
+              your current database first if you want to keep this dataset.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white border-0"
+              onClick={(e) => {
+                e.preventDefault()
+                void regenerateData()
+              }}
+            >
+              <RefreshCw className="h-4 w-4 mr-1.5" />
+              Regenerate Data
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Add Column Dialog */}
       <Dialog open={addColumnDialogOpen} onOpenChange={setAddColumnDialogOpen}>

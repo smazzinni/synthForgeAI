@@ -717,7 +717,13 @@ export default function MyDatabasesPage() {
                           <Database className="h-5 w-5" />
                         </div>
                         <div className="flex-1 min-w-0">
-                          <p className="font-semibold text-base truncate">{db.name}</p>
+                          <Link
+                            href={`/dashboard/databases/${db.id}`}
+                            className="font-semibold text-base truncate block hover:text-amber-700 dark:hover:text-amber-400 transition-colors"
+                            title="View database details"
+                          >
+                            {db.name}
+                          </Link>
                           <div className="flex items-center flex-wrap gap-1.5 mt-1">
                             {getDbTypeBadge(db.db_type)}
                             {getStatusBadge(db.status)}
@@ -889,7 +895,13 @@ export default function MyDatabasesPage() {
                                   <Database className="h-4 w-4" />
                                 </div>
                                 <div className="min-w-0">
-                                  <p className="font-medium text-sm truncate">{db.name}</p>
+                                  <Link
+                                    href={`/dashboard/databases/${db.id}`}
+                                    className="font-medium text-sm truncate block hover:text-amber-700 dark:hover:text-amber-400 transition-colors"
+                                    title="View database details"
+                                  >
+                                    {db.name}
+                                  </Link>
                                   <p className="text-[11px] text-muted-foreground md:hidden">
                                     {(db.row_count || 0).toLocaleString()} rows · {tableCount} tables
                                   </p>
