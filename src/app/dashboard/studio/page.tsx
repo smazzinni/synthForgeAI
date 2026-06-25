@@ -55,6 +55,7 @@ import {
   Wand2,
   PlugZap,
   Square,
+  RotateCcw,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { apiPost, apiPatch, apiDelete, apiGet, invalidateCache } from '@/lib/api-client'
@@ -561,30 +562,61 @@ function StudioPageInner({
 
         saveConversation(userMessage.content, displayText || fullContent, lastAgentName)
 
-        // ─── AUTO-EXECUTE non-destructive SELECT queries ───
+        // ─── AUTO-EXECUTE queries in live-DB mode ───
         // The system prompt tells the AI that SELECT queries are
         // auto-executed. So when the AI emits a SELECT (or WITH ... SELECT,
         // or SHOW/DESCRIBE/EXPLAIN), we immediately run it against the live
         // DB and display the rows inline — the user doesn't have to click
-        // anything. Mutations (INSERT/UPDATE/DELETE/DDL) still require an
-        // explicit click so destructive operations get a confirmation.
-        if (primarySqlBlock && activeConnectionId) {
-          const stripped = stripSqlComments(primarySqlBlock).trim()
-          const firstVerb = stripped.split(/\s+/)[0]?.toUpperCase() || ''
-          const isAutoExecutableRead =
-            firstVerb === 'SELECT' ||
-            firstVerb === 'WITH' ||
-            firstVerb === 'SHOW' ||
-            firstVerb === 'DESCRIBE' ||
-            firstVerb === 'EXPLAIN'
+        // anything.
+        //
+        // For DDL/INSERT (e.g. when the user says "seed this database"),
+        // we ALSO auto-execute them — but with a confirmation dialog for
+        // each block (since they mutate data). This makes the "seed this
+        // database" flow work end-to-end: AI emits CREATE TABLE + INSERT
+        // blocks, the studio runs them sequentially (confirming each),
+        // then refreshes the schema so the new tables appear in the Data
+        // section.
+        if (sqlBlocks.length > 0 && activeConnectionId) {
+          // Auto-execute each SQL block sequentially.
+          // - SELECT/WITH/SHOW/DESCRIBE/EXPLAIN: skipConfirm=true (no dialog)
+          // - CREATE TABLE/INSERT/UPDATE/DELETE/ALTER/DROP/TRUNCATE:
+          //   skipConfirm=false (shows confirmation dialog per block)
+          // We run them sequentially (not in parallel) so the user can
+          // confirm/reject each one, and so foreign-key dependencies
+          // (CREATE TABLE users → INSERT INTO users → CREATE TABLE orders
+          // referencing users) resolve in order.
+          const runSequentially = async () => {
+            for (let idx = 0; idx < sqlBlocks.length; idx++) {
+              const block = sqlBlocks[idx]
+              const stripped = stripSqlComments(block).trim()
+              const firstVerb = stripped.split(/\s+/)[0]?.toUpperCase() || ''
+              const isReadOnly =
+                firstVerb === 'SELECT' ||
+                firstVerb === 'WITH' ||
+                firstVerb === 'SHOW' ||
+                firstVerb === 'DESCRIBE' ||
+                firstVerb === 'EXPLAIN'
 
-          if (isAutoExecutableRead && !isDestructiveSQL(primarySqlBlock)) {
-            // Auto-execute in the background (don't block the return).
-            // Pass skipConfirm=true since we already verified it's a read.
-            // Use the ref because `executeSqlBlock` is defined below
-            // `sendMessage` in the source — `const` isn't hoisted.
-            executeSqlBlockRef.current(assistantId, primarySqlBlock, true)
+              if (isReadOnly && !isDestructiveSQL(block)) {
+                // Auto-run reads immediately, no confirmation
+                await executeSqlBlockRef.current(assistantId, block, true)
+              } else {
+                // For DDL/INSERT/UPDATE/DELETE: show a confirmation dialog.
+                // If there are multiple blocks, batch them so the user
+                // doesn't get N dialogs — instead they get one dialog per
+                // block but can quickly click through.
+                // We pass skipConfirm=false so executeSqlBlock shows the
+                // native confirm() dialog.
+                // eslint-disable-next-line no-await-in-loop
+                await executeSqlBlockRef.current(assistantId, block, false)
+              }
+            }
           }
+          // Kick off the sequential execution in the background.
+          // Don't await — we want the chat to remain responsive.
+          runSequentially().catch(err => {
+            console.error('[Studio] Auto-execution sequence failed:', err)
+          })
         }
 
         return
@@ -1988,15 +2020,43 @@ function StudioPageInner({
                 <div className="w-40 border-r bg-muted/30 flex flex-col shrink-0">
                   <div className="px-2 py-1.5 border-b flex items-center justify-between">
                     <p className="text-[9px] font-semibold text-muted-foreground uppercase tracking-wider">Tables</p>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-4 w-4 p-0"
-                      onClick={() => setAddTableDialogOpen(true)}
-                      title="Add Table"
-                    >
-                      <Plus className="h-2.5 w-2.5" />
-                    </Button>
+                    <div className="flex items-center gap-0.5">
+                      {isLiveDbMode && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-4 w-4 p-0"
+                          onClick={async () => {
+                            if (!activeConnectionId) return
+                            try {
+                              toast.info('Refreshing schema from live DB...')
+                              const refresh = await apiGet<{
+                                schema?: SchemaTable[]
+                                data?: Record<string, unknown[]>
+                              }>(`/api/connections/${activeConnectionId}?include=introspect`, { cacheTtl: 0, force: true, timeout: 30000 })
+                              if (refresh.schema) setGeneratedSchema(refresh.schema)
+                              if (refresh.data) setGeneratedData(refresh.data)
+                              setSelectedTable('')
+                              toast.success(`Loaded ${refresh.schema?.length || 0} tables from live DB`)
+                            } catch (err) {
+                              toast.error(err instanceof Error ? err.message : 'Failed to refresh')
+                            }
+                          }}
+                          title="Refresh schema from live DB"
+                        >
+                          <RotateCcw className="h-2.5 w-2.5" />
+                        </Button>
+                      )}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-4 w-4 p-0"
+                        onClick={() => setAddTableDialogOpen(true)}
+                        title="Add Table"
+                      >
+                        <Plus className="h-2.5 w-2.5" />
+                      </Button>
+                    </div>
                   </div>
                   <div className="flex-1 overflow-y-auto p-1 space-y-0.5 max-h-96">
                     {Object.entries(generatedData).map(([tableName, rows]) => (

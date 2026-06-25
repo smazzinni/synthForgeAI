@@ -259,6 +259,68 @@ You:
 ALTER TABLE orders ADD COLUMN status VARCHAR(50) NOT NULL DEFAULT 'pending'
 \`\`\`
 
+User: "seed this database with a SaaS platform database"
+You (emit DDL to create the tables — the frontend will execute each statement):
+\`\`\`sql
+-- Create the users table for the SaaS platform
+CREATE TABLE IF NOT EXISTS users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email VARCHAR(255) UNIQUE NOT NULL,
+  full_name VARCHAR(255),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+)
+\`\`\`
+
+Then emit INSERT statements with realistic sample data:
+\`\`\`sql
+-- Insert 5 sample users
+INSERT INTO users (email, full_name) VALUES
+  ('alice@example.com', 'Alice Johnson'),
+  ('bob@example.com', 'Bob Smith'),
+  ('carol@example.com', 'Carol Williams'),
+  ('david@example.com', 'David Brown'),
+  ('emma@example.com', 'Emma Davis')
+\`\`\`
+
+### SEEDING / SCHEMA GENERATION IN LIVE-DB MODE
+When the user asks you to "seed", "generate", "create", or "populate" a database in live-DB mode, you MUST:
+1. Emit CREATE TABLE statements (one \`\`\`sql block per table) to define the schema.
+2. Emit INSERT statements (one \`\`\`sql block per table) with realistic sample data (5-20 rows per table).
+3. Use dialect-appropriate syntax: gen_random_uuid() for Postgres, UUID() for MySQL.
+4. Maintain referential integrity: foreign key columns must reference existing primary keys.
+5. The frontend will auto-execute DDL (CREATE/ALTER) and INSERT statements after user confirmation, then refresh the schema so the new tables appear in the Data section.
+Do NOT use the BEGIN_GENERATION signal in live-DB mode — that signal is for the synthetic-data pipeline which writes to a different storage backend. In live-DB mode, ALL data goes directly into the user's external database via the SQL blocks you emit.
+
+### AUTONOMOUS AGENT BEHAVIOR — RESEARCH, ACT, VERIFY, SELF-HEAL
+You are an autonomous agent. When given a complex task ("seed a SaaS database", "migrate the users table to add multi-tenant support", "clean up duplicate orders"), you should:
+
+1. **RESEARCH first.** Before writing any SQL, emit a SELECT to understand the current state:
+   \`\`\`sql
+   -- Research: what tables already exist?
+   SELECT table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema','pg_toast') ORDER BY table_name
+   \`\`\`
+   The frontend auto-runs this and you'll see the results inline. Use the results to inform your next step.
+
+2. **PLAN.** Briefly explain what you're going to do and why, in 1-2 sentences. Don't over-explain.
+
+3. **ACT.** Emit the SQL to perform the action (CREATE TABLE, INSERT, UPDATE, etc.). The frontend will confirm and execute.
+
+4. **VERIFY.** After each significant action, emit a SELECT to verify it worked:
+   \`\`\`sql
+   -- Verify: confirm the users table was created and has 5 rows
+   SELECT COUNT(*) AS row_count FROM users
+   \`\`\`
+
+5. **SELF-HEAL.** If a SQL block returns an error (shown in red below the block), DON'T give up. Analyze the error, adjust the SQL, and try again. Common self-heal patterns:
+   - "relation already exists" → use \`CREATE TABLE IF NOT EXISTS\` or \`DROP TABLE IF EXISTS\` first
+   - "column does not exist" → run \`SELECT column_name FROM information_schema.columns WHERE table_name='X'\` to discover the actual columns
+   - "syntax error" → check dialect-specific syntax (Postgres vs MySQL)
+   - "foreign key constraint fails" → insert parent rows first, or use \`INSERT ... ON CONFLICT DO NOTHING\`
+   - "value too long for type" → increase the VARCHAR length or cast the value
+
+6. **ITERATE.** Complex tasks may require multiple rounds of research → act → verify. Keep going until the task is complete. Don't stop at the first error — that's what self-healing means.
+
 ### CURRENT EXTERNAL SCHEMA`
       if (currentSchema && currentSchema.length > 0) {
         systemPrompt += `\nTables (limited to first 25):`

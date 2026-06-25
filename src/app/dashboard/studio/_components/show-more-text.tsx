@@ -1,12 +1,14 @@
 'use client'
 
 import { useState, useRef, useEffect } from 'react'
+import { MarkdownTable, hasMarkdownTable, parseMarkdownTable } from './markdown-table'
 
 // ─── ShowMoreText ───
 // Renders long text with a "Show more" / "Show less" toggle when it
 // overflows the default max-height. Supports basic markdown: **bold**,
 // `inline code`, lists (- item, * item, 1. item), headings (#, ##, ###),
-// and fenced code blocks (```).
+// fenced code blocks (```), AND GitHub-flavored markdown tables
+// (| col | col |) which are rendered as scrollable HTML tables.
 //
 // BUGFIX (BUG-49): added a ResizeObserver so the overflow check re-runs
 // when the container is resized (e.g. when the user drags the chat
@@ -58,7 +60,8 @@ export function ShowMoreText({ content, isStreaming }: { content: string; isStre
 
 // ─── Minimal markdown renderer ───
 // Supports: # / ## / ### headings, **bold**, `code`, - / * / 1. lists,
-// ```fenced code blocks```, and blank-line paragraph breaks.
+// ```fenced code blocks```, GitHub-flavored markdown tables
+// (| col | col |), and blank-line paragraph breaks.
 // Returns a React fragment.
 function renderMarkdown(content: string): React.ReactNode {
   const lines = content.split('\n')
@@ -68,6 +71,31 @@ function renderMarkdown(content: string): React.ReactNode {
 
   while (i < lines.length) {
     const line = lines[i]
+
+    // ─── Markdown table detection ───
+    // A markdown table starts with a header row (containing |), followed
+    // by a separator row (|---|---|). Detect the start and consume all
+    // consecutive table rows.
+    if (line.includes('|') && i + 1 < lines.length) {
+      const nextLine = lines[i + 1].trim()
+      // Separator row check: |---|---:|:--:|--:|
+      if (/^\|?[\s:|-]+\|?$/.test(nextLine) && nextLine.includes('-')) {
+        // Collect all consecutive lines that look like table rows
+        const tableLines: string[] = [line]
+        let j = i + 1
+        while (j < lines.length && lines[j].includes('|') && lines[j].trim().length > 0) {
+          tableLines.push(lines[j])
+          j++
+        }
+        const tableText = tableLines.join('\n')
+        const parsed = parseMarkdownTable(tableText)
+        if (parsed) {
+          out.push(<MarkdownTable key={key++} markdown={tableText} />)
+          i = j
+          continue
+        }
+      }
+    }
 
     // Fenced code block
     const fenceMatch = line.match(/^```(\w*)$/)

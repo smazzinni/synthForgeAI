@@ -470,3 +470,85 @@ Stage Summary:
 - The user's new pooler connection (aws-1-ap-southeast-1.pooler.supabase.com:6543) works correctly.
 
 ---
+
+---
+Task ID: 5
+Agent: main (orchestrator)
+Task: Parse markdown tables + fix live-DB generation flow + make AI agents autonomous + self-healing + UI improvements
+
+Work Log:
+
+PHASE 1 — Markdown table parser + scrollable table component
+- Created src/app/dashboard/studio/_components/markdown-table.tsx (243 lines):
+  - MarkdownTable component renders GitHub-flavored markdown tables (| col | col |) as proper HTML tables
+  - Vertical scrollbar (maxHeight prop, default 320px) + horizontal scrollbar (overflow-auto)
+  - Sticky header row
+  - Row numbering (# column)
+  - Cell type coloring: NULL (italic gray), booleans (green/red), numbers (blue), timestamps (violet), UUIDs (amber), emails (sky)
+  - parseMarkdownTable() function with bracket-aware cell splitting (handles escaped pipes \|)
+  - parseAlignments() for |:--|:--:|--:| syntax (left/center/right)
+  - hasMarkdownTable() detector
+- Updated ShowMoreText to detect markdown tables in AI responses and render them via <MarkdownTable> instead of raw text. The renderer scans for header+separator line pairs and consumes all consecutive table rows.
+
+PHASE 2 — Fix live-DB generation flow
+- ROOT CAUSE: when the user said "seed this database with a SaaS platform database", the AI emitted a BEGIN_GENERATION signal (which triggers the synthetic-data pipeline that writes to Supabase's synthetic_databases table, NOT the live external DB). The user saw "generating..." but nothing appeared in the live DB.
+- FIX 1: Updated the system prompt with a new "SEEDING / SCHEMA GENERATION IN LIVE-DB MODE" section that explicitly instructs the AI to:
+  1. Emit CREATE TABLE statements (one ```sql block per table)
+  2. Emit INSERT statements with realistic sample data (5-20 rows per table)
+  3. Use dialect-appropriate syntax (gen_random_uuid() for Postgres, UUID() for MySQL)
+  4. Maintain referential integrity
+  5. NEVER use BEGIN_GENERATION in live-DB mode
+- FIX 2: Updated the studio's LIVE DB MODE branch to auto-execute ALL SQL blocks sequentially:
+  - SELECT/WITH/SHOW/DESCRIBE/EXPLAIN: auto-run immediately (skipConfirm=true, no dialog)
+  - CREATE TABLE/INSERT/UPDATE/DELETE/ALTER/DROP/TRUNCATE: auto-run with confirmation dialog (skipConfirm=false)
+  - Blocks run sequentially (not parallel) so FK dependencies resolve in order
+  - After each mutation, the studio refreshes the schema via /api/connections/[id]?include=introspect so new tables appear in the Data section
+
+PHASE 3 — Show live DB schema/data in the Data section
+- Added a "Refresh DB" button (RotateCcw icon) next to the Tables label in the Data tab sidebar. Only visible in live-DB mode.
+- Clicking it re-introspects the live DB (schema + sample rows) and updates the Data section immediately. Useful after the AI seeds the DB to see the new tables without reloading the page.
+- The auto-execution flow also triggers a schema refresh after each mutation, so the Data section stays in sync.
+
+PHASE 4 — Make AI agents autonomous + self-healing
+- Created a new API endpoint: POST /api/connections/[id]/agent
+  - action: 'introspect' → returns full schema + per-table row counts (for the agent to research before acting)
+  - action: 'execute' → runs arbitrary SQL and returns rows/affectedRows/error (for the agent to act)
+  - action: 'verify' → runs a SELECT to verify a previous mutation succeeded
+- Updated the system prompt with a new "AUTONOMOUS AGENT BEHAVIOR — RESEARCH, ACT, VERIFY, SELF-HEAL" section that instructs the AI to:
+  1. RESEARCH first (emit a SELECT to understand the current state)
+  2. PLAN (briefly explain what to do)
+  3. ACT (emit the SQL)
+  4. VERIFY (emit a SELECT to confirm it worked)
+  5. SELF-HEAL (if a block fails, analyze the error, adjust the SQL, retry — don't give up)
+  6. ITERATE (complex tasks need multiple rounds)
+- The prompt includes common self-heal patterns: "relation already exists" → CREATE IF NOT EXISTS, "column does not exist" → introspect information_schema.columns, "foreign key constraint fails" → insert parent rows first, etc.
+
+PHASE 5 — SqlBlockCard UI improvements
+- Added error recovery hints: when a SQL block fails, the card shows a red "Recovery hint" section explaining how to fix the error. The hint maps 11 common PostgreSQL/MySQL error codes to actionable advice.
+- Added a "Retry" button (RotateCcw icon) that appears on failed blocks, replacing the "Run on live DB" label. Clicking it re-executes the same SQL.
+- Failed blocks now render with a red border + rose background (instead of sky blue) so failures are visually distinct.
+- The card header icon and label color also change to rose on failure.
+
+PHASE 6 — "Auto-run" badge for read-only queries
+- SqlBlockCard shows a green "Auto-run" badge for SELECT/WITH/SHOW/DESCRIBE/EXPLAIN queries (so the user understands why results appeared without clicking).
+- Destructive queries show the red "Destructive" badge.
+- Other mutations show no badge (just the Run button).
+
+Files created:
+- src/app/dashboard/studio/_components/markdown-table.tsx (243 lines)
+- src/app/api/connections/[id]/agent/route.ts (76 lines)
+
+Files modified:
+- src/app/api/chat/route.ts — added SEEDING section + AUTONOMOUS AGENT BEHAVIOR section to the live-DB system prompt
+- src/app/dashboard/studio/_components/show-more-text.tsx — integrated MarkdownTable into the markdown renderer
+- src/app/dashboard/studio/_components/sql-block-card.tsx — error recovery hints, Retry button, red failure styling
+- src/app/dashboard/studio/page.tsx — auto-execute ALL SQL blocks sequentially (not just SELECTs), Refresh DB button in Data tab, RotateCcw import
+
+Stage Summary:
+- Markdown tables in AI responses now render as scrollable HTML tables with sticky headers + cell-type coloring
+- "Seed this database" flow now works end-to-end: AI emits CREATE TABLE + INSERT blocks → studio auto-executes them (with confirmation) → schema refreshes → new tables appear in the Data section
+- AI agents are now autonomous: they research the schema first, act, verify, and self-heal on errors. The system prompt explicitly tells them not to give up at the first error.
+- The SqlBlockCard shows actionable recovery hints when SQL fails, and a Retry button for easy re-execution.
+- Build verified: next build succeeds with all routes intact (including the new /api/connections/[id]/agent route).
+
+---
