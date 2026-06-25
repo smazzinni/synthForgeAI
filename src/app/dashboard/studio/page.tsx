@@ -260,6 +260,19 @@ function StudioPageInner({
         }
         setDatabaseName(result.connection.name)
 
+        // Replace the generic welcome message with a live-DB welcome so the
+        // user immediately understands they are connected to a real database
+        // and the assistant can run SQL against it. Only replace the initial
+        // assistant greeting (id === '1') so we never clobber real chat history.
+        setMessages(prev => {
+          const hasRealHistory = prev.some(m => m.role === 'user')
+          if (hasRealHistory) return prev
+          return prev.map(m => m.id === '1' ? {
+            ...m,
+            content: `Connected to live ${result.connection.dialect} **"${result.connection.name}"**. I have direct access to this database — ask me anything and I'll run SQL against it.\n\n**Examples:**\n- "show me the first 10 rows of users"\n- "how many rows are in the orders table?"\n- "what tables are in this database?"\n- "add a status column to the orders table"\n\n**How it works:**\n- **SELECT** queries are auto-executed immediately — results appear inline below.\n- **INSERT / UPDATE / DELETE / DDL** operations show a confirmation dialog before executing.`,
+          } : m)
+        })
+
         if (result.error) {
           toast.warning(`Schema introspection warning: ${result.error}`)
         } else {
@@ -500,7 +513,18 @@ function StudioPageInner({
       })
 
       if (!response.ok) {
-        throw new Error(`API error: ${response.status}`)
+        // Parse the JSON error body so the user sees the helpful message
+        // (e.g. "DeepSeek API key not configured", "Rate limit exceeded")
+        // instead of a vague "API error: 503".
+        let detail = `API error: ${response.status}`
+        try {
+          const errBody = await response.json()
+          if (errBody?.error) detail = errBody.error
+          else if (errBody?.content) detail = errBody.content
+        } catch {
+          // Body wasn't JSON — keep the generic status message
+        }
+        throw new Error(detail)
       }
 
       const reader = response.body?.getReader()
@@ -574,6 +598,15 @@ function StudioPageInner({
               ))
             } else if (parsed.type === 'error') {
               console.error('[Studio] Stream error:', parsed.content)
+              // Surface the mid-stream error to the user and stop the
+              // streaming indicator so the bubble doesn't appear stuck.
+              const errMsg = parsed.content || 'The AI stream was interrupted'
+              setMessages(prev => prev.map(m =>
+                m.id === assistantId
+                  ? { ...m, isStreaming: false, content: m.content || `⚠️ ${errMsg}` }
+                  : m
+              ))
+              toast.error(errMsg)
             }
           } catch {
             // Skip unparseable
@@ -810,17 +843,22 @@ function StudioPageInner({
     }
   }, [input, currentDatabaseId, databaseName, conversationId, generatedSchema, generatedData, hasGeneratedData, saveConversation, activeConnectionId, activeConnectionName, activeConnectionDialect, isLiveDbMode])
 
-  // Auto-send query from dashboard
+  // Auto-send query from dashboard. We wait for the live-DB connection to
+  // finish loading (when ?connectionId= is present) before firing, otherwise
+  // sendMessage runs with activeConnectionId=undefined and the AI emits a
+  // BEGIN_GENERATION signal instead of SQL against the live DB.
   useEffect(() => {
     const q = searchParams.get('q')
-    if (q && !initialQuerySent) {
+    const hasConnection = searchParams.get('connectionId')
+    const ready = !hasConnection || (activeConnectionId && !connectionLoading)
+    if (q && !initialQuerySent && ready) {
       setInitialQuerySent(true)
       const timer = setTimeout(() => {
         sendMessage(q)
-      }, 500)
+      }, 100)
       return () => clearTimeout(timer)
     }
-  }, [searchParams, initialQuerySent])
+  }, [searchParams, initialQuerySent, activeConnectionId, connectionLoading])
 
   // ─── Auto-save generated data ───
   const autoSaveData = async (
@@ -955,9 +993,10 @@ function StudioPageInner({
   // Called from the chat message UI when the user clicks "Execute".
   // If the statement is destructive, ask for confirmation first.
   const executeSqlBlock = async (messageId: string, sql: string, skipConfirm = false) => {
-    // Keep the ref in sync so `sendMessage` (defined above) can call this
-    // function for auto-execution of SELECT queries.
-    executeSqlBlockRef.current = executeSqlBlock
+    // NOTE: The ref is kept in sync via the useEffect below (not inside the
+    // function body) so it is populated BEFORE the first auto-execution call
+    // from `sendMessage`. The previous in-body assignment was a no-op on the
+    // first AI response, silently breaking auto-execution of SELECT queries.
 
     if (!activeConnectionId) {
       toast.error('No active DB connection')
@@ -1084,6 +1123,16 @@ function StudioPageInner({
       toast.error(msg)
     }
   }
+
+  // Keep executeSqlBlockRef in sync so `sendMessage` (defined above
+  // `executeSqlBlock`) can invoke it for auto-execution of SELECT queries in
+  // live-DB mode. This useEffect MUST be placed AFTER the `executeSqlBlock`
+  // const declaration to avoid a Temporal Dead Zone (TDZ) ReferenceError.
+  // The ref is reassigned whenever the function identity or the live-DB
+  // context changes so the closure captures fresh `activeConnectionId` etc.
+  useEffect(() => {
+    executeSqlBlockRef.current = executeSqlBlock
+  }, [executeSqlBlock, activeConnectionId, activeConnectionName, activeConnectionDialect])
 
   // ─── SQL Execution ───
   const executeSQL = async (sql: string, skipConfirm = false) => {
