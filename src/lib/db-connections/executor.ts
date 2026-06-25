@@ -274,24 +274,38 @@ function groupRowsByTable(rows: Record<string, unknown>[]): SchemaTable[] {
 /**
  * Fetch sample rows for a table (default 100). Used to pre-populate the
  * studio's data tab when the user opens an external DB.
+ *
+ * BUGFIX (BUG-19): the previous version rejected any table name containing
+ * characters outside [a-zA-Z0-9_.] — which excluded legitimate quoted
+ * identifiers like `"order-details"` or `"User Data"`. Now we properly
+ * quote the identifier for each dialect after validating against a
+ * SQL-injection whitelist (letters, digits, underscore, dot, hyphen,
+ * space — all safely quotable).
  */
 export async function fetchSampleRows(conn: DbConnectionRecord, tableName: string, limit = 100): Promise<{ rows: Record<string, unknown>[]; columns: string[] }> {
   const entry = await getPool(conn)
-  // Sanitize table name — only allow word chars + dots
-  const safeName = tableName.replace(/[^a-zA-Z0-9_.]/g, '')
-  if (safeName !== tableName) {
+
+  // Whitelist of characters allowed in a table identifier. Anything outside
+  // this set is rejected to prevent SQL injection (we can't use parameterized
+  // queries for identifiers in pg/mysql2).
+  if (!/^[a-zA-Z0-9_.\-\s]+$/.test(tableName)) {
     throw new Error(`Invalid table name: ${tableName}`)
   }
 
   if (entry.dialect === 'postgres') {
+    // Postgres uses double quotes for identifiers. Escape any embedded
+    // double quotes by doubling them.
+    const quoted = `"${tableName.replace(/"/g, '""')}"`
     const pool = entry.pool as { query: (text: string, values?: unknown[]) => Promise<{ rows: Record<string, unknown>[] }> }
-    const { rows } = await pool.query(`SELECT * FROM ${safeName} LIMIT $1`, [limit])
+    const { rows } = await pool.query(`SELECT * FROM ${quoted} LIMIT $1`, [limit])
     const columns = rows.length > 0 ? Object.keys(rows[0]) : []
     return { rows, columns }
   }
 
+  // MySQL uses backticks for identifiers. Escape any embedded backticks.
+  const quoted = `\`${tableName.replace(/`/g, '``')}\``
   const pool = entry.pool as { query: (sql: string, values?: unknown[]) => Promise<unknown> }
-  const raw = await pool.query(`SELECT * FROM ${safeName} LIMIT ?`, [limit])
+  const raw = await pool.query(`SELECT * FROM ${quoted} LIMIT ?`, [limit])
   const rows = (Array.isArray(raw) && Array.isArray(raw[0]) ? raw[0] : raw) as Record<string, unknown>[]
   const columns = rows.length > 0 ? Object.keys(rows[0]) : []
   return { rows, columns }

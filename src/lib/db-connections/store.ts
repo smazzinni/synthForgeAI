@@ -41,6 +41,9 @@ function saveRaw(userId: string, list: DbConnectionRecord[]) {
 // via db-connections-migration.sql without restarting the server).
 let supabaseAvailable: boolean | null = null
 
+// One-time warning flag for the "table doesn't exist" fallthrough.
+let tableMissingWarned = false
+
 async function trySupabase(): Promise<boolean> {
   if (supabaseAvailable !== null) return supabaseAvailable
   const admin = getSupabaseAdmin()
@@ -144,7 +147,32 @@ export async function createConnection(
       .select()
       .single()
     if (!error && data) return data as DbConnectionRecord
-    // Fall through to in-memory on error
+    // BUGFIX (BUG-25): distinguish "table doesn't exist" (fall through to
+    // in-memory with a one-time warning) from real errors like RLS denial
+    // or unique-constraint violation (which should NOT silently fall
+    // through, because the user would see a "success" toast but the
+    // connection would be ephemeral — only on this server instance).
+    if (error) {
+      const msg = (error.message || '').toLowerCase()
+      const isTableMissing =
+        msg.includes('does not exist') ||
+        msg.includes('relation "public.db_connections" does not exist') ||
+        msg.includes('42p01')
+      if (isTableMissing) {
+        // Table not created yet — fall through to in-memory (one-time warn)
+        if (!tableMissingWarned) {
+          console.warn('[db-connections/store] Table "db_connections" does not exist in Supabase. Falling back to in-memory storage. Run db-connections-migration.sql to enable persistent storage.')
+          tableMissingWarned = true
+        }
+        // Reset the cached probe so the next call re-checks (in case the
+        // user runs the migration in the meantime).
+        supabaseAvailable = null
+      } else {
+        // Real error (RLS, constraint, etc.) — throw so the route returns
+        // a 500 instead of silently falling through to in-memory.
+        throw new Error(`Failed to save connection: ${error.message}`)
+      }
+    }
   }
 
   const list = listRaw(userId)

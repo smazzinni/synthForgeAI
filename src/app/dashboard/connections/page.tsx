@@ -128,11 +128,15 @@ export default function DatabaseConnectionsPage() {
   }
 
   const handleDialectChange = (dialect: 'postgres' | 'mysql') => {
+    // BUGFIX (BUG-53): previously switching dialect reset `schema` to '' for
+    // MySQL and to 'public' for Postgres, losing any user-entered value
+    // when toggling back and forth. Now we only change the port and dialect
+    // — the schema field is conditionally rendered (hidden for MySQL) so
+    // its value is naturally preserved when switching back.
     setForm(prev => ({
       ...prev,
       dialect,
       port: DEFAULT_PORTS[dialect],
-      schema: dialect === 'postgres' ? (prev.schema || 'public') : '',
     }))
   }
 
@@ -159,7 +163,7 @@ export default function DatabaseConnectionsPage() {
       if (editingId) {
         // If password is empty on edit, don't send it (keep existing)
         if (!payload.password) delete payload.password
-        result = await apiPatch<{ connection: SafeDbConnection; test?: { ok: boolean; error?: string; hint?: string; latencyMs?: number } }>('/api/connections', { id: editingId, ...payload })
+        result = await apiPatch<{ connection: SafeDbConnection; test?: { ok: boolean; error?: string; hint?: string; latencyMs?: number } }>(`/api/connections/${editingId}`, payload)
       } else {
         result = await apiPost<{ connection: SafeDbConnection; test?: { ok: boolean; error?: string; hint?: string; latencyMs?: number } }>('/api/connections', payload)
       }
@@ -206,7 +210,7 @@ export default function DatabaseConnectionsPage() {
     if (!confirm(`Delete connection "${name}"? This cannot be undone.`)) return
     setDeleting(id)
     try {
-      await apiDelete(`/api/connections?id=${id}`)
+      await apiDelete(`/api/connections/${id}`)
       invalidateCache('/api/connections')
       setConnections(prev => prev.filter(c => c.id !== id))
       toast.success(`Connection "${name}" deleted`)
@@ -505,7 +509,7 @@ export default function DatabaseConnectionsPage() {
                     size="sm"
                     className="h-7 text-[10px] flex-1 bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white"
                     onClick={() => handleOpenInStudio(conn)}
-                    disabled={conn.status === 'failed'}
+                    title={conn.status === 'failed' ? 'This connection failed its last test — opening anyway. Edit it to fix the credentials.' : 'Open in AI Chat'}
                   >
                     <MessageSquare className="mr-1 h-3 w-3" />
                     Open in AI Chat

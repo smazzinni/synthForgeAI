@@ -54,6 +54,7 @@ import {
   Shield,
   Wand2,
   PlugZap,
+  Square,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { apiPost, apiPatch, apiDelete, apiGet, invalidateCache } from '@/lib/api-client'
@@ -71,354 +72,23 @@ import {
   type OptionChoice,
   type BeginGenerationSignal,
 } from '@/lib/ai-agents'
+// Extracted types + helpers + sub-components (kept the main file focused)
+import type { Message, SchemaTable, StudioPageProps, GenerationProgress } from './_lib/types'
+import {
+  exportAsCSV,
+  exportAsJSON,
+  exportAsSQL,
+  parseAIResponse,
+  extractSchema,
+  extractAllSqlBlocks,
+  extractSqlBlock,
+  generateSchemaSQL as generateSchemaSQLHelper,
+  computeERLayout as computeERLayoutHelper,
+} from './_lib/utils'
+import { AgentIcon } from './_components/agent-icon'
+import { ShowMoreText } from './_components/show-more-text'
+import { SqlBlockCard } from './_components/sql-block-card'
 
-// ─── Types ───
-interface GenerationProgress {
-  isGenerating: boolean
-  currentTable: string
-  rowsInserted: number
-  totalInserted: number
-  targetRows: number
-  tablesGenerated: number
-  statusMessages: string[]
-  databaseId?: string
-}
-
-interface Message {
-  id: string
-  role: 'user' | 'assistant' | 'system'
-  content: string
-  reasoningContent?: string
-  agentName?: string
-  agentStatus?: AgentStatus | null
-  interactiveOptions?: InteractiveOptions | null
-  generationProgress?: GenerationProgress | null
-  timestamp: Date
-  isStreaming?: boolean
-  tables?: Record<string, unknown[]> | null
-  // ─── External DB SQL block(s) ───
-  // When the AI returns ```sql blocks in live-DB mode, the parsed SQL is
-  // stored here so the UI can render an "Execute" button per block.
-  // BUGFIX (BUG-35): support multiple SQL blocks per message.
-  sqlBlock?: string | null
-  sqlBlocks?: string[]
-  sqlBlockExecuting?: boolean
-  sqlBlockResult?: { ok: boolean; message: string; rowCount?: number; affectedRows?: number; rows?: Record<string, unknown>[]; columns?: string[] } | null
-}
-
-interface SchemaTable {
-  name: string
-  columns: { name: string; type: string }[]
-}
-
-interface StudioPageProps {
-  databaseId?: string
-  initialName?: string
-  initialSchema?: SchemaTable[]
-  initialData?: Record<string, unknown[]>
-  initialMessages?: Message[]
-  conversationId?: string
-  // ─── External DB connection (live mode) ───
-  initialConnectionId?: string
-  initialConnectionName?: string
-  initialConnectionDialect?: 'postgres' | 'mysql'
-}
-
-// ─── Export helpers (client-side) ───
-function exportAsCSV(data: Record<string, unknown>[], filename: string) {
-  if (!data.length) return
-  const columns = Object.keys(data[0])
-  const csvRows = [
-    columns.map(c => `"${c}"`).join(','),
-    ...data.map(row =>
-      columns.map(col => {
-        const val = row[col]
-        if (val === null || val === undefined) return ''
-        if (typeof val === 'object') return `"${JSON.stringify(val).replace(/"/g, '""')}"`
-        return `"${String(val).replace(/"/g, '""')}"`
-      }).join(',')
-    ),
-  ]
-  const blob = new Blob([csvRows.join('\n')], { type: 'text/csv' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  a.click()
-  URL.revokeObjectURL(url)
-}
-
-function exportAsJSON(data: unknown, filename: string) {
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  a.click()
-  URL.revokeObjectURL(url)
-}
-
-function exportAsSQL(schema: SchemaTable[], data: Record<string, unknown[]>, filename: string) {
-  let sql = `-- SynthForge AI Export\n-- Generated: ${new Date().toISOString()}\n\n`
-  for (const table of schema) {
-    const rows = data[table.name] as Record<string, unknown>[] | undefined
-    sql += `CREATE TABLE ${table.name} (\n`
-    const colDefs = table.columns.map(col => {
-      let def = `  ${col.name} ${col.type.toUpperCase()}`
-      if (col.name === 'id') def += ' PRIMARY KEY'
-      return def
-    })
-    sql += colDefs.join(',\n') + '\n);\n\n'
-    if (rows && rows.length > 0) {
-      const columns = Object.keys(rows[0])
-      for (const row of rows) {
-        const values = columns.map(col => {
-          const val = row[col]
-          if (val === null || val === undefined) return 'NULL'
-          if (typeof val === 'number') return String(val)
-          if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE'
-          return `'${String(val).replace(/'/g, "''")}'`
-        })
-        sql += `INSERT INTO ${table.name} (${columns.join(', ')}) VALUES (${values.join(', ')});\n`
-      }
-      sql += '\n'
-    }
-  }
-  const blob = new Blob([sql], { type: 'application/sql' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  a.click()
-  URL.revokeObjectURL(url)
-}
-
-// ─── Parse AI response to extract text and JSON data ───
-function parseAIResponse(content: string): {
-  displayText: string
-  tables: Record<string, unknown[]> | null
-  databaseName: string | null
-} {
-  let tables: Record<string, unknown[]> | null = null
-  let databaseName: string | null = null
-  let displayText = content
-
-  // Try to extract JSON code block — match ALL code blocks (global flag)
-  // so that if the AI emits two ```json blocks, both are stripped from
-  // displayText. BUGFIX (BUG-44): the previous version only stripped the
-  // first, leaving the second visible to the user as raw text.
-  const codeBlockRe = /```(?:json)?\s*\n?([\s\S]*?)\n?```/g
-  let codeBlockMatch: RegExpExecArray | null
-  while ((codeBlockMatch = codeBlockRe.exec(content)) !== null) {
-    try {
-      const parsed = JSON.parse(codeBlockMatch[1])
-      if (parsed?.tables && !tables) {
-        tables = parsed.tables
-        databaseName = parsed.database_name || null
-      }
-    } catch {
-      // Not valid JSON in code block — leave it alone
-    }
-  }
-  if (tables) {
-    displayText = content.replace(/```(?:json)?\s*\n?[\s\S]*?\n?```/g, '').trim()
-  }
-
-  // If no code block found, try raw JSON
-  // BUGFIX (BUG-43): the previous regex `\{[\s\S]*"tables"[\s\S]*\}` was
-  // greedy and could match from the FIRST `{` to the LAST `}` in the
-  // content — including arbitrary text in between — causing JSON.parse to
-  // fail. Use a non-greedy match anchored to balanced braces.
-  if (!tables) {
-    const marker = '{"tables"'
-    let idx = content.indexOf(marker)
-    while (idx !== -1) {
-      // Walk forward doing bracket counting to find the matching close brace.
-      let depth = 0
-      let inStr = false
-      let escape = false
-      let end = -1
-      for (let i = idx; i < content.length; i++) {
-        const ch = content[i]
-        if (escape) { escape = false; continue }
-        if (ch === '\\' && inStr) { escape = true; continue }
-        if (ch === '"') { inStr = !inStr; continue }
-        if (inStr) continue
-        if (ch === '{') depth++
-        else if (ch === '}') {
-          depth--
-          if (depth === 0) { end = i; break }
-        }
-      }
-      if (end === -1) break
-      const candidate = content.substring(idx, end + 1)
-      try {
-        const parsed = JSON.parse(candidate)
-        if (parsed?.tables) {
-          tables = parsed.tables
-          databaseName = parsed.database_name || null
-          displayText = content.replace(candidate, '').trim()
-          break
-        }
-      } catch {
-        // Not parseable — try next occurrence
-      }
-      idx = content.indexOf(marker, idx + 1)
-    }
-  }
-
-  // Clean up tags and agent status / options blocks
-  displayText = displayText.replace(/<think[\s\S]*?<\/think>/gi, '')
-  displayText = displayText.replace(/<thinking[\s\S]*?<\/thinking>/gi, '')
-  displayText = cleanDisplayText(displayText)
-  // Additional cleanup: remove any leftover raw JSON lines that look like agent commands
-  displayText = displayText.replace(/^\s*\{"type"\s*:\s*"[^"]+"\s*[,\}][^\n]*$/gm, '')
-  // Remove multiple consecutive blank lines
-  displayText = displayText.replace(/\n{3,}/g, '\n\n')
-  displayText = displayText.trim()
-
-  return { displayText, tables, databaseName }
-}
-
-// ─── Extract schema from table data ───
-function extractSchema(tables: Record<string, unknown[]>): SchemaTable[] {
-  const schema: SchemaTable[] = []
-  for (const [tableName, tableData] of Object.entries(tables)) {
-    const rows = tableData as Record<string, unknown>[]
-    if (Array.isArray(rows) && rows.length > 0) {
-      const columns = Object.keys(rows[0]).map(key => {
-        const val = rows[0][key]
-        let type = 'varchar(255)'
-        if (typeof val === 'number') type = Number.isInteger(val) ? 'integer' : 'decimal'
-        else if (typeof val === 'boolean') type = 'boolean'
-        else if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}/.test(val)) type = 'timestamp'
-        else if (key === 'id' || key.endsWith('_id')) type = 'uuid'
-        return { name: key, type }
-      })
-      schema.push({ name: tableName, columns })
-    }
-  }
-  return schema
-}
-
-// ─── Extract ALL ```sql ... ``` code blocks from AI response content ───
-// Returns an array of SQL strings (without fences). Case-insensitive tag.
-// Non-SQL code blocks (```json, ```bash, etc.) are NOT included.
-//
-// BUGFIX (BUG-35/50): the previous version used a non-global regex that
-// only matched the FIRST block (and was case-sensitive on the language
-// tag). If the AI emitted two ```sql blocks, the second was silently
-// deleted from the displayed text by the caller's /g strip but never
-// surfaced to the user.
-export function extractAllSqlBlocks(content: string): string[] {
-  const blocks: string[] = []
-  // Match ```sql or ```SQL or ```Sql (case-insensitive). The `s` flag
-  // makes `.` match newlines.
-  const re = /```sql\s*\n([\s\S]*?)\n?```/gi
-  let match: RegExpExecArray | null
-  while ((match = re.exec(content)) !== null) {
-    const body = match[1].trim()
-    if (body) blocks.push(body)
-  }
-  return blocks
-}
-
-// Backwards-compat: returns the FIRST sql block (or null). Most callers
-// only need one — use extractAllSqlBlocks if you need every block.
-function extractSqlBlock(content: string): string | null {
-  const blocks = extractAllSqlBlocks(content)
-  return blocks.length > 0 ? blocks[0] : null
-}
-
-// ─── Agent icon helper ───
-function AgentIcon({ agentName, size = 'sm' }: { agentName?: string; size?: 'sm' | 'md' }) {
-  const agent = getAgentByName(agentName || '')
-  const sizeClass = size === 'sm' ? 'h-5 w-5' : 'h-6 w-6'
-  const iconSize = size === 'sm' ? 'h-2.5 w-2.5' : 'h-3 w-3'
-
-  if (agent?.id === 'schema_architect') {
-    return (
-      <div className={`${sizeClass} rounded-full bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center shrink-0`}>
-        <GitBranch className={`${iconSize} text-white`} />
-      </div>
-    )
-  }
-  if (agent?.id === 'data_generator') {
-    return (
-      <div className={`${sizeClass} rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shrink-0`}>
-        <Database className={`${iconSize} text-white`} />
-      </div>
-    )
-  }
-  if (agent?.id === 'quality_analyst') {
-    return (
-      <div className={`${sizeClass} rounded-full bg-gradient-to-br from-sky-500 to-blue-600 flex items-center justify-center shrink-0`}>
-        <CheckCircle2 className={`${iconSize} text-white`} />
-      </div>
-    )
-  }
-  if (agent?.id === 'privacy_officer') {
-    return (
-      <div className={`${sizeClass} rounded-full bg-gradient-to-br from-rose-500 to-pink-600 flex items-center justify-center shrink-0`}>
-        <Shield className={`${iconSize} text-white`} />
-      </div>
-    )
-  }
-  // Default: Orchestrator
-  return (
-    <div className={`${sizeClass} rounded-full bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center shrink-0`}>
-      <Sparkles className={`${iconSize} text-white`} />
-    </div>
-  )
-}
-
-// ─── ShowMoreText component for long messages ───
-function ShowMoreText({ content, isStreaming }: { content: string; isStreaming?: boolean }) {
-  const [expanded, setExpanded] = useState(false)
-  const contentRef = useRef<HTMLDivElement>(null)
-  const [isOverflowing, setIsOverflowing] = useState(false)
-
-  useEffect(() => {
-    if (contentRef.current) {
-      setIsOverflowing(contentRef.current.scrollHeight > 400)
-    }
-  }, [content])
-
-  // Format the text with basic markdown-like rendering
-  const parts = content.split(/(\*\*[^*]+\*\*|\`[^`]+\`|\n)/g)
-  const rendered = parts.map((part, i) => {
-    if (part.startsWith('**') && part.endsWith('**')) {
-      return <strong key={i}>{part.slice(2, -2)}</strong>
-    }
-    if (part.startsWith('`') && part.endsWith('`')) {
-      return <code key={i} className="bg-muted px-1 py-0.5 rounded text-xs font-mono">{part.slice(1, -1)}</code>
-    }
-    if (part === '\n') {
-      return <br key={i} />
-    }
-    return <span key={i}>{part}</span>
-  })
-
-  return (
-    <div>
-      <div
-        ref={contentRef}
-        className={`text-sm leading-relaxed whitespace-pre-wrap ${!expanded && isOverflowing ? 'max-h-[400px] overflow-y-auto' : ''}`}
-        style={{ overflowWrap: 'break-word', wordBreak: 'break-word' }}
-      >
-        {rendered}
-      </div>
-      {isOverflowing && !isStreaming && (
-        <button
-          onClick={() => setExpanded(!expanded)}
-          className="mt-1 text-[10px] text-amber-600 dark:text-amber-400 hover:underline font-medium"
-        >
-          {expanded ? 'Show less' : 'Show more'}
-        </button>
-      )}
-    </div>
-  )
-}
 
 // ─── Main Studio Page Component ───
 function StudioPageInner({
@@ -522,14 +192,12 @@ function StudioPageInner({
 
   const hasGeneratedData = generatedSchema.length > 0 || Object.keys(generatedData).length > 0
 
-  // Handle initial query from dashboard
-  useEffect(() => {
-    const q = searchParams.get('q')
-    if (q && !initialQuerySent) {
-      setInitialQuerySent(true)
-      setInput(q)
-    }
-  }, [searchParams, initialQuerySent])
+  // Handle initial query from dashboard — merged with the auto-send effect
+  // below to avoid double-firing. The previous version had TWO effects
+  // both reading `searchParams.get('q')`: one set `input`, the other
+  // called `sendMessage(q)`. If the user had already typed something,
+  // the sendMessage(q) would overwrite their input. Now there's only one
+  // effect that calls sendMessage(q) directly (BUG-47).
 
   // ─── Load external DB connection when ?connectionId=... is in the URL ───
   // Fetches the connection record, then introspects schema + sample rows.
@@ -552,7 +220,7 @@ function StudioPageInner({
           schema?: SchemaTable[]
           data?: Record<string, unknown[]>
           error?: string
-        }>(`/api/connections?id=${connId}&include=introspect`, { cacheTtl: 0, force: true, timeout: 30000 })
+        }>(`/api/connections/${connId}?include=introspect`, { cacheTtl: 0, force: true, timeout: 30000 })
 
         if (cancelled) return
 
@@ -605,9 +273,21 @@ function StudioPageInner({
     }
   }, [generatedData, selectedTable])
 
-  // Scroll to bottom of chat
+  // Scroll to bottom of chat — but only if the user is already near the
+  // bottom (within 80px). This prevents the view from snapping back down
+  // on every token while the user is reading earlier messages.
+  // BUGFIX (BUG-51): previously fired on every `currentReasoning` change
+  // (i.e. every token), causing janky scroll fighting with the user.
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const container = chatContainerRef.current
+    if (!container) return
+    const nearBottom =
+      container.scrollHeight - container.scrollTop - container.clientHeight < 80
+    if (!nearBottom) return
+    // Use 'auto' (instant) during streaming — 'smooth' causes a long
+    // animation queue that fights with rapid token updates.
+    const isStreaming = currentReasoning.length > 0
+    chatEndRef.current?.scrollIntoView({ behavior: isStreaming ? 'auto' : 'smooth' })
   }, [messages, currentReasoning])
 
   // ─── Resize handler ───
@@ -1101,6 +781,26 @@ function StudioPageInner({
     }
   }
 
+  // ─── Stop generation ───
+  // Aborts the in-flight chat request AND any streaming data generation.
+  // The AbortController's cancel() handler on the server-side ReadableStream
+  // ensures the upstream DeepSeek connection is also released.
+  const handleStopGeneration = () => {
+    if (abortRef.current) {
+      abortRef.current.abort()
+      abortRef.current = null
+    }
+    if (generationAbortRef.current) {
+      generationAbortRef.current.abort()
+      generationAbortRef.current = null
+    }
+    setLoading(false)
+    loadingRef.current = false
+    setReasoningVisible(false)
+    setGenerationProgress(prev => ({ ...prev, isGenerating: false }))
+    toast.info('Generation stopped')
+  }
+
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text)
     toast.success('Copied to clipboard')
@@ -1197,7 +897,7 @@ function StudioPageInner({
           const refresh = await apiGet<{
             schema?: SchemaTable[]
             data?: Record<string, unknown[]>
-          }>(`/api/connections?id=${activeConnectionId}&include=introspect`, { cacheTtl: 0, force: true, timeout: 30000 })
+          }>(`/api/connections/${activeConnectionId}?include=introspect`, { cacheTtl: 0, force: true, timeout: 30000 })
           if (refresh.schema) setGeneratedSchema(refresh.schema)
           if (refresh.data) setGeneratedData(refresh.data)
         } catch (err) {
@@ -1275,6 +975,7 @@ function StudioPageInner({
         // multi-statement SQL where the second statement is destructive).
         requiresConfirmation?: boolean
         destructive?: boolean
+        sql?: string
       }>(endpoint, payload, { timeout: 60000 })
 
       // BUGFIX (BUG-38): if the server detected a destructive operation
@@ -1336,22 +1037,9 @@ function StudioPageInner({
   }
 
   // ─── Generate SQL from schema ───
-  const generateSchemaSQL = (): string => {
-    if (!generatedSchema.length) return '-- No schema generated yet'
-    let sql = `-- SynthForge AI Generated Schema\n-- Database: ${databaseName || 'untitled'}\n\n`
-
-    for (const table of generatedSchema) {
-      sql += `CREATE TABLE ${table.name} (\n`
-      const cols = table.columns.map(col => {
-        let def = `  ${col.name} ${col.type.toUpperCase()}`
-        if (col.name === 'id') def += ' PRIMARY KEY'
-        return def
-      })
-      sql += cols.join(',\n')
-      sql += '\n);\n\n'
-    }
-    return sql
-  }
+  // Generate CREATE TABLE SQL from the current schema. Delegates to the
+  // extracted helper in ./_lib/utils.
+  const generateSchemaSQL = (): string => generateSchemaSQLHelper(generatedSchema, databaseName)
 
   // ─── Handle option button click ───
   const handleOptionClick = (choice: OptionChoice) => {
@@ -1862,55 +1550,10 @@ function StudioPageInner({
   const hasMoreRows = currentTableData.length > visibleRows
 
   // ─── ER Diagram Layout ───
-  const computeERLayout = () => {
-    const tableNames = Object.keys(generatedData)
-    if (tableNames.length === 0) return { nodes: [], edges: [] }
-
-    const nodes: Array<{ name: string; x: number; y: number; schema: SchemaTable; rows: number }> = []
-    const edges: Array<{ from: string; to: string; fromCol: string; toCol: string; type: string }> = []
-
-    // Hierarchical layout
-    const colWidth = 220
-    const rowHeight = 200
-    const cols = Math.ceil(Math.sqrt(tableNames.length))
-
-    tableNames.forEach((name, i) => {
-      const col = i % cols
-      const row = Math.floor(i / cols)
-      const schema = generatedSchema.find(t => t.name === name)
-      const rows = (generatedData[name] as unknown[])?.length || 0
-
-      nodes.push({
-        name,
-        x: 60 + col * (colWidth + 80),
-        y: 60 + row * (rowHeight + 40),
-        schema: schema || { name, columns: [] },
-        rows,
-      })
-
-      // Find FK relationships
-      if (schema) {
-        for (const col of schema.columns) {
-          if (col.name.endsWith('_id') && col.name !== 'id') {
-            const targetTable = col.name.replace('_id', '')
-            if (tableNames.includes(targetTable)) {
-              edges.push({
-                from: name,
-                to: targetTable,
-                fromCol: col.name,
-                toCol: 'id',
-                type: '1:N',
-              })
-            }
-          }
-        }
-      }
-    })
-
-    return { nodes, edges }
-  }
-
-  const erLayout = hasGeneratedData ? computeERLayout() : { nodes: [], edges: [] }
+  // Delegates to the extracted helper in ./_lib/utils.
+  const erLayout = hasGeneratedData
+    ? computeERLayoutHelper(generatedData, generatedSchema)
+    : { nodes: [] as Array<{ name: string; x: number; y: number; schema: SchemaTable; rows: number }>, edges: [] as Array<{ from: string; to: string; fromCol: string; toCol: string; type: string }> }
 
   // SVG dimensions based on layout
   const svgWidth = Math.max(600, erLayout.nodes.length > 0 ? Math.max(...erLayout.nodes.map(n => n.x)) + 280 : 600)
@@ -2075,107 +1718,36 @@ function StudioPageInner({
                   </div>
                 )}
 
-                {/* ─── SQL block (live DB mode) ─── */}
+                {/* ─── SQL block(s) (live DB mode) ─── */}
                 {message.role === 'assistant' && message.sqlBlock && (
-                  <div className="mt-2 rounded-md border border-sky-300 dark:border-sky-800 bg-sky-50/50 dark:bg-sky-950/30 overflow-hidden">
-                    <div className="px-2 py-1 border-b border-sky-300/50 dark:border-sky-800/50 flex items-center justify-between">
-                      <div className="flex items-center gap-1.5">
-                        <Code2 className="h-3 w-3 text-sky-600 dark:text-sky-400" />
-                        <span className="text-[9px] font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-400">
-                          SQL · {activeConnectionDialect || 'postgres'}
-                        </span>
-                        {isDestructiveSQL(message.sqlBlock) && (
-                          <Badge variant="outline" className="text-[8px] h-3.5 px-1 border-rose-400 text-rose-700 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/40">
-                            <AlertTriangle className="h-2 w-2 mr-0.5" />
-                            Destructive
-                          </Badge>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-0.5">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-5 px-1.5 text-[9px]"
-                          onClick={() => copyToClipboard(message.sqlBlock!)}
-                          title="Copy SQL"
-                        >
-                          <Copy className="h-2.5 w-2.5" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-5 px-1.5 text-[9px]"
-                          onClick={() => { setSqlEditor(message.sqlBlock!); setActiveTab('sql') }}
-                          title="Open in SQL editor"
-                        >
-                          <Code2 className="h-2.5 w-2.5" />
-                        </Button>
-                      </div>
-                    </div>
-                    <pre className="p-2 text-[10px] leading-relaxed font-mono overflow-x-auto max-h-[180px] overflow-y-auto bg-background/50">
-                      <code>{message.sqlBlock}</code>
-                    </pre>
-                    <div className="px-2 py-1.5 border-t border-sky-300/50 dark:border-sky-800/50 flex items-center gap-1.5">
-                      <Button
-                        size="sm"
-                        className="h-6 text-[10px] bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-700 hover:to-indigo-700 text-white"
-                        disabled={message.sqlBlockExecuting}
-                        onClick={() => executeSqlBlock(message.id, message.sqlBlock!)}
-                      >
-                        {message.sqlBlockExecuting ? (
-                          <>
-                            <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-                            Executing...
-                          </>
-                        ) : (
-                          <>
-                            <Play className="h-3 w-3 mr-1" />
-                            Run on live DB
-                          </>
-                        )}
-                      </Button>
-                      {message.sqlBlockResult && (
-                        <span className={`text-[9px] font-medium ${message.sqlBlockResult.ok ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
-                          {message.sqlBlockResult.ok ? <CheckCircle2 className="inline h-2.5 w-2.5 mr-0.5" /> : <AlertTriangle className="inline h-2.5 w-2.5 mr-0.5" />}
-                          {message.sqlBlockResult.message}
-                        </span>
-                      )}
-                    </div>
-                    {/* Show returned rows for SELECT queries */}
-                    {message.sqlBlockResult?.ok && message.sqlBlockResult.rows && message.sqlBlockResult.rows.length > 0 && (
-                      <div className="border-t border-sky-300/50 dark:border-sky-800/50 max-h-[200px] overflow-auto">
-                        <table className="w-full text-[9px] font-mono">
-                          <thead className="sticky top-0 bg-sky-100 dark:bg-sky-950/60">
-                            <tr>
-                              {(message.sqlBlockResult.columns || Object.keys(message.sqlBlockResult.rows[0])).map(col => (
-                                <th key={col} className="px-1.5 py-1 text-left font-semibold text-sky-800 dark:text-sky-300 whitespace-nowrap">
-                                  {col}
-                                </th>
-                              ))}
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {message.sqlBlockResult.rows.slice(0, 20).map((row, i) => (
-                              <tr key={i} className="border-t border-sky-200/50 dark:border-sky-800/30">
-                                {(message.sqlBlockResult?.columns || Object.keys(row)).map(col => (
-                                  <td key={col} className="px-1.5 py-0.5 whitespace-nowrap">
-                                    {row[col] === null || row[col] === undefined
-                                      ? <span className="text-muted-foreground italic">NULL</span>
-                                      : String(row[col]).slice(0, 80)}
-                                  </td>
-                                ))}
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                        {message.sqlBlockResult.rows.length > 20 && (
-                          <div className="px-2 py-1 text-[8px] text-muted-foreground bg-sky-50/50 dark:bg-sky-950/30">
-                            + {message.sqlBlockResult.rows.length - 20} more row(s)
-                          </div>
-                        )}
+                  <>
+                    {/* Render the primary SQL block (with execute button + result) */}
+                    <SqlBlockCard
+                      sql={message.sqlBlock}
+                      dialect={activeConnectionDialect}
+                      executing={message.sqlBlockExecuting}
+                      result={message.sqlBlockResult}
+                      onCopy={() => copyToClipboard(message.sqlBlock!)}
+                      onOpenInEditor={() => { setSqlEditor(message.sqlBlock!); setActiveTab('sql') }}
+                      onExecute={() => executeSqlBlock(message.id, message.sqlBlock!)}
+                    />
+                    {/* Render any additional SQL blocks as read-only previews
+                        (the user can copy them into the SQL editor to execute). */}
+                    {message.sqlBlocks && message.sqlBlocks.length > 1 && (
+                      <div className="mt-1.5 space-y-1">
+                        {message.sqlBlocks.slice(1).map((extraSql, idx) => (
+                          <SqlBlockCard
+                            key={idx}
+                            sql={extraSql}
+                            dialect={activeConnectionDialect}
+                            onCopy={() => copyToClipboard(extraSql)}
+                            onOpenInEditor={() => { setSqlEditor(extraSql); setActiveTab('sql') }}
+                            onExecute={() => executeSqlBlock(message.id, extraSql)}
+                          />
+                        ))}
                       </div>
                     )}
-                  </div>
+                  </>
                 )}
               </div>
               {message.role === 'user' && (
@@ -2210,14 +1782,26 @@ function StudioPageInner({
               disabled={loading || connectionLoading}
               className="flex-1 text-xs h-8"
             />
-            <Button
-              onClick={() => sendMessage()}
-              disabled={loading || !input.trim()}
-              size="sm"
-              className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white h-8 w-8 p-0"
-            >
-              {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
-            </Button>
+            {loading ? (
+              <Button
+                onClick={handleStopGeneration}
+                size="sm"
+                variant="destructive"
+                className="h-8 w-8 p-0"
+                title="Stop generation"
+              >
+                <Square className="h-3.5 w-3.5" />
+              </Button>
+            ) : (
+              <Button
+                onClick={() => sendMessage()}
+                disabled={!input.trim()}
+                size="sm"
+                className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white h-8 w-8 p-0"
+              >
+                <Send className="h-3.5 w-3.5" />
+              </Button>
+            )}
           </div>
         </div>
       </div>

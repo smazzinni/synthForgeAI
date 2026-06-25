@@ -459,14 +459,20 @@ export function isDestructiveSQL(sql: string): boolean {
 }
 
 /**
- * Get agent definition by name (fuzzy match)
+ * Get agent definition by name (fuzzy match).
+ *
+ * BUGFIX (BUG-59): returns `null` for unknown agent names instead of
+ * defaulting to the Orchestrator. This prevents typos emitted by the AI
+ * from being silently masked — callers can now render a fallback icon
+ * explicitly when the agent isn't recognized.
  */
 export function getAgentByName(name: string): AgentDef | null {
+  if (!name) return null
   const normalized = name.toLowerCase().replace(/\s+/g, '_')
   for (const agent of AGENT_LIST) {
     if (agent.id === normalized || agent.name.toLowerCase() === name.toLowerCase()) {
       return agent
     }
   }
-  return AI_AGENTS.orchestrator
+  return null
 }

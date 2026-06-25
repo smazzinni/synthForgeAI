@@ -488,7 +488,17 @@ function executeInsert(
     } else {
       values.forEach((v, i) => { row[`col_${i + 1}`] = v })
     }
-    if (!row.id) row.id = crypto.randomUUID()
+    // BUGFIX (BUG-34): only auto-generate an `id` column when the table
+    // actually has one. The previous version unconditionally added
+    // `row.id = crypto.randomUUID()` even for tables that use a different
+    // primary key (e.g. `user_id`), polluting the data with a phantom
+    // column that doesn't exist in the schema.
+    const tableHasIdColumn =
+      (colList && colList.includes('id')) ||
+      (!colList && tableRows.length > 0 && 'id' in (tableRows[0] as Record<string, unknown>))
+    if (tableHasIdColumn && !row.id) {
+      row.id = crypto.randomUUID()
+    }
     tableRows.push(row)
     inserted++
   }

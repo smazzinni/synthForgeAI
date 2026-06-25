@@ -319,3 +319,88 @@ Stage Summary:
 - Build verified: `next build` succeeds with all routes intact.
 
 ---
+
+---
+Task ID: 3
+Agent: main (orchestrator)
+Task: Fix PATCH 404 on Vercel + refactor large files + fix remaining bugs + improve AI logic
+
+Work Log:
+
+PHASE 1 — PATCH 404 fix
+- Diagnosed: /api/connections returned 404 for PATCH on Vercel even though the route file exported PATCH correctly. Root cause is likely Vercel's handling of certain HTTP methods on collection endpoints.
+- Refactored to standard RESTful nested routes:
+  - /api/connections (collection): GET (list), POST (create + test)
+  - /api/connections/[id] (per-item): GET (with ?include=introspect), PATCH (update + re-test), DELETE
+  - /api/connections/execute (unchanged): POST (live SQL execution)
+- Extracted shared helpers (getUserIdFromCookies, validateInput) to src/lib/db-connections/api-helpers.ts so both route files use the same code.
+- Updated all callers:
+  - src/app/dashboard/connections/page.tsx: apiPatch('/api/connections/${id}', ...) and apiDelete('/api/connections/${id}')
+  - src/app/dashboard/studio/page.tsx: apiGet('/api/connections/${connId}?include=introspect', ...)
+
+PHASE 2 — Refactor studio page (3246 → 2854 lines, ~400 lines extracted)
+- Created src/app/dashboard/studio/_lib/types.ts (59 lines) — Message, SchemaTable, StudioPageProps, GenerationProgress interfaces
+- Created src/app/dashboard/studio/_lib/utils.ts (284 lines) — pure helpers:
+  - exportAsCSV, exportAsJSON, exportAsSQL
+  - parseAIResponse (with the BUG-43/44 fixes from task 2)
+  - extractSchema, extractAllSqlBlocks, extractSqlBlock
+  - generateSchemaSQL
+  - computeERLayout (with ERNode/EREdge types)
+- Created src/app/dashboard/studio/_components/agent-icon.tsx (55 lines) — AgentIcon component
+- Created src/app/dashboard/studio/_components/show-more-text.tsx (158 lines) — ShowMoreText with:
+  - BUGFIX (BUG-49): ResizeObserver so overflow check re-runs on container resize
+  - IMPROVEMENT: richer markdown rendering — now supports headings (#, ##, ###), unordered lists (-, *), ordered lists (1.), and fenced code blocks (```), in addition to the previous **bold** and `inline code`
+- Created src/app/dashboard/studio/_components/sql-block-card.tsx (149 lines) — extracted the SQL block card UI (was ~100 inline lines in page.tsx) into a reusable component. Now renders multiple SQL cards per message (BUG-35 follow-up).
+- Removed duplicate definitions from page.tsx; replaced inline SQL card markup with <SqlBlockCard> component invocation.
+- Replaced inline computeERLayout and generateSchemaSQL with imported helpers.
+
+PHASE 3 — Fix remaining LOW bugs
+- BUG-19: fetchSampleRows rejected table names with hyphens or quotes (e.g. "order-details"). Now properly quotes identifiers per dialect (double-quotes for Postgres, backticks for MySQL) after a SQL-injection whitelist check.
+- BUG-25: createConnection silently fell through to in-memory storage on ANY Supabase error (RLS denial, constraint violation, etc.). Now distinguishes "table doesn't exist" (fall through with one-time warning) from real errors (throw so the route returns 500).
+- BUG-34: executeInsert auto-added an `id` column even when the table doesn't use `id` as PK. Now only auto-generates `id` when the table actually has an id column (checked via colList or existing rows).
+- BUG-47: two duplicate useEffects both read searchParams.get('q') — one set input, the other called sendMessage(q). Merged into a single effect that calls sendMessage(q) directly.
+- BUG-51: scrollIntoView fired on every currentReasoning token, fighting with the user's manual scroll. Now only auto-scrolls if the user is already near the bottom (within 80px), and uses 'auto' (instant) behavior during streaming instead of 'smooth'.
+- BUG-53: edit dialog lost the original schema value when switching dialect back and forth. Now only changes port and dialect on switch — the schema field's value is preserved (conditionally rendered, hidden for MySQL).
+- BUG-56: "Open in AI Chat" button was permanently disabled when status='failed'. Now always enabled, with a tooltip warning when the connection failed its last test.
+- BUG-59: getAgentByName returned the Orchestrator for unknown agent names, masking AI typos. Now returns null; callers render a default icon explicitly.
+
+PHASE 4 — Improve AI agent + chat logic
+- Rewrote BASE_SYSTEM_PROMPT in /api/chat/route.ts:
+  - Clearer structure: Core Principles → Workflow (Phase 1 Discovery / Phase 2 Schema design / Phase 3 Generation) → Data Quality Rules → Context-Aware Operations → Smart Defaults
+  - Added "Be concise" and "Be deterministic" principles — the AI should not ask 5 clarifying questions if 1 will do
+  - Explicitly limits Discovery to 1-3 turns
+  - Clarified that destructive ops require confirmation BEFORE emitting BEGIN_GENERATION
+  - Added concrete examples for BEGIN_GENERATION and agent_status signals
+- Added Stop generation button to the studio chat input:
+  - New handleStopGeneration() function aborts both the chat AbortController and the generation AbortController
+  - The Send button morphs into a red Stop button (Square icon) while loading
+  - Resets loading, loadingRef, reasoningVisible, generationProgress.isGenerating
+  - Shows an info toast "Generation stopped"
+  - The server-side ReadableStream.cancel() handler (added in task 2) ensures the upstream DeepSeek connection is released too
+- Improved ShowMoreText markdown rendering (see Phase 2 above) — now supports headings, lists, and code blocks instead of just bold/code/newlines.
+
+Files modified / created:
+- src/lib/db-connections/api-helpers.ts (NEW) — extracted getUserIdFromCookies + validateInput
+- src/lib/db-connections/executor.ts — BUG-19 (quoted identifiers), BUG-25 (distinguish table-missing from real errors)
+- src/lib/db-connections/store.ts — BUG-25 (tableMissingWarned flag, throw on real errors)
+- src/lib/ai-agents.ts — BUG-59 (getAgentByName returns null for unknown)
+- src/app/api/connections/route.ts — refactored to collection-only (GET list, POST create)
+- src/app/api/connections/[id]/route.ts (NEW) — per-item GET/PATCH/DELETE with proper params Promise destructuring
+- src/app/api/chat/route.ts — rewrote BASE_SYSTEM_PROMPT for clarity
+- src/app/api/sql/execute/route.ts — BUG-34 (don't auto-add id column)
+- src/app/dashboard/connections/page.tsx — updated API calls to nested routes, BUG-53 (preserve schema), BUG-56 (enable Open button)
+- src/app/dashboard/studio/_lib/types.ts (NEW)
+- src/app/dashboard/studio/_lib/utils.ts (NEW)
+- src/app/dashboard/studio/_components/agent-icon.tsx (NEW)
+- src/app/dashboard/studio/_components/show-more-text.tsx (NEW)
+- src/app/dashboard/studio/_components/sql-block-card.tsx (NEW)
+- src/app/dashboard/studio/page.tsx — imports from new files, removed duplicate defs (~400 lines), BUG-47 (merged useEffects), BUG-51 (smart scroll), Stop button, uses SqlBlockCard component
+
+Stage Summary:
+- PATCH 404 fixed via RESTful nested routes (/api/connections/[id])
+- Studio page reduced from 3246 → 2854 lines with 5 new focused files
+- 8 remaining LOW bugs fixed
+- AI chat improved: clearer system prompt, Stop button, richer markdown rendering
+- Build verified: 'next build' succeeds with all routes intact
+
+---
