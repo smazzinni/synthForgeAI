@@ -720,3 +720,28 @@ Verification:
 
 Stage Summary:
 - 3 improvements pushed to git main (commit 91cc541)
+
+---
+Task ID: CRON-REVIEW-4
+Agent: Main Agent (Z.ai Code) — webDevReview cron
+Task: QA assessment + persist SQL query history & saved queries
+
+Work Log:
+- Reviewed worklogs for prior context
+- Performed QA: dashboard 8/10, studio chat works, SQL tab query execution works, forgot-password 8/10
+- Identified feature gap: SQL query history + saved queries were in-memory only (lost on reload)
+
+Feature implemented:
+- Persisted query history + saved queries to localStorage (lazy initializers + useEffect persistence)
+- Redesigned 'Save' button into 'Saved (N)' dropdown with 'Save Current Query' item + per-item delete
+- Added 'Clear History' option to History dropdown
+- Added DropdownMenuSeparator
+
+Verification:
+- Build passes cleanly
+- Tested: ran query → History (1), saved query → Saved (1) with delete, reloaded → both persisted
+- Delete button works with toast feedback
+
+Stage Summary:
+- 1 feature added: persisted SQL query history + saved queries
+- All changes pushed to git main (commit 4d6dfd0)
