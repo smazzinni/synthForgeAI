@@ -381,10 +381,27 @@ export function computeERLayout(
       for (const col of schema.columns) {
         if (col.name.endsWith('_id') && col.name !== 'id') {
           const targetTable = col.name.replace('_id', '')
+          // Match the FK target table. Try exact match first, then plural
+          // (customer_id → customers), then singular (products_id → product).
+          // This handles the common case where the AI generates plural table
+          // names (users, orders) but FK columns use the singular form
+          // (user_id, order_id).
+          let matchedTable: string | null = null
           if (tableNames.includes(targetTable)) {
+            matchedTable = targetTable
+          } else if (tableNames.includes(targetTable + 's')) {
+            matchedTable = targetTable + 's'
+          } else if (tableNames.includes(targetTable + 'es')) {
+            matchedTable = targetTable + 'es'
+          } else if (targetTable.endsWith('s') && tableNames.includes(targetTable.slice(0, -1))) {
+            matchedTable = targetTable.slice(0, -1)
+          } else if (targetTable.endsWith('ies') && tableNames.includes(targetTable.slice(0, -3) + 'y')) {
+            matchedTable = targetTable.slice(0, -3) + 'y'
+          }
+          if (matchedTable && matchedTable !== name) {
             edges.push({
               from: name,
-              to: targetTable,
+              to: matchedTable,
               fromCol: col.name,
               toCol: 'id',
               type: '1:N',
