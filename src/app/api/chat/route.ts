@@ -189,6 +189,14 @@ Rules:
 - For "add more data" requests, inspect the current schema and data patterns and append rows when appropriate.
 - Keep all changes within the current active database context you were given.
 
+## IMPORTED / EXISTING DATA (EXTEND & EDIT)
+When the user has **uploaded or existing** data (tables already in context):
+- **Extend the domain** (e.g. "add library management to this school data"): design new related tables, foreign keys to existing tables where sensible, and realistic rows. You may return **only new or changed tables** in the \`tables\` JSON object — the app merges them with existing tables.
+- **Inspect structure**: summarize tables, columns, relationships, and row counts in plain English when asked.
+- **Small edits** (delete rows/columns, rename fields): return the **complete** affected table(s) in \`tables\`.
+- **Do not** restart the intake questionnaire when tables already exist unless the user explicitly asks for a brand-new database from scratch.
+- Match naming, ID style, and data patterns from the samples you were given.
+
 ## OPERATIONAL GUIDELINES
 - Use realistic values and respect data types.
 - Maintain referential integrity and valid UUID formats.
@@ -240,6 +248,7 @@ export async function POST(request: NextRequest) {
       history?: ChatMessage[]
       currentSchema?: Array<{ name: string; columns: Array<{ name: string; type: string }> }>
       currentData?: Record<string, unknown[]>
+      dataRowCounts?: Record<string, number>
       conversationId?: string
     }
     try {
@@ -258,6 +267,7 @@ export async function POST(request: NextRequest) {
       history = [],
       currentSchema,
       currentData,
+      dataRowCounts,
       conversationId,
     } = body
 
@@ -333,7 +343,10 @@ export async function POST(request: NextRequest) {
           const safeTableName = String(tableName)
             .replace(/[\r\n]/g, ' ')
             .slice(0, 100)
-          systemPrompt += `\n- Table "${safeTableName}": ${rows.length} rows`
+          const rowTotal =
+            dataRowCounts?.[tableName] ??
+            (Array.isArray(rows) ? rows.length : 0)
+          systemPrompt += `\n- Table "${safeTableName}": ${rowTotal} rows`
           if (rows.length > 0) {
             const sampleRow = rows[0] as Record<string, unknown>
             const safeCols = Object.keys(sampleRow)
@@ -346,7 +359,36 @@ export async function POST(request: NextRequest) {
         systemPrompt += `\n\nWhen the user says "add more rows", "delete", "update", etc., they are referring to THIS database.`
       }
 
-      systemPrompt += `\n\nIMPORTANT: When modifying existing data, include ALL tables in your response (both modified and unmodified). Do not omit tables that haven't changed.`
+      systemPrompt += `\n\nIMPORTANT: When modifying existing data, include ALL tables in your response when you are rewriting existing rows. When **adding new modules/tables only**, you may return just the new or changed tables — the client merges with the current dataset.`
+    } else if (currentSchema && currentSchema.length > 0) {
+      systemPrompt += `\n\n## CURRENT WORKSPACE DATA (no persisted database id yet)`
+      systemPrompt += `\nThe user has data loaded in the studio. Treat it as the active database.`
+      for (const table of currentSchema) {
+        const safeTableName = String(table.name)
+          .replace(/[\r\n]/g, ' ')
+          .slice(0, 100)
+        const safeCols = (table.columns || [])
+          .map(c =>
+            `${String(c.name).replace(/[\r\n]/g, ' ').slice(0, 60)}(${String(c.type).replace(/[\r\n]/g, ' ').slice(0, 60)})`
+          )
+          .join(', ')
+        systemPrompt += `\n- Table "${safeTableName}": ${safeCols}`
+      }
+      if (currentData && Object.keys(currentData).length > 0) {
+        systemPrompt += `\n\n### Row counts:`
+        for (const [tableName, rows] of Object.entries(currentData)) {
+          if (!Array.isArray(rows)) continue
+          const safeTableName = String(tableName)
+            .replace(/[\r\n]/g, ' ')
+            .slice(0, 100)
+          systemPrompt += `\n- "${safeTableName}": ${rows.length} rows in context`
+          if (rows.length > 0) {
+            const sample = JSON.stringify(rows[0]).slice(0, 400)
+            systemPrompt += ` | sample: ${sample}`
+          }
+        }
+      }
+      systemPrompt += `\n\nDo not run the greenfield intake questionnaire — help the user explore, extend, or edit this data.`
     }
 
     const ALLOWED_ROLES = new Set<string>(['user', 'assistant'])

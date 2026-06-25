@@ -20,6 +20,13 @@ import {
   columnPlainEnglishHint,
   type SchemaTable,
 } from "./helpers";
+import { mergeTableUpdates } from "@/lib/import-parser";
+import {
+  arrayBufferToBase64,
+  isExcelFile,
+  parseImportFromFile,
+} from "@/lib/import-from-file";
+import type { ImportResult } from "@/lib/import-parser";
 
 import {
   DropdownMenu,
@@ -246,6 +253,7 @@ function StudioPageInner({
   );
   const [databaseName, setDatabaseName] = useState(initialName || "");
   const [saving, setSaving] = useState(false);
+  const [isUnsavedPreview, setIsUnsavedPreview] = useState(false);
   const [activeTab, setActiveTab] = useState("data");
   const [selectedTable, setSelectedTable] = useState<string>("");
   const [visibleRows, setVisibleRows] = useState(20);
@@ -515,6 +523,7 @@ function StudioPageInner({
         }
       }
       invalidateCache("/api/databases");
+      setIsUnsavedPreview(false);
       toast.success("Data saved to database!");
     } catch (err) {
       console.error("[Studio] Auto-save failed:", err);
@@ -1084,15 +1093,18 @@ function StudioPageInner({
         let dataToSend: Record<string, unknown[]> | undefined = hasGeneratedData
           ? generatedData
           : undefined;
+        let dataRowCounts: Record<string, number> | undefined;
         if (dataToSend) {
+          dataRowCounts = {};
+          for (const [tableName, rows] of Object.entries(dataToSend)) {
+            dataRowCounts[tableName] = Array.isArray(rows) ? rows.length : 0;
+          }
           const dataStr = JSON.stringify(dataToSend);
           if (dataStr.length > 20000) {
-            // Send only schema + row counts instead of full data
             const summary: Record<string, unknown[]> = {};
             for (const [tableName, rows] of Object.entries(dataToSend)) {
               if (Array.isArray(rows) && rows.length > 0) {
-                // Send first 2 rows as samples + row count
-                summary[tableName] = rows.slice(0, 2);
+                summary[tableName] = rows.slice(0, 5);
               } else {
                 summary[tableName] = [];
               }
@@ -1112,6 +1124,7 @@ function StudioPageInner({
             ...(conversationId ? { conversationId } : {}),
             currentSchema: generatedSchema,
             currentData: dataToSend,
+            ...(dataRowCounts ? { dataRowCounts } : {}),
             history,
           }),
           signal: controller.signal,
@@ -1603,11 +1616,19 @@ function StudioPageInner({
 
           if (tables) {
             setActiveTab("data");
-            const schema = extractSchema(tables);
+            const mergedTables = mergeTableUpdates(generatedData, tables);
+            const updatedFromAI = extractSchema(tables);
+            const schemaMap = new Map(
+              generatedSchema.map((s) => [s.name, s] as const),
+            );
+            for (const table of updatedFromAI) {
+              schemaMap.set(table.name, table);
+            }
+            const schema = Array.from(schemaMap.values());
             setGeneratedSchema(schema);
-            setGeneratedData(tables);
+            setGeneratedData(mergedTables);
             if (parsedName) setDatabaseName(parsedName);
-            autoSaveData(tables, schema, parsedName);
+            autoSaveData(mergedTables, schema, parsedName);
             toast.success("Right panel updated from your request.");
           }
 
@@ -1738,33 +1759,122 @@ function StudioPageInner({
     }
   };
 
-  // ─── Upload file handler ───
-  const handleUpload = async (file: File) => {
-    const text = await file.text();
-    const name = file.name.endsWith(".json")
-      ? file.name.slice(0, -5)
-      : file.name;
-    const response = await fetch("/api/import", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        fileName: name,
-        fileType: file.type,
-        content: text,
-      }),
-    });
-    const result = await response.json();
-    if (result.error) {
-      throw new Error(result.error);
+  // ─── Apply parsed import to studio state ───
+  const applyImportedData = (
+    parsed: ImportResult,
+    fileName: string,
+    mode: "preview" | "save",
+    db?: { id: string; name?: string },
+  ) => {
+    const { dataJson, schemaJson, suggestedName } = parsed
+    const tableNames = Object.keys(dataJson)
+    const rowCount = Object.values(dataJson).reduce(
+      (sum, rows) => sum + (Array.isArray(rows) ? rows.length : 0),
+      0,
+    )
+    const displayName = db?.name || suggestedName
+
+    setGeneratedSchema(schemaJson)
+    setGeneratedData(dataJson)
+    setDatabaseName(displayName)
+    setActiveTab("data")
+    if (tableNames.length > 0) {
+      setSelectedTable(tableNames[0])
     }
-    const db = result.database;
+
+    if (mode === "preview") {
+      setCurrentDatabaseId(undefined)
+      setIsUnsavedPreview(true)
+    } else {
+      setCurrentDatabaseId(db?.id)
+      setIsUnsavedPreview(false)
+      invalidateCache("/api/databases")
+    }
+
+    const modeNote =
+      mode === "preview"
+        ? "**Preview only** — not saved yet. Click **Save** in the header when you are ready, or keep chatting to extend the data."
+        : "Saved to your workspace."
+
+    const importSummary = `${mode === "preview" ? "Previewing" : "Imported"} **${displayName}** — ${tableNames.length} table${tableNames.length === 1 ? "" : "s"}, ${rowCount} row${rowCount === 1 ? "" : "s"}. Data is on the right. ${modeNote} Ask me to extend it (e.g. add library management), inspect structure, or edit rows.`
+
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `${Date.now()}-import-user`,
+        role: "user",
+        content: `${mode === "preview" ? "Previewed" : "Uploaded"} data file: ${fileName}`,
+        timestamp: new Date(),
+      },
+      {
+        id: `${Date.now()}-import-assistant`,
+        role: "assistant",
+        content: importSummary,
+        agentName: "Orchestrator",
+        timestamp: new Date(),
+      },
+    ])
+
+    toast.success(
+      mode === "preview"
+        ? `Preview: ${tableNames.length} table${tableNames.length === 1 ? "" : "s"}`
+        : `Saved ${tableNames.length} table${tableNames.length === 1 ? "" : "s"}`,
+    )
+  }
+
+  // ─── Upload file handler ───
+  const handleUpload = async (
+    file: File,
+    mode: "preview" | "save" = "preview",
+  ) => {
+    if (mode === "preview") {
+      const parsed = await parseImportFromFile(file)
+      applyImportedData(parsed, file.name, "preview")
+      return
+    }
+
+    let response: Response
+    if (isExcelFile(file.name, file.type)) {
+      const buffer = await file.arrayBuffer()
+      response = await fetch("/api/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileName: file.name,
+          fileType: file.type,
+          content: arrayBufferToBase64(buffer),
+          encoding: "base64",
+        }),
+      })
+    } else {
+      const text = await file.text()
+      response = await fetch("/api/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileName: file.name,
+          fileType: file.type,
+          content: text,
+        }),
+      })
+    }
+
+    const result = await response.json()
+    if (result.error) {
+      throw new Error(result.error)
+    }
+    const db = result.database
     if (db) {
-      setCurrentDatabaseId(db.id);
-      setGeneratedSchema(db.schema_json || []);
-      setGeneratedData(db.data_json || {});
-      setDatabaseName(db.name);
-      invalidateCache("/api/databases");
-      toast.success("Database imported successfully");
+      applyImportedData(
+        {
+          dataJson: (db.data_json || {}) as Record<string, unknown[]>,
+          schemaJson: (db.schema_json || []) as SchemaTable[],
+          suggestedName: db.name || file.name.replace(/\.[^.]+$/, ""),
+        },
+        file.name,
+        "save",
+        { id: db.id, name: db.name },
+      )
     }
   };
 
@@ -2590,6 +2700,11 @@ function StudioPageInner({
         {/* Chat Input - Multi-line textarea with Enter to send, Shift+Enter for newline */}
         <div className="px-2.5 py-2 border-t bg-card shrink-0">
           <div className="flex gap-1.5 items-end">
+            <UploadPanel
+              onUpload={handleUpload}
+              disabled={loading || !!activeFlow}
+              compact
+            />
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -2635,7 +2750,10 @@ function StudioPageInner({
       {/* ─── Right Panel: Data/SQL/Explorer ─── */}
       <div className="flex-1 flex flex-col min-w-0">
         {/* Upload Panel - for importing databases */}
-        <UploadPanel onUpload={handleUpload} />
+        <UploadPanel
+          onUpload={handleUpload}
+          disabled={loading || generationProgress.isGenerating}
+        />
 
         {(generationProgress.isGenerating || rightGenBanner !== null) && (
           <div className="mx-3 mt-2 mb-1 shrink-0">
@@ -2663,6 +2781,14 @@ function StudioPageInner({
             {hasGeneratedData && (
               <>
                 <Database className="h-3.5 w-3.5 text-amber-600" />
+                {isUnsavedPreview && (
+                  <Badge
+                    variant="outline"
+                    className="text-[10px] h-6 border-amber-500/50 text-amber-700 dark:text-amber-300"
+                  >
+                    Unsaved preview
+                  </Badge>
+                )}
                 <Input
                   value={databaseName}
                   onChange={(e) => setDatabaseName(e.target.value)}
