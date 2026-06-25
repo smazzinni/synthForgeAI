@@ -1,6 +1,10 @@
 import { NextRequest } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
 import ZAI from 'z-ai-web-dev-sdk'
+import {
+  createDatabaseInMemory,
+  updateDatabaseInMemory,
+} from '@/lib/in-memory-store'
 
 // ─── Streaming Database Generation API ───
 // Receives a generation signal (schema + row counts + instructions),
@@ -151,11 +155,31 @@ export async function POST(request: NextRequest) {
     let databaseId = body.databaseId
     const admin = getSupabaseAdmin()
 
-    if (!databaseId && admin) {
+    if (!databaseId) {
       const dbName = body.databaseName || body.schema[0]?.name || 'synthetic_db'
-      const { data: newDb, error: dbError } = await admin
-        .from('synthetic_databases')
-        .insert({
+      if (admin) {
+        const { data: newDb, error: dbError } = await admin
+          .from('synthetic_databases')
+          .insert({
+            name: dbName,
+            db_type: 'postgresql',
+            schema_json: body.schema,
+            data_json: {},
+            row_count: 0,
+            quality_score: 0.85,
+            status: 'generating',
+            user_id: userId,
+          })
+          .select()
+          .single()
+
+        if (!dbError && newDb) {
+          databaseId = newDb.id
+        }
+      } else {
+        // In-memory fallback — create a database record so the studio can
+        // load the generated data back via /api/databases?id=...
+        const newDb = createDatabaseInMemory(userId, {
           name: dbName,
           db_type: 'postgresql',
           schema_json: body.schema,
@@ -163,20 +187,19 @@ export async function POST(request: NextRequest) {
           row_count: 0,
           quality_score: 0.85,
           status: 'generating',
-          user_id: userId,
         })
-        .select()
-        .single()
-
-      if (!dbError && newDb) {
         databaseId = newDb.id
       }
-    } else if (databaseId && admin) {
+    } else if (databaseId) {
       // Update existing database status
-      await admin
-        .from('synthetic_databases')
-        .update({ status: 'generating' })
-        .eq('id', databaseId)
+      if (admin) {
+        await admin
+          .from('synthetic_databases')
+          .update({ status: 'generating' })
+          .eq('id', databaseId)
+      } else {
+        updateDatabaseInMemory(userId, databaseId, { status: 'generating' })
+      }
     }
 
     // ─── Build messages for the AI ───
@@ -267,29 +290,47 @@ export async function POST(request: NextRequest) {
       allTableData[tableName].push(...records)
 
       // Update database record periodically
-      if (admin && databaseId) {
-        try {
-          const { data: db } = await admin
-            .from('synthetic_databases')
-            .select('data_json')
-            .eq('id', databaseId)
-            .single()
+      if (databaseId) {
+        if (admin) {
+          try {
+            const { data: db } = await admin
+              .from('synthetic_databases')
+              .select('data_json')
+              .eq('id', databaseId)
+              .single()
 
-          const existingData = (db?.data_json as Record<string, unknown[]>) || {}
-          if (!existingData[tableName]) {
-            existingData[tableName] = []
+            const existingData = (db?.data_json as Record<string, unknown[]>) || {}
+            if (!existingData[tableName]) {
+              existingData[tableName] = []
+            }
+            existingData[tableName] = [...existingData[tableName], ...records]
+
+            await admin
+              .from('synthetic_databases')
+              .update({
+                data_json: existingData,
+                row_count: totalInserted + records.length,
+              })
+              .eq('id', databaseId)
+          } catch (err) {
+            console.warn('[Generate-Stream] DB update failed:', err)
           }
-          existingData[tableName] = [...existingData[tableName], ...records]
-
-          await admin
-            .from('synthetic_databases')
-            .update({
-              data_json: existingData,
+        } else {
+          // In-memory fallback — merge the new records into the stored data_json
+          try {
+            const existing = (allTableData[tableName] || []).slice(0, -records.length)
+            const merged: Record<string, unknown[]> = {}
+            for (const [t, rows] of Object.entries(allTableData)) {
+              merged[t] = rows
+            }
+            updateDatabaseInMemory(userId, databaseId, {
+              data_json: merged,
               row_count: totalInserted + records.length,
             })
-            .eq('id', databaseId)
-        } catch (err) {
-          console.warn('[Generate-Stream] DB update failed:', err)
+            void existing // (kept for clarity; allTableData already has the merged data)
+          } catch (err) {
+            console.warn('[Generate-Stream] In-memory DB update failed:', err)
+          }
         }
       }
 
@@ -441,20 +482,36 @@ export async function POST(request: NextRequest) {
           }
 
           // ─── Update database status ───
-          if (admin && databaseId) {
-            try {
-              await admin
-                .from('synthetic_databases')
-                .update({
+          if (databaseId) {
+            if (admin) {
+              try {
+                await admin
+                  .from('synthetic_databases')
+                  .update({
+                    status: 'ready',
+                    data_json: allTableData,
+                    schema_json: body.schema,
+                    row_count: totalInserted,
+                    quality_score: 0.85,
+                  })
+                  .eq('id', databaseId)
+              } catch (err) {
+                console.warn('[Generate-Stream] Final DB update failed:', err)
+              }
+            } else {
+              // In-memory fallback — persist the final data so the studio
+              // can load it via /api/databases?id=...
+              try {
+                updateDatabaseInMemory(userId, databaseId, {
                   status: 'ready',
                   data_json: allTableData,
                   schema_json: body.schema,
                   row_count: totalInserted,
                   quality_score: 0.85,
                 })
-                .eq('id', databaseId)
-            } catch (err) {
-              console.warn('[Generate-Stream] Final DB update failed:', err)
+              } catch (err) {
+                console.warn('[Generate-Stream] In-memory final DB update failed:', err)
+              }
             }
           }
 

@@ -20,6 +20,11 @@ import {
   Lock,
   Workflow,
   ChevronRight,
+  Terminal,
+  Table2,
+  GitBranch,
+  CheckCircle,
+  Cpu,
 } from 'lucide-react'
 
 const features = [
@@ -88,6 +93,14 @@ const steps = [
   },
 ]
 
+const agents = [
+  { name: 'Orchestrator', icon: Sparkles, color: 'from-amber-500 to-red-600', task: 'Coordinates the pipeline' },
+  { name: 'Schema Architect', icon: GitBranch, color: 'from-violet-500 to-purple-600', task: 'Designs the schema' },
+  { name: 'Data Generator', icon: Database, color: 'from-emerald-500 to-teal-600', task: 'Creates realistic rows' },
+  { name: 'Quality Analyst', icon: CheckCircle, color: 'from-sky-500 to-cyan-600', task: 'Validates integrity' },
+  { name: 'Privacy Officer', icon: Shield, color: 'from-rose-500 to-pink-600', task: 'Ensures compliance' },
+]
+
 const pricingPlans = [
   {
     name: 'Free',
@@ -127,51 +140,131 @@ export default function LandingPage() {
       <section className="relative overflow-hidden">
         <div className="absolute inset-0 bg-gradient-to-br from-amber-50 via-background to-red-50 dark:from-amber-950/20 dark:via-background dark:to-red-950/20" />
         <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-amber-200/20 via-transparent to-transparent dark:from-amber-900/10" />
-        <div className="relative container mx-auto px-4 md:px-6 py-20 md:py-32">
-          <div className="max-w-4xl mx-auto text-center">
-            <Badge variant="secondary" className="mb-6 px-4 py-1.5 text-sm font-medium">
-              <Sparkles className="h-3.5 w-3.5 mr-1.5" />
-              AI-Powered Synthetic Data Generation
-            </Badge>
-            <h1 className="text-4xl md:text-6xl lg:text-7xl font-bold tracking-tight mb-6">
-              Generate Realistic{' '}
-              <span className="bg-gradient-to-r from-amber-600 to-red-600 bg-clip-text text-transparent">
-                Synthetic Data
-              </span>{' '}
-              from Scratch
-            </h1>
-            <p className="text-lg md:text-xl text-muted-foreground max-w-2xl mx-auto mb-10">
-              Describe what you need in natural language. Our multi-agent AI pipeline designs schemas,
-              generates data, validates quality, and ensures privacy compliance — automatically.
-            </p>
-            <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
-              <Button
-                size="lg"
-                asChild
-                className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white h-12 px-8 text-base"
-              >
-                <Link href="/signup">
-                  Start Generating Free
-                  <ArrowRight className="ml-2 h-4 w-4" />
-                </Link>
-              </Button>
-              <Button size="lg" variant="outline" asChild className="h-12 px-8 text-base">
-                <Link href="/about">Learn More</Link>
-              </Button>
+        {/* Subtle grid pattern overlay */}
+        <div
+          className="absolute inset-0 opacity-[0.03] dark:opacity-[0.05]"
+          style={{
+            backgroundImage: 'linear-gradient(to right, currentColor 1px, transparent 1px), linear-gradient(to bottom, currentColor 1px, transparent 1px)',
+            backgroundSize: '32px 32px',
+          }}
+        />
+        <div className="relative container mx-auto px-4 md:px-6 py-20 md:py-28">
+          <div className="grid lg:grid-cols-2 gap-12 items-center max-w-6xl mx-auto">
+            {/* Left: headline + CTA */}
+            <div className="text-center lg:text-left">
+              <Badge variant="secondary" className="mb-6 px-4 py-1.5 text-sm font-medium">
+                <Sparkles className="h-3.5 w-3.5 mr-1.5" />
+                AI-Powered Synthetic Data Generation
+              </Badge>
+              <h1 className="text-4xl md:text-5xl lg:text-6xl font-bold tracking-tight mb-6 leading-[1.1]">
+                Generate Realistic{' '}
+                <span className="bg-gradient-to-r from-amber-600 to-red-600 bg-clip-text text-transparent">
+                  Synthetic Data
+                </span>{' '}
+                from Scratch
+              </h1>
+              <p className="text-lg text-muted-foreground max-w-xl mx-auto lg:mx-0 mb-8">
+                Describe what you need in natural language. Our multi-agent AI pipeline designs schemas,
+                generates data, validates quality, and ensures privacy compliance — automatically.
+              </p>
+              <div className="flex flex-col sm:flex-row items-center justify-center lg:justify-start gap-4">
+                <Button
+                  size="lg"
+                  asChild
+                  className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white h-12 px-8 text-base shadow-lg shadow-amber-500/20 hover:shadow-amber-500/30 transition-shadow"
+                >
+                  <Link href="/dashboard/studio">
+                    Start Generating Free
+                    <ArrowRight className="ml-2 h-4 w-4" />
+                  </Link>
+                </Button>
+                <Button size="lg" variant="outline" asChild className="h-12 px-8 text-base">
+                  <Link href="/about">Learn More</Link>
+                </Button>
+              </div>
+
+              {/* Stats */}
+              <div className="mt-12 grid grid-cols-3 gap-6 max-w-md mx-auto lg:mx-0">
+                {[
+                  { value: '10M+', label: 'Rows Generated' },
+                  { value: '99.5%', label: 'Quality Score' },
+                  { value: '<30s', label: 'Generation Time' },
+                ].map((stat) => (
+                  <div key={stat.label} className="text-center lg:text-left">
+                    <div className="text-2xl md:text-3xl font-bold bg-gradient-to-r from-amber-600 to-red-600 bg-clip-text text-transparent">
+                      {stat.value}
+                    </div>
+                    <div className="text-xs text-muted-foreground mt-0.5">{stat.label}</div>
+                  </div>
+                ))}
+              </div>
             </div>
 
-            {/* Stats */}
-            <div className="mt-16 grid grid-cols-3 gap-8 max-w-lg mx-auto">
-              {[
-                { value: '10M+', label: 'Rows Generated' },
-                { value: '99.5%', label: 'Quality Score' },
-                { value: '<30s', label: 'Generation Time' },
-              ].map((stat) => (
-                <div key={stat.label} className="text-center">
-                  <div className="text-2xl md:text-3xl font-bold">{stat.value}</div>
-                  <div className="text-sm text-muted-foreground">{stat.label}</div>
+            {/* Right: demo preview card */}
+            <div className="relative">
+              {/* Glow effect behind the card */}
+              <div className="absolute -inset-4 bg-gradient-to-br from-amber-500/20 via-red-500/10 to-amber-500/20 dark:from-amber-500/10 dark:via-red-500/5 dark:to-amber-500/10 rounded-3xl blur-2xl" />
+              <div className="relative rounded-2xl border border-border/60 bg-card/80 backdrop-blur-sm shadow-2xl overflow-hidden">
+                {/* Window chrome */}
+                <div className="flex items-center gap-2 px-4 py-3 border-b bg-muted/40">
+                  <div className="flex gap-1.5">
+                    <div className="h-3 w-3 rounded-full bg-rose-400" />
+                    <div className="h-3 w-3 rounded-full bg-amber-400" />
+                    <div className="h-3 w-3 rounded-full bg-emerald-400" />
+                  </div>
+                  <div className="ml-2 flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <Terminal className="h-3 w-3" />
+                    <span className="font-mono">studio — synthforge-ai</span>
+                  </div>
                 </div>
-              ))}
+                {/* Chat preview */}
+                <div className="p-4 space-y-3">
+                  {/* User message */}
+                  <div className="flex justify-end">
+                    <div className="rounded-2xl rounded-tr-sm bg-gradient-to-r from-amber-600 to-red-600 text-white px-3.5 py-2 text-sm max-w-[80%] shadow-sm">
+                      Create an e-commerce database with 5 rows each
+                    </div>
+                  </div>
+                  {/* AI response with agent badges */}
+                  <div className="flex justify-start">
+                    <div className="rounded-2xl rounded-tl-sm bg-muted/60 px-3.5 py-2.5 text-sm max-w-[85%] space-y-2">
+                      <div className="flex items-center gap-1.5">
+                        <Badge variant="outline" className="text-[9px] px-1.5 py-0 h-4 border-violet-400/50 text-violet-600 dark:text-violet-400">
+                          <GitBranch className="h-2 w-2 mr-0.5" />
+                          Schema Architect
+                        </Badge>
+                      </div>
+                      <p className="text-muted-foreground">Designing 3 tables: users, products, orders…</p>
+                    </div>
+                  </div>
+                  {/* Schema table preview */}
+                  <div className="rounded-lg border border-border/50 overflow-hidden">
+                    <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-muted/40 border-b border-border/50">
+                      <Table2 className="h-3 w-3 text-emerald-600" />
+                      <span className="text-xs font-mono font-medium">users</span>
+                      <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 ml-auto">5 rows</Badge>
+                    </div>
+                    <div className="grid grid-cols-3 gap-px bg-border/30 text-[10px]">
+                      <div className="bg-primary/10 px-2 py-1 font-mono">
+                        <span className="inline-flex items-center gap-0.5">
+                          <span className="text-[7px] font-bold bg-primary/20 text-primary rounded px-0.5">PK</span>
+                          id
+                        </span>
+                      </div>
+                      <div className="bg-background px-2 py-1 font-mono text-muted-foreground">email</div>
+                      <div className="bg-background px-2 py-1 font-mono text-muted-foreground">name</div>
+                    </div>
+                  </div>
+                  {/* Progress bar */}
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden">
+                      <div className="h-full w-full bg-gradient-to-r from-emerald-500 to-teal-500 rounded-full" />
+                    </div>
+                    <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+                    <span className="text-[10px] text-muted-foreground font-mono">15/15 rows</span>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -192,19 +285,62 @@ export default function LandingPage() {
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             {features.map((feature) => (
-              <Card key={feature.title} className="group hover:shadow-lg transition-all duration-300 border-border/50">
-                <CardHeader>
-                  <div className={`h-12 w-12 rounded-xl bg-gradient-to-br ${feature.color} flex items-center justify-center mb-3 group-hover:scale-110 transition-transform`}>
+              <Card key={feature.title} className="group relative hover:shadow-xl transition-all duration-300 border-border/50 overflow-hidden">
+                {/* Gradient glow on hover */}
+                <div className={`absolute -inset-px bg-gradient-to-br ${feature.color} opacity-0 group-hover:opacity-10 transition-opacity duration-300 rounded-2xl`} />
+                <CardHeader className="relative">
+                  <div className={`h-12 w-12 rounded-xl bg-gradient-to-br ${feature.color} flex items-center justify-center mb-3 shadow-lg group-hover:scale-110 group-hover:rotate-3 transition-transform duration-300`}>
                     <feature.icon className="h-6 w-6 text-white" />
                   </div>
                   <CardTitle className="text-xl">{feature.title}</CardTitle>
                 </CardHeader>
-                <CardContent>
+                <CardContent className="relative">
                   <CardDescription className="text-base leading-relaxed">
                     {feature.description}
                   </CardDescription>
                 </CardContent>
               </Card>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* Agent Pipeline Section */}
+      <section className="py-20 md:py-28">
+        <div className="container mx-auto px-4 md:px-6">
+          <div className="text-center max-w-2xl mx-auto mb-16">
+            <Badge variant="outline" className="mb-4">
+              <Cpu className="h-3 w-3 mr-1" />
+              Multi-Agent Pipeline
+            </Badge>
+            <h2 className="text-3xl md:text-4xl font-bold tracking-tight mb-4">
+              Five Specialized AI Agents Working Together
+            </h2>
+            <p className="text-muted-foreground text-lg">
+              Each agent has a distinct role in the pipeline, collaborating to deliver production-quality synthetic data.
+            </p>
+          </div>
+
+          {/* Agent flow */}
+          <div className="flex flex-col lg:flex-row items-stretch justify-center gap-3 lg:gap-2 max-w-5xl mx-auto">
+            {agents.map((agent, idx) => (
+              <div key={agent.name} className="flex flex-col lg:flex-row items-center gap-3 lg:gap-2 flex-1">
+                <div className="group relative w-full lg:flex-1">
+                  <div className={`absolute -inset-0.5 bg-gradient-to-br ${agent.color} opacity-0 group-hover:opacity-20 blur rounded-xl transition-opacity`} />
+                  <div className="relative rounded-xl border border-border/60 bg-card p-4 lg:p-3 text-center hover:border-transparent hover:shadow-lg transition-all">
+                    <div className={`h-10 w-10 rounded-lg bg-gradient-to-br ${agent.color} flex items-center justify-center mx-auto mb-2 shadow-md`}>
+                      <agent.icon className="h-5 w-5 text-white" />
+                    </div>
+                    <p className="text-xs font-semibold mb-0.5">{agent.name}</p>
+                    <p className="text-[10px] text-muted-foreground leading-tight">{agent.task}</p>
+                  </div>
+                </div>
+                {idx < agents.length - 1 && (
+                  <div className="flex lg:flex-col items-center justify-center">
+                    <ChevronRight className="h-4 w-4 text-muted-foreground/40 rotate-90 lg:rotate-0" />
+                  </div>
+                )}
+              </div>
             ))}
           </div>
         </div>

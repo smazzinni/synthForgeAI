@@ -16,8 +16,15 @@ import { getSupabaseAdmin } from '@/lib/supabase/admin'
 import type { DbConnectionInput, DbConnectionRecord, SafeDbConnectionRecord } from './types'
 import { toSafeRecord } from './types'
 
-// In-memory fallback keyed by user_id
-const inMemoryStore = new Map<string, DbConnectionRecord[]>()
+// In-memory fallback keyed by user_id.
+// Use globalThis so the store survives Next.js dev hot-reloads (Turbopack
+// re-evaluates modules on file changes, which would reset a plain Map and
+// lose all saved connections).
+const globalForConnStore = globalThis as unknown as {
+  __synthConnStore?: Map<string, DbConnectionRecord[]>
+}
+const inMemoryStore: Map<string, DbConnectionRecord[]> =
+  globalForConnStore.__synthConnStore ?? (globalForConnStore.__synthConnStore = new Map())
 
 function generateId(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {

@@ -25,13 +25,18 @@ async function getMysqlPool() {
 // We keep one pool per connection id so we don't pay the TCP+auth cost on
 // every request. Pools are evicted after 10 minutes of inactivity OR when
 // the underlying connection record changes (PATCH) or is deleted.
+// Use globalThis so the pool cache survives Next.js dev hot-reloads.
 interface PoolEntry {
   pool: unknown  // either pg.Pool or mysql2.Pool
   dialect: 'postgres' | 'mysql'
   lastUsedAt: number
   close: () => Promise<void>
 }
-const poolCache = new Map<string, PoolEntry>()
+const globalForPool = globalThis as unknown as {
+  __synthPoolCache?: Map<string, PoolEntry>
+}
+const poolCache: Map<string, PoolEntry> =
+  globalForPool.__synthPoolCache ?? (globalForPool.__synthPoolCache = new Map())
 const POOL_TTL_MS = 10 * 60 * 1000
 
 /**

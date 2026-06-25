@@ -1,17 +1,58 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import {
+  listConversationsInMemory,
+  createConversationInMemory,
+  addMessagesInMemory,
+  deleteConversationInMemory,
+} from '@/lib/in-memory-store'
+
+const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
+
+function getUserIdFromCookies(request: NextRequest): string {
+  try {
+    const supabaseCookies = request.cookies.getAll().filter(c => c.name.includes('-auth-token'))
+    for (const cookie of supabaseCookies) {
+      try {
+        const rawValue = decodeURIComponent(cookie.value)
+        let accessToken: string | null = null
+        try {
+          const parsed = JSON.parse(rawValue)
+          accessToken = parsed?.access_token || null
+        } catch {
+          accessToken = rawValue
+        }
+        if (!accessToken) continue
+        const parts = accessToken.split('.')
+        if (parts.length !== 3) continue
+        const payload = JSON.parse(atob(parts[1]))
+        if (payload?.sub) return payload.sub as string
+      } catch {
+        continue
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return DEFAULT_USER_ID
+}
 
 // GET /api/conversations - List conversations for a user
 export async function GET(request: NextRequest) {
   try {
-    const admin = getSupabaseAdmin()
-    if (!admin) {
-      return NextResponse.json({ conversations: [] })
-    }
-
+    const userId = getUserIdFromCookies(request)
     const { searchParams } = new URL(request.url)
     const databaseId = searchParams.get('databaseId')
-    const userId = searchParams.get('userId')
+
+    const admin = getSupabaseAdmin()
+    if (!admin) {
+      // In-memory fallback
+      let conversations = listConversationsInMemory(userId)
+      if (databaseId) {
+        conversations = conversations.filter(c => c.database_id === databaseId)
+      }
+      return NextResponse.json({ conversations })
+    }
 
     let query = admin
       .from('conversations')
@@ -56,12 +97,28 @@ export async function GET(request: NextRequest) {
 // POST /api/conversations - Create or update conversation with messages
 export async function POST(request: NextRequest) {
   try {
+    const userId = getUserIdFromCookies(request)
     const body = await request.json()
-    const { id, databaseId, title, messages: messageData, userId } = body
+    const { id, databaseId, title, messages: messageData, userId: bodyUserId } = body
 
     const admin = getSupabaseAdmin()
     if (!admin) {
-      return NextResponse.json({ error: 'Database service not configured' }, { status: 503 })
+      // In-memory fallback — create conversation + add messages
+      let conversationId = id
+      if (!conversationId) {
+        const conv = createConversationInMemory(userId, {
+          database_id: databaseId || null,
+          title: title || 'New Conversation',
+          user_id: bodyUserId || userId,
+          status: 'active',
+          agent_mode: 'orchestrator',
+        })
+        conversationId = conv.id
+      }
+      if (messageData && Array.isArray(messageData) && messageData.length > 0) {
+        addMessagesInMemory(userId, conversationId, messageData)
+      }
+      return NextResponse.json({ conversationId })
     }
 
     let conversationId = id
@@ -73,7 +130,7 @@ export async function POST(request: NextRequest) {
         .insert({
           database_id: databaseId || null,
           title: title || 'New Conversation',
-          user_id: userId || null,
+          user_id: bodyUserId || userId,
           status: 'active',
           agent_mode: 'orchestrator',
         })
@@ -115,6 +172,7 @@ export async function POST(request: NextRequest) {
 // DELETE /api/conversations - Delete a conversation
 export async function DELETE(request: NextRequest) {
   try {
+    const userId = getUserIdFromCookies(request)
     const { searchParams } = new URL(request.url)
     const id = searchParams.get('id')
 
@@ -124,7 +182,12 @@ export async function DELETE(request: NextRequest) {
 
     const admin = getSupabaseAdmin()
     if (!admin) {
-      return NextResponse.json({ error: 'Database service not configured' }, { status: 503 })
+      // In-memory fallback
+      const ok = deleteConversationInMemory(userId, id)
+      if (!ok) {
+        return NextResponse.json({ error: 'Conversation not found' }, { status: 404 })
+      }
+      return NextResponse.json({ success: true })
     }
 
     // Delete messages first

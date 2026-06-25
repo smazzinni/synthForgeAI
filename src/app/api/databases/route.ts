@@ -1,5 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import {
+  listDatabasesInMemory,
+  getDatabaseInMemory,
+  createDatabaseInMemory,
+  updateDatabaseInMemory,
+  deleteDatabaseInMemory,
+} from '@/lib/in-memory-store'
 
 // ─── Default user ID for fallback when auth is not available ───
 const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
@@ -117,25 +124,28 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const admin = getSupabaseAdmin()
-    if (!admin) {
-      return NextResponse.json({ databases: [] })
-    }
-
     const { searchParams } = new URL(request.url)
     const id = searchParams.get('id')
+    const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
+
+    const admin = getSupabaseAdmin()
+    if (!admin) {
+      // In-memory fallback
+      if (id) {
+        const db = getDatabaseInMemory(userId, id)
+        return NextResponse.json({ database: db })
+      }
+      return NextResponse.json({ databases: listDatabasesInMemory(userId) })
+    }
 
     // Check cache for list queries (not individual ID queries)
     if (!id) {
-      const userId = getUserIdFromCookies(request)
       const cacheKey = `databases:list:${userId || 'anon'}`
       const cached = apiCache.get(cacheKey)
       if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
         return NextResponse.json(cached.data)
       }
     }
-
-    const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
 
     // If requesting a specific database by ID
     if (id) {
@@ -215,11 +225,21 @@ export async function POST(request: NextRequest) {
     }
 
     const admin = getSupabaseAdmin()
-    if (!admin) {
-      return NextResponse.json({ error: 'Database service not configured' }, { status: 503 })
-    }
-
     const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
+
+    if (!admin) {
+      // In-memory fallback
+      const record = createDatabaseInMemory(userId, {
+        name,
+        db_type,
+        status,
+        schema_json,
+        data_json,
+        row_count: row_count || 0,
+        quality_score,
+      })
+      return NextResponse.json({ database: record })
+    }
 
     const insertData: Record<string, unknown> = {
       name,
@@ -287,8 +307,22 @@ export async function PATCH(request: NextRequest) {
     }
 
     const admin = getSupabaseAdmin()
+    const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
+
     if (!admin) {
-      return NextResponse.json({ error: 'Database service not configured' }, { status: 503 })
+      // In-memory fallback
+      const patch: Record<string, unknown> = {}
+      if (data_json !== undefined) patch.data_json = data_json
+      if (schema_json !== undefined) patch.schema_json = schema_json
+      if (row_count !== undefined) patch.row_count = row_count
+      if (quality_score !== undefined) patch.quality_score = quality_score
+      if (status !== undefined) patch.status = status
+      if (name !== undefined) patch.name = name
+      const updated = updateDatabaseInMemory(userId, id, patch)
+      if (!updated) {
+        return NextResponse.json({ error: 'Database not found' }, { status: 404 })
+      }
+      return NextResponse.json({ database: updated })
     }
 
     const updateData: Record<string, unknown> = {}
@@ -346,8 +380,15 @@ export async function DELETE(request: NextRequest) {
     }
 
     const admin = getSupabaseAdmin()
+    const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
+
     if (!admin) {
-      return NextResponse.json({ error: 'Database service not configured' }, { status: 503 })
+      // In-memory fallback
+      const ok = deleteDatabaseInMemory(userId, id)
+      if (!ok) {
+        return NextResponse.json({ error: 'Database not found' }, { status: 404 })
+      }
+      return NextResponse.json({ success: true })
     }
 
     const { error } = await admin
