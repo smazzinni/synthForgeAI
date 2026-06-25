@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
+import { Separator } from '@/components/ui/separator'
 import {
   Dialog,
   DialogContent,
@@ -32,6 +33,7 @@ import {
   ArrowRight,
   RefreshCw,
   Lightbulb,
+  Sparkles,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { apiGet, apiPost, apiPatch, apiDelete, invalidateCache } from '@/lib/api-client'
@@ -58,6 +60,102 @@ const DEFAULT_PORTS: Record<'postgres' | 'mysql', number> = {
   postgres: 5432,
   mysql: 3306,
 }
+
+interface ProviderPreset {
+  id: string
+  name: string
+  description: string
+  dialect: 'postgres' | 'mysql'
+  host: string
+  port: number
+  username: string
+  database: string
+  schema?: string
+  ssl: boolean
+  color: string // tailwind gradient classes
+}
+
+// Quick Connect presets — one click pre-fills the form with sane defaults
+// for the most popular hosted + local database providers. Placeholders in
+// square brackets (e.g. [region], [project-ref]) are intentional: the user
+// replaces them with their specific values.
+const PROVIDER_PRESETS: ProviderPreset[] = [
+  {
+    id: 'supabase',
+    name: 'Supabase',
+    description: 'Pooler connection — uses project ref in username',
+    dialect: 'postgres',
+    host: 'aws-0-[region].pooler.supabase.com',
+    port: 6543,
+    username: 'postgres.[project-ref]',
+    database: 'postgres',
+    schema: 'public',
+    ssl: true,
+    color: 'from-emerald-500 to-green-600',
+  },
+  {
+    id: 'neon',
+    name: 'Neon',
+    description: 'Serverless Postgres with branching',
+    dialect: 'postgres',
+    host: 'ep-[id].[region].aws.neon.tech',
+    port: 5432,
+    username: '[username]',
+    database: 'neondb',
+    schema: 'public',
+    ssl: true,
+    color: 'from-teal-400 to-cyan-500',
+  },
+  {
+    id: 'railway',
+    name: 'Railway',
+    description: 'Postgres hosted on Railway.app',
+    dialect: 'postgres',
+    host: '[region].railway.app',
+    port: 5432,
+    username: 'postgres',
+    database: 'railway',
+    ssl: true,
+    color: 'from-purple-500 to-violet-600',
+  },
+  {
+    id: 'planetscale',
+    name: 'PlanetScale',
+    description: 'Serverless MySQL on Vitess',
+    dialect: 'mysql',
+    host: '[hash].p.[region].aws.psdb.cloud',
+    port: 3306,
+    username: '[hash]',
+    database: '[db-name]',
+    ssl: true,
+    color: 'from-fuchsia-500 to-pink-600',
+  },
+  {
+    id: 'local-postgres',
+    name: 'Local PostgreSQL',
+    description: 'Default local dev Postgres',
+    dialect: 'postgres',
+    host: 'localhost',
+    port: 5432,
+    username: 'postgres',
+    database: 'postgres',
+    schema: 'public',
+    ssl: false,
+    color: 'from-slate-500 to-slate-700',
+  },
+  {
+    id: 'local-mysql',
+    name: 'Local MySQL',
+    description: 'Default local dev MySQL',
+    dialect: 'mysql',
+    host: 'localhost',
+    port: 3306,
+    username: 'root',
+    database: 'mysql',
+    ssl: false,
+    color: 'from-stone-500 to-stone-700',
+  },
+]
 
 // ─── Client-side "how to fix" hint derivation ───
 // Mirrors the server-side explainConnectionError so the actionable hint
@@ -311,6 +409,25 @@ export default function DatabaseConnectionsPage() {
     }
   }
 
+  // Apply a Quick Connect preset — pre-fills the form fields but keeps the
+  // dialog open so the user can edit the placeholder values (host, username,
+  // etc.) before saving. Only sets the connection name if it is currently
+  // empty, so a user who already typed a name doesn't lose it.
+  const applyPreset = (preset: ProviderPreset) => {
+    setForm(prev => ({
+      ...prev,
+      dialect: preset.dialect,
+      host: preset.host,
+      port: preset.port,
+      username: preset.username,
+      database: preset.database,
+      schema: preset.schema ?? (preset.dialect === 'postgres' ? 'public' : ''),
+      ssl: preset.ssl,
+      name: prev.name.trim() === '' ? preset.name : prev.name,
+    }))
+    toast.success('Preset applied — fill in your specific details')
+  }
+
   const handleOpenInStudio = (conn: SafeDbConnection) => {
     // Route to studio with ?connectionId=... so it loads the external DB
     router.push(`/dashboard/studio?connectionId=${conn.id}`)
@@ -345,6 +462,37 @@ export default function DatabaseConnectionsPage() {
             </DialogHeader>
 
             <div className="space-y-3 max-h-[60vh] overflow-y-auto py-2">
+              {/* Quick Connect presets */}
+              <div className="space-y-2.5">
+                <div className="flex items-center gap-2">
+                  <Sparkles className="h-4 w-4 text-amber-600 shrink-0" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium leading-none">Quick Connect</p>
+                    <p className="text-xs text-muted-foreground mt-1">Choose a provider to pre-fill connection details</p>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                  {PROVIDER_PRESETS.map((preset) => (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      onClick={() => applyPreset(preset)}
+                      className="group flex items-start gap-2 rounded-lg border p-2.5 text-left transition-colors hover:border-amber-500 hover:bg-amber-50 dark:hover:bg-amber-950/30"
+                    >
+                      <div className={`h-7 w-7 shrink-0 rounded-md bg-gradient-to-br ${preset.color} flex items-center justify-center text-white text-xs font-bold`}>
+                        {preset.name.charAt(0)}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-semibold leading-tight">{preset.name}</p>
+                        <p className="text-[10px] text-muted-foreground leading-tight mt-0.5 line-clamp-2">{preset.description}</p>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <Separator />
+
               {/* Name */}
               <div className="space-y-1.5">
                 <Label htmlFor="name">Connection Name</Label>
