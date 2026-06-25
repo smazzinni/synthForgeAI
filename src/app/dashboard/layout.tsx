@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useAuth } from '@/hooks/use-auth'
 import { DashboardSidebar } from '@/components/layout/dashboard-sidebar'
+import { NotificationCenter } from '@/components/layout/notification-center'
 import { Loader2, PanelLeft, PanelLeftClose } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 
@@ -69,6 +70,7 @@ export default function DashboardLayout({
             )}
           </Button>
           <div className="flex-1" />
+          <NotificationCenter />
         </div>
         <main className="flex-1 overflow-auto">
           {children}
