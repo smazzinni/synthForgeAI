@@ -57,3 +57,28 @@ export interface StudioPageProps {
   initialConnectionName?: string
   initialConnectionDialect?: 'postgres' | 'mysql'
 }
+
+/**
+ * Persisted conversation entry in localStorage history.
+ *
+ * Stores the full message list plus the generated schema/data/databaseName/
+ * databaseId so the entire studio state can be restored when a user reopens
+ * a past conversation from the History dropdown.
+ */
+export interface SavedConversation {
+  id: string
+  title: string
+  messages: Message[]
+  schema: SchemaTable[]
+  data: Record<string, unknown[]>
+  databaseName: string
+  databaseId: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+/** A named, user-saved SQL snippet for the SQL workspace. */
+export interface SavedQuery {
+  name: string
+  sql: string
+}
