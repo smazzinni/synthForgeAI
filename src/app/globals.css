@@ -144,3 +144,46 @@
 .dark ::-webkit-scrollbar-thumb:hover {
   background: oklch(0.4 0 0 / 0.5);
 }
+
+/* ─── Studio chat animations ─── */
+@keyframes msg-fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-msg-fade-in {
+  animation: msg-fade-in-up 0.28s ease-out both;
+}
+
+/* Animated typing dots — staggered bounce instead of static pulse */
+@keyframes typing-bounce {
+  0%, 60%, 100% {
+    transform: translateY(0);
+    opacity: 0.5;
+  }
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+.typing-dot {
+  animation: typing-bounce 1s ease-in-out infinite;
+}
+
+/* Soft pulsing glow for the "AI is thinking..." indicator */
+@keyframes thinking-pulse {
+  0%, 100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.animate-thinking {
+  animation: thinking-pulse 1.4s ease-in-out infinite;
+}

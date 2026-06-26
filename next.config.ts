@@ -6,11 +6,6 @@ const nextConfig: NextConfig = {
   typescript: {
     ignoreBuildErrors: true,
   },
-  // Skip ESLint errors during build — the codebase has pre-existing lint
-  // warnings that don't affect functionality.
-  eslint: {
-    ignoreDuringBuilds: true,
-  },
   reactStrictMode: false,
   allowedDevOrigins: ['.space-z.ai', '.space-chatglm.site', 'localhost', '127.0.0.1'],
   async headers() {

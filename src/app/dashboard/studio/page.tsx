@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect, useCallback, Suspense } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
@@ -94,6 +95,7 @@ import {
   PanelRightOpen,
   Clock,
   MessageSquare,
+  Eraser,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
@@ -228,6 +230,26 @@ function relativeTime(iso: string): string {
   const mo = Math.floor(day / 30)
   if (mo < 12) return `${mo}mo ago`
   return `${Math.floor(day / 365)}y ago`
+}
+
+// Format a message timestamp as a short HH:MM string for the hover tooltip.
+function formatTimestamp(d: Date): string {
+  try {
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  } catch {
+    return ''
+  }
+}
+
+// Auto-resize a <textarea> to fit its content, capped at ~3 lines.
+// Resets height to auto first so shrinking text also collapses the box.
+function autoResizeTextarea(el: HTMLTextAreaElement | null) {
+  if (!el) return
+  el.style.height = 'auto'
+  // ~20px per line + a little padding; cap at 3 lines (~72px).
+  const maxHeight = 72
+  el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`
+  el.style.overflowY = el.scrollHeight > maxHeight ? 'auto' : 'hidden'
 }
 
 
@@ -433,7 +455,14 @@ function StudioPageInner({
   // floating button is rendered to re-open it.
   const [showShortcuts, setShowShortcuts] = useState(false)
   const [panelVisible, setPanelVisible] = useState(true)
-  const chatInputRef = useRef<HTMLInputElement>(null)
+  // Auto-resizing textarea ref. We swap from a single-line <Input> to a
+  // <Textarea> so the chat box can grow with content (capped at 3 lines).
+  const chatInputRef = useRef<HTMLTextAreaElement>(null)
+  // Tracks whether the chat textarea is focused so we can render a soft
+  // amber focus ring/glow around the input row.
+  const [inputFocused, setInputFocused] = useState(false)
+  // Controls the "Clear chat" confirmation AlertDialog in the chat header.
+  const [clearChatOpen, setClearChatOpen] = useState(false)
 
   // Streaming generation state
   const [generationProgress, setGenerationProgress] = useState<GenerationProgress>({
@@ -642,6 +671,15 @@ function StudioPageInner({
     const isStreaming = currentReasoning.length > 0
     chatEndRef.current?.scrollIntoView({ behavior: isStreaming ? 'auto' : 'smooth' })
   }, [messages, currentReasoning])
+
+  // ─── Auto-resize chat textarea ───
+  // Recompute the textarea height whenever `input` changes. The onChange
+  // handler already calls autoResizeTextarea on each keystroke, but this
+  // effect also catches programmatic clears (e.g. setInput('') after
+  // sendMessage) so the box collapses back to a single line.
+  useEffect(() => {
+    autoResizeTextarea(chatInputRef.current)
+  }, [input])
 
   // ─── Resize handler ───
   useEffect(() => {
@@ -1293,6 +1331,31 @@ function StudioPageInner({
         timestamp: new Date(),
       },
     ])
+  }
+
+  // ─── Clear chat ───
+  // Like startNewChat but only wipes the message list (keeps the current
+  // generated schema/data + database name + conversation id). Used by the
+  // "Clear chat" button in the chat header (with an AlertDialog confirmation).
+  const clearChat = () => {
+    setMessages([
+      {
+        id: Date.now().toString(),
+        role: 'assistant',
+        content: isLiveDbMode
+          ? `Chat cleared. Still connected to live ${activeConnectionDialect || 'DB'} **"${activeConnectionName || ''}"** — ask me anything.`
+          : 'Chat cleared. Describe the next database you need.',
+        agentName: 'Orchestrator',
+        timestamp: new Date(),
+      },
+    ])
+    setCurrentReasoning('')
+    setReasoningVisible(false)
+    // Detach from the active saved conversation so clearing doesn't overwrite
+    // the previous history entry — the cleared state starts a new one.
+    activeConversationIdRef.current = null
+    setActiveConversationId(null)
+    toast.success('Chat cleared')
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -2335,12 +2398,45 @@ function StudioPageInner({
         {/* Chat Header */}
         <div className="px-3 py-2.5 border-b flex items-center justify-between bg-card shrink-0">
           <div className="flex items-center gap-2 min-w-0">
-            <div className={`h-6 w-6 rounded-lg flex items-center justify-center shrink-0 ${isLiveDbMode ? 'bg-gradient-to-br from-sky-500 to-indigo-600' : 'bg-gradient-to-br from-amber-500 to-red-600'}`}>
-              {isLiveDbMode ? <PlugZap className="h-3 w-3 text-white" /> : <Sparkles className="h-3 w-3 text-white" />}
+            <div className="relative shrink-0">
+              <div className={`h-6 w-6 rounded-lg flex items-center justify-center bg-gradient-to-br ${isLiveDbMode ? 'from-amber-500 to-red-600' : 'from-amber-500 to-red-600'}`}>
+                {isLiveDbMode ? <PlugZap className="h-3 w-3 text-white" /> : <Sparkles className="h-3 w-3 text-white" />}
+              </div>
+              {/* Live connection status dot — green when the studio has a
+                  reachable DB (live connection OR generated synthetic data),
+                  muted grey otherwise. Pinned to the bottom-right of the icon. */}
+              <span
+                className={`absolute -bottom-0.5 -right-0.5 h-2 w-2 rounded-full border border-card ${
+                  (isLiveDbMode || hasGeneratedData)
+                    ? 'bg-emerald-500'
+                    : 'bg-muted-foreground/40'
+                }`}
+                title={
+                  (isLiveDbMode || hasGeneratedData)
+                    ? 'Database connected'
+                    : 'No database connected'
+                }
+                aria-label={
+                  (isLiveDbMode || hasGeneratedData)
+                    ? 'Database connected'
+                    : 'No database connected'
+                }
+              />
             </div>
             <div className="min-w-0">
-              <h2 className="text-xs font-semibold truncate">
+              <h2 className="text-xs font-semibold truncate flex items-center gap-1.5">
                 {isLiveDbMode ? (activeConnectionName || 'Live DB') : 'SynthForge AI'}
+                {/* Active dialect badge — PostgreSQL / MySQL in live mode,
+                    SQLite for synthetic-data mode. Amber/red theme to stay
+                    consistent with the rest of the chat header. */}
+                <Badge
+                  variant="outline"
+                  className="text-[8px] h-3 px-1 gap-0.5 leading-none shrink-0 border-amber-400/60 text-amber-700 dark:text-amber-400 bg-amber-50/60 dark:bg-amber-950/30"
+                >
+                  {isLiveDbMode
+                    ? (activeConnectionDialect || 'postgres').toUpperCase()
+                    : 'SQLITE'}
+                </Badge>
               </h2>
               <p className="text-[9px] text-muted-foreground truncate">
                 {isLiveDbMode
@@ -2353,11 +2449,28 @@ function StudioPageInner({
             <Button
               variant="ghost"
               size="sm"
-              className="h-5 w-5 p-0"
+              className="h-5 w-5 p-0 hover:bg-amber-100 dark:hover:bg-amber-950/40 hover:text-amber-700 dark:hover:text-amber-400"
               onClick={startNewChat}
               title="New Chat (⌘K)"
+              aria-label="New chat"
             >
               <Plus className="h-3 w-3" />
+            </Button>
+            {/* ─── Clear chat (with confirmation) ─── */}
+            {/* Wipes the message list back to a fresh greeting but keeps the
+                current schema/data/connection. Opens an AlertDialog so the
+                action is confirmable (matches the existing destructive-action
+                UX pattern used for destructive SQL). */}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-5 w-5 p-0 hover:bg-rose-100 dark:hover:bg-rose-950/40 hover:text-rose-600 dark:hover:text-rose-400"
+              onClick={() => setClearChatOpen(true)}
+              title="Clear chat"
+              aria-label="Clear chat"
+              disabled={loading}
+            >
+              <Eraser className="h-3 w-3" />
             </Button>
             {/* ─── Conversation History dropdown ─── */}
             {/* Controlled so we can close it programmatically after loading a
@@ -2547,27 +2660,29 @@ function StudioPageInner({
           {messages.map((message) => (
             <div
               key={message.id}
-              className={`flex gap-1.5 ${message.role === 'user' ? 'justify-end' : ''}`}
+              className={`group relative flex gap-1.5 animate-msg-fade-in ${message.role === 'user' ? 'justify-end' : ''}`}
             >
               {message.role === 'assistant' && (
                 <AgentIcon agentName={message.agentName} size="sm" />
               )}
               <div
-                className={`max-w-[88%] rounded-lg px-2.5 py-2 overflow-hidden ${
+                className={`relative w-full sm:max-w-[88%] rounded-lg px-2.5 py-2 overflow-hidden border transition-colors ${
                   message.role === 'user'
-                    ? 'bg-primary text-primary-foreground'
-                    : 'bg-muted/70'
+                    ? 'bg-primary text-primary-foreground border-transparent'
+                    : 'bg-gradient-to-b from-amber-50/70 to-amber-50/10 dark:from-amber-950/25 dark:to-amber-950/5 border-amber-200/50 dark:border-amber-900/30'
                 }`}
                 style={{ overflowWrap: 'break-word', wordBreak: 'break-word' }}
               >
                 {message.role === 'assistant' && (
-                  <p className="text-[9px] font-medium text-amber-600 dark:text-amber-400 mb-0.5 flex items-center gap-1">
-                    {message.agentName || 'Orchestrator'}
+                  <p className="text-[9px] font-semibold mb-0.5 flex items-center gap-1">
+                    <span className="bg-gradient-to-r from-amber-600 to-red-600 dark:from-amber-400 dark:to-red-400 bg-clip-text text-transparent">
+                      {message.agentName || 'Orchestrator'}
+                    </span>
                     {message.isStreaming && (
-                      <span className="flex items-center gap-0.5">
-                        <span className="inline-block h-1 w-1 rounded-full bg-amber-500 animate-pulse" />
-                        <span className="inline-block h-1 w-1 rounded-full bg-amber-500 animate-pulse [animation-delay:0.2s]" />
-                        <span className="inline-block h-1 w-1 rounded-full bg-amber-500 animate-pulse [animation-delay:0.4s]" />
+                      <span className="flex items-center gap-[3px] ml-0.5" aria-label="assistant is typing">
+                        <span className="typing-dot inline-block h-1 w-1 rounded-full bg-amber-500" />
+                        <span className="typing-dot inline-block h-1 w-1 rounded-full bg-amber-500 [animation-delay:0.18s]" />
+                        <span className="typing-dot inline-block h-1 w-1 rounded-full bg-amber-500 [animation-delay:0.36s]" />
                       </span>
                     )}
                   </p>
@@ -2602,50 +2717,64 @@ function StudioPageInner({
                 )}
 
                 {/* ─── SQL block(s) (live DB mode) ─── */}
+                {/* Wrapped in a mt-2.5 + space-y-2 container for clearer visual
+                    hierarchy between the message body and the SQL card(s). */}
                 {message.role === 'assistant' && message.sqlBlock && (
                   <>
-                    {/* Render the primary SQL block (with execute button + result) */}
-                    <SqlBlockCard
-                      sql={message.sqlBlock}
-                      dialect={activeConnectionDialect}
-                      executing={message.sqlBlockExecuting}
-                      result={message.sqlBlockResult}
-                      onCopy={() => copyToClipboard(message.sqlBlock!)}
-                      onOpenInEditor={() => { setSqlEditor(message.sqlBlock!); setActiveTab('sql') }}
-                      onExecute={() => executeSqlBlock(message.id, message.sqlBlock!)}
-                    />
-                    {/* Render any additional SQL blocks as read-only previews
-                        (the user can copy them into the SQL editor to execute). */}
-                    {message.sqlBlocks && message.sqlBlocks.length > 1 && (
-                      <div className="mt-1.5 space-y-1">
-                        {message.sqlBlocks.slice(1).map((extraSql, idx) => (
-                          <SqlBlockCard
-                            key={idx}
-                            sql={extraSql}
-                            dialect={activeConnectionDialect}
-                            onCopy={() => copyToClipboard(extraSql)}
-                            onOpenInEditor={() => { setSqlEditor(extraSql); setActiveTab('sql') }}
-                            onExecute={() => executeSqlBlock(message.id, extraSql)}
-                          />
-                        ))}
-                      </div>
-                    )}
+                    <div className="mt-2.5 space-y-2">
+                      {/* Render the primary SQL block (with execute button + result) */}
+                      <SqlBlockCard
+                        sql={message.sqlBlock}
+                        dialect={activeConnectionDialect}
+                        executing={message.sqlBlockExecuting}
+                        result={message.sqlBlockResult}
+                        onCopy={() => copyToClipboard(message.sqlBlock!)}
+                        onOpenInEditor={() => { setSqlEditor(message.sqlBlock!); setActiveTab('sql') }}
+                        onExecute={() => executeSqlBlock(message.id, message.sqlBlock!)}
+                      />
+                      {/* Render any additional SQL blocks as read-only previews
+                          (the user can copy them into the SQL editor to execute). */}
+                      {message.sqlBlocks && message.sqlBlocks.length > 1 && (
+                        <div className="space-y-2">
+                          {message.sqlBlocks.slice(1).map((extraSql, idx) => (
+                            <SqlBlockCard
+                              key={idx}
+                              sql={extraSql}
+                              dialect={activeConnectionDialect}
+                              onCopy={() => copyToClipboard(extraSql)}
+                              onOpenInEditor={() => { setSqlEditor(extraSql); setActiveTab('sql') }}
+                              onExecute={() => executeSqlBlock(message.id, extraSql)}
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   </>
                 )}
+
+                {/* Hover timestamp — small muted text pinned to the bottom-right
+                    corner of the bubble. Hidden until the row is hovered so the
+                    chat stays visually uncluttered. */}
+                <span
+                  className="pointer-events-none absolute bottom-0.5 right-1.5 text-[8px] font-medium text-muted-foreground/70 opacity-0 transition-opacity duration-150 group-hover:opacity-100"
+                  aria-hidden="true"
+                >
+                  {formatTimestamp(message.timestamp)}
+                </span>
               </div>
               {message.role === 'user' && (
-                <div className="h-5 w-5 rounded-full bg-primary flex items-center justify-center shrink-0 mt-0.5">
-                  <User className="h-2.5 w-2.5 text-primary-foreground" />
+                <div className="h-5 w-5 rounded-full bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center shrink-0 mt-0.5 shadow-sm">
+                  <User className="h-2.5 w-2.5 text-white" />
                 </div>
               )}
             </div>
           ))}
           {loading && messages.length > 0 && !messages[messages.length - 1]?.isStreaming && (
-            <div className="flex gap-1.5">
+            <div className="flex gap-1.5 animate-msg-fade-in">
               <AgentIcon agentName="Orchestrator" size="sm" />
-              <div className="bg-muted/70 rounded-lg px-2.5 py-2">
+              <div className="bg-gradient-to-b from-amber-50/70 to-amber-50/10 dark:from-amber-950/25 dark:to-amber-950/5 border border-amber-200/50 dark:border-amber-900/30 rounded-lg px-2.5 py-2">
                 <div className="flex items-center gap-1">
-                  <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
+                  <Loader2 className="h-3 w-3 animate-spin text-amber-600 dark:text-amber-400" />
                   <span className="text-[10px] text-muted-foreground">Connecting...</span>
                 </div>
               </div>
@@ -2656,35 +2785,89 @@ function StudioPageInner({
 
         {/* Chat Input */}
         <div className="px-2.5 py-2 border-t bg-card shrink-0">
-          <div className="flex gap-1.5">
-            <Input
+          {/* Pulsing "AI is thinking..." indicator — shown above the input row
+              while a generation is in flight so the user has clear feedback
+              that the assistant is working (in addition to the typing dots
+              inside the streaming bubble). */}
+          {loading && (
+            <div className="mb-1.5 flex items-center gap-1.5 animate-thinking" aria-live="polite">
+              <span className="relative flex h-1.5 w-1.5">
+                <span className="absolute inline-flex h-full w-full rounded-full bg-amber-500 opacity-75 animate-ping" />
+                <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-amber-600 dark:bg-amber-400" />
+              </span>
+              <span className="text-[9px] font-medium text-amber-700 dark:text-amber-400">
+                AI is thinking…
+              </span>
+            </div>
+          )}
+          <div
+            className={`flex gap-1.5 items-end rounded-lg p-1 transition-all duration-200 ${
+              inputFocused
+                ? 'ring-2 ring-amber-400/50 dark:ring-amber-500/40 shadow-[0_0_0_3px_rgba(251,191,36,0.08)]'
+                : 'ring-1 ring-transparent'
+            }`}
+          >
+            <Textarea
               ref={chatInputRef}
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={(e) => {
+                setInput(e.target.value)
+                autoResizeTextarea(chatInputRef.current)
+              }}
               onKeyDown={handleKeyDown}
+              onFocus={() => setInputFocused(true)}
+              onBlur={() => setInputFocused(false)}
               placeholder={isLiveDbMode ? 'Ask me to edit, delete, drop, or query your live DB...' : 'Describe the data you need...'}
               disabled={loading || connectionLoading}
-              className="flex-1 text-xs h-8"
+              rows={1}
+              className="flex-1 text-xs min-h-[32px] max-h-[72px] [field-sizing:fixed] resize-none border-0 bg-transparent focus-visible:ring-0 focus-visible:ring-offset-0 px-1.5 py-1.5 leading-snug"
             />
             {loading ? (
               <Button
                 onClick={handleStopGeneration}
                 size="sm"
                 variant="destructive"
-                className="h-8 w-8 p-0"
+                className="h-8 w-8 p-0 shrink-0 hover:scale-105 transition-transform"
                 title="Stop generation"
+                aria-label="Stop generation"
               >
-                <Square className="h-3.5 w-3.5" />
+                <Square className="h-3.5 w-3.5 fill-current" />
               </Button>
             ) : (
               <Button
                 onClick={() => sendMessage()}
                 disabled={!input.trim()}
                 size="sm"
-                className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white h-8 w-8 p-0"
+                className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white h-8 w-8 p-0 shrink-0 transition-transform hover:scale-105 disabled:scale-100 disabled:opacity-50"
+                aria-label="Send message"
               >
                 <Send className="h-3.5 w-3.5" />
               </Button>
+            )}
+          </div>
+          {/* Footer row: character counter (right) + keyboard hint (left).
+              Only shows the counter when there is input text so the row stays
+              empty/unobtrusive for an empty input. */}
+          <div className="mt-1 flex items-center justify-between px-1">
+            <span className="text-[8px] text-muted-foreground/70 select-none">
+              <kbd className="px-1 py-0.5 rounded border bg-muted text-muted-foreground font-mono text-[8px] leading-none">
+                ⌘
+              </kbd>
+              <span className="mx-0.5">+</span>
+              <kbd className="px-1 py-0.5 rounded border bg-muted text-muted-foreground font-mono text-[8px] leading-none">
+                Enter
+              </kbd>
+              <span className="ml-1">to send · Shift+Enter for newline</span>
+            </span>
+            {input.length > 0 && (
+              <span
+                className={`text-[8px] font-medium tabular-nums select-none ${
+                  input.length > 1800 ? 'text-rose-500' : 'text-muted-foreground/70'
+                }`}
+                aria-live="polite"
+              >
+                {input.length.toLocaleString()} chars
+              </span>
             )}
           </div>
         </div>
@@ -4250,6 +4433,39 @@ function StudioPageInner({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* ─── Clear Chat confirmation ─── */}
+      {/* Triggered by the Eraser button in the chat header. Uses AlertDialog so
+          the user must explicitly confirm before the message list is wiped
+          (prevents accidental loss of an in-progress conversation). The
+          schema/data/connection are preserved — only messages are reset. */}
+      <AlertDialog open={clearChatOpen} onOpenChange={setClearChatOpen}>
+        <AlertDialogContent className="sm:max-w-md">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2">
+              <Eraser className="h-4 w-4 text-rose-600" />
+              Clear chat?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This removes all messages from the current chat and starts a fresh
+              greeting. Your generated schema, data, and database connection
+              will be preserved.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                clearChat()
+                setClearChatOpen(false)
+              }}
+              className="bg-gradient-to-r from-rose-600 to-red-600 hover:from-rose-700 hover:to-red-700 text-white"
+            >
+              Clear chat
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* ─── Keyboard Shortcuts Help Dialog ─── */}
       {/* Opened via Cmd/Ctrl + / (or the Keyboard icon in the chat header).
