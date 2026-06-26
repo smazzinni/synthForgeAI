@@ -89,6 +89,11 @@ import {
   ArrowRight,
   Columns,
   ChevronRight,
+  Keyboard,
+  PanelRightClose,
+  PanelRightOpen,
+  Clock,
+  MessageSquare,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
@@ -126,6 +131,104 @@ import {
 import { AgentIcon } from './_components/agent-icon'
 import { ShowMoreText } from './_components/show-more-text'
 import { SqlBlockCard } from './_components/sql-block-card'
+
+
+// ─── Conversation history (localStorage persistence) ───
+// Saves up to 50 most recent conversations so users can reload past sessions
+// from the History dropdown in the chat header. Each conversation stores the
+// full message list plus the generated schema/data/databaseName/databaseId so
+// the entire studio state can be restored on load.
+const CONVERSATION_STORAGE_KEY = 'synthforge_conversations'
+const MAX_CONVERSATIONS = 50
+
+interface SavedConversation {
+  id: string
+  title: string
+  messages: Message[]
+  schema: SchemaTable[]
+  data: Record<string, unknown[]>
+  databaseName: string
+  databaseId: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+// SSR-safe lazy loader. Guards against malformed JSON, missing fields, and
+// string-vs-Date timestamp mismatches (localStorage serializes Date → string).
+function loadSavedConversations(): SavedConversation[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = localStorage.getItem(CONVERSATION_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .filter((c: unknown): c is Record<string, unknown> => typeof c === 'object' && c !== null)
+      .map((c): SavedConversation => {
+        const rawMsgs = Array.isArray(c.messages) ? c.messages : []
+        const messages: Message[] = rawMsgs.map((m: Record<string, unknown>, i: number) => ({
+          id: String(m.id ?? `m-${i}`),
+          role: (m.role as Message['role']) || 'assistant',
+          content: String(m.content ?? ''),
+          reasoningContent: m.reasoningContent != null ? String(m.reasoningContent) : undefined,
+          agentName: m.agentName != null ? String(m.agentName) : undefined,
+          timestamp: new Date(typeof m.timestamp === 'string' ? m.timestamp : Date.now()),
+          isStreaming: false,
+        }))
+        return {
+          id: String(c.id ?? ''),
+          title: String(c.title ?? 'New Conversation'),
+          messages,
+          schema: Array.isArray(c.schema) ? (c.schema as SchemaTable[]) : [],
+          data: (c.data && typeof c.data === 'object' && !Array.isArray(c.data))
+            ? (c.data as Record<string, unknown[]>)
+            : {},
+          databaseName: String(c.databaseName ?? ''),
+          databaseId: c.databaseId != null ? String(c.databaseId) : null,
+          createdAt: String(c.createdAt ?? new Date().toISOString()),
+          updatedAt: String(c.updatedAt ?? new Date().toISOString()),
+        }
+      })
+  } catch {
+    return []
+  }
+}
+
+function persistSavedConversations(convs: SavedConversation[]) {
+  if (typeof window === 'undefined') return
+  try {
+    localStorage.setItem(CONVERSATION_STORAGE_KEY, JSON.stringify(convs))
+  } catch { /* localStorage unavailable or quota exceeded */ }
+}
+
+// Auto-title: first user message truncated to 50 chars, else "New Conversation".
+function generateConversationTitle(messages: Message[]): string {
+  const firstUser = messages.find(m => m.role === 'user')
+  if (!firstUser) return 'New Conversation'
+  const text = firstUser.content.trim()
+  if (!text) return 'New Conversation'
+  return text.length > 50 ? text.slice(0, 50) + '…' : text
+}
+
+// Compact relative time for the history list ("2h ago", "just now", …).
+function relativeTime(iso: string): string {
+  const then = new Date(iso).getTime()
+  if (Number.isNaN(then)) return ''
+  const diff = Math.max(0, Date.now() - then)
+  const sec = Math.floor(diff / 1000)
+  if (sec < 60) return 'just now'
+  const min = Math.floor(sec / 60)
+  if (min < 60) return `${min}m ago`
+  const hr = Math.floor(min / 60)
+  if (hr < 24) return `${hr}h ago`
+  const day = Math.floor(hr / 24)
+  if (day < 7) return `${day}d ago`
+  const wk = Math.floor(day / 7)
+  if (wk < 5) return `${wk}w ago`
+  const mo = Math.floor(day / 30)
+  if (mo < 12) return `${mo}mo ago`
+  return `${Math.floor(day / 365)}y ago`
+}
 
 
 // ─── Main Studio Page Component ───
@@ -184,6 +287,20 @@ function StudioPageInner({
   const [initialQuerySent, setInitialQuerySent] = useState(false)
   const [conversationId, setConversationId] = useState(initialConversationId || '')
 
+  // ─── Conversation history (localStorage) ───
+  // Persists past conversations so users can reload them from the History
+  // dropdown in the chat header. Lazy-initialized from localStorage (SSR-safe).
+  const [conversations, setConversations] = useState<SavedConversation[]>(() => loadSavedConversations())
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null)
+  const [historyOpen, setHistoryOpen] = useState(false)
+  // Refs to read/write these inside the persistence effect without adding
+  // them to its dependency array (which would cause infinite re-runs).
+  const activeConversationIdRef = useRef<string | null>(null)
+  // When loading a past conversation we set this so the next messages-change
+  // effect skips auto-persisting (which would otherwise bump `updatedAt` and
+  // needlessly reorder the history list).
+  const skipNextPersistRef = useRef(false)
+
   // SQL workspace state
   const [sqlEditor, setSqlEditor] = useState('')
   const [sqlResults, setSqlResults] = useState<{ rows: Record<string, unknown>[]; columns: string[]; executionTime: number } | null>(null)
@@ -224,6 +341,66 @@ function StudioPageInner({
     } catch { /* localStorage unavailable */ }
   }, [savedQueries])
 
+  // ─── Persist current conversation to history whenever messages change ───
+  // Skips the initial greeting (no user messages) and mid-stream saves (a
+  // message with isStreaming=true means the assistant is still generating).
+  // Updates the existing conversation if activeConversationId is set, otherwise
+  // creates a new entry. Keeps the list sorted by updatedAt desc and capped at
+  // MAX_CONVERSATIONS (50).
+  useEffect(() => {
+    if (skipNextPersistRef.current) {
+      skipNextPersistRef.current = false
+      return
+    }
+    const hasUserMsg = messages.some(m => m.role === 'user')
+    if (!hasUserMsg) return
+    if (messages.some(m => m.isStreaming)) return
+
+    const existingId = activeConversationIdRef.current
+    const newId = existingId || (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`)
+    const now = new Date().toISOString()
+    const title = generateConversationTitle(messages)
+
+    setConversations(prev => {
+      const existing = prev.find(c => c.id === newId)
+      // Skip if this exact entry was just written (no-op guard for re-renders
+      // where the deps didn't actually change content).
+      if (existing && existing.updatedAt === now) return prev
+      const conv: SavedConversation = {
+        id: newId,
+        title,
+        messages,
+        schema: generatedSchema,
+        data: generatedData,
+        databaseName,
+        databaseId: currentDatabaseId || null,
+        createdAt: existing?.createdAt || now,
+        updatedAt: now,
+      }
+      let next: SavedConversation[]
+      if (existing) {
+        next = prev.map(c => (c.id === newId ? conv : c))
+      } else {
+        next = [conv, ...prev]
+      }
+      // Keep most-recently-updated first; cap at MAX_CONVERSATIONS.
+      next.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+      if (next.length > MAX_CONVERSATIONS) next = next.slice(0, MAX_CONVERSATIONS)
+      persistSavedConversations(next)
+      return next
+    })
+
+    // Register the new conversation id so subsequent updates patch this entry
+    // instead of creating duplicates. Use the ref synchronously + state for any
+    // UI that cares (e.g. highlighting the active item in the dropdown).
+    if (!existingId) {
+      activeConversationIdRef.current = newId
+      setActiveConversationId(newId)
+    }
+  }, [messages, generatedSchema, generatedData, databaseName, currentDatabaseId])
+
   // Explorer state
   const [favoriteTables, setFavoriteTables] = useState<Set<string>>(new Set())
   const [explorerZoom, setExplorerZoom] = useState(1)
@@ -234,6 +411,15 @@ function StudioPageInner({
   // Chat panel resize
   const [chatWidth, setChatWidth] = useState(340)
   const [isResizing, setIsResizing] = useState(false)
+
+  // ─── Keyboard shortcuts + right panel visibility ───
+  // `showShortcuts` toggles the shortcuts help dialog (Cmd/Ctrl + /).
+  // `panelVisible` toggles the right data/SQL/explorer panel (Cmd/Ctrl + B).
+  // When the panel is hidden the chat column expands to full width and a
+  // floating button is rendered to re-open it.
+  const [showShortcuts, setShowShortcuts] = useState(false)
+  const [panelVisible, setPanelVisible] = useState(true)
+  const chatInputRef = useRef<HTMLInputElement>(null)
 
   // Streaming generation state
   const [generationProgress, setGenerationProgress] = useState<GenerationProgress>({
@@ -998,20 +1184,85 @@ function StudioPageInner({
     }
   }
 
+  // ─── Load a saved conversation from history ───
+  // Restores messages, schema, data, databaseName, and databaseId from a
+  // localStorage-saved conversation. Sets skipNextPersistRef so the
+  // messages-change effect doesn't immediately re-save (which would bump
+  // updatedAt and needlessly reorder the history list).
+  const loadConversation = useCallback((conv: SavedConversation) => {
+    skipNextPersistRef.current = true
+    activeConversationIdRef.current = conv.id
+    setActiveConversationId(conv.id)
+    // Restore all conversation state. Force isStreaming=false on every
+    // message so the persistence effect doesn't skip saving the restored
+    // conversation on the next real change.
+    setMessages(
+      conv.messages.map(m => ({
+        ...m,
+        timestamp: new Date(m.timestamp),
+        isStreaming: false,
+        sqlBlockExecuting: false,
+      })),
+    )
+    setGeneratedSchema(conv.schema || [])
+    setGeneratedData(conv.data || {})
+    setDatabaseName(conv.databaseName || '')
+    setCurrentDatabaseId(conv.databaseId || undefined)
+    // Reset the backend conversation id — the loaded chat is a fresh backend
+    // session (the backend conversation endpoint is keyed by databaseId, not
+    // by the localStorage history id).
+    setConversationId('')
+    setSelectedTable('')
+    setVisibleRows(20)
+    toast.success('Conversation loaded')
+  }, [])
+
+  // ─── Delete a conversation from history ───
+  const deleteConversation = useCallback((id: string) => {
+    setConversations(prev => {
+      const next = prev.filter(c => c.id !== id)
+      persistSavedConversations(next)
+      return next
+    })
+    // If the deleted conversation is the active one, detach so the next
+    // user message starts a new history entry instead of patching a ghost.
+    if (activeConversationIdRef.current === id) {
+      activeConversationIdRef.current = null
+      setActiveConversationId(null)
+    }
+    toast.success('Conversation deleted')
+  }, [])
+
   // ─── New chat ───
+  // The current conversation is already auto-persisted by the messages-change
+  // effect above, so here we only need to detach from it (so the next chat
+  // starts a fresh history entry) and reset the studio to its initial greeting
+  // state. In live-DB mode we preserve the introspected schema/data (they are
+  // tied to the connection, not the conversation); in synthetic-data mode we
+  // clear everything per the task spec.
   const startNewChat = () => {
+    activeConversationIdRef.current = null
+    setActiveConversationId(null)
+    setConversationId('')
+    if (!isLiveDbMode) {
+      setGeneratedSchema([])
+      setGeneratedData([])
+      setDatabaseName('')
+      setCurrentDatabaseId(undefined)
+    }
+    setSelectedTable('')
+    setVisibleRows(20)
     setMessages([
       {
         id: Date.now().toString(),
         role: 'assistant',
-        content: hasGeneratedData
-          ? `You're still working on **"${databaseName}"**. What would you like to do next?`
+        content: isLiveDbMode
+          ? `Connected to live ${activeConnectionDialect || 'DB'} **"${activeConnectionName || ''}"**. Ask me anything and I'll run SQL against it.`
           : 'Welcome to **SynthForge AI Studio**! Describe the database you need.',
         agentName: 'Orchestrator',
         timestamp: new Date(),
       },
     ])
-    setConversationId('')
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -1019,6 +1270,34 @@ function StudioPageInner({
       e.preventDefault()
       sendMessage()
     }
+  }
+
+  // ─── Save current SQL editor content as a named query ───
+  // Shared by the "Saved Queries" dropdown and the Cmd/Ctrl+Shift+S shortcut.
+  // Prompts for a name and appends to the savedQueries list (persisted to
+  // localStorage via the effect near the top of the component).
+  const saveCurrentQuery = () => {
+    if (!sqlEditor.trim()) {
+      toast.error('Nothing to save — SQL editor is empty')
+      return
+    }
+    const name = window.prompt('Name this query:')
+    if (name) {
+      setSavedQueries(prev => [...prev, { name, sql: sqlEditor }])
+      toast.success('Query saved!')
+    }
+  }
+
+  // ─── Export the current database as a SQL dump ───
+  // Shared by the Export dropdown and the Cmd/Ctrl+Shift+E shortcut. Falls
+  // back to a toast when there's nothing to export.
+  const exportCurrentDatabase = () => {
+    if (!hasGeneratedData) {
+      toast.error('Nothing to export — no database generated yet')
+      return
+    }
+    exportAsSQL(generatedSchema, generatedData, `${databaseName || 'database'}.sql`)
+    toast.success('Database exported as SQL dump')
   }
 
   // ─── Stop generation ───
@@ -1926,10 +2205,103 @@ function StudioPageInner({
   const svgWidth = Math.max(600, erLayout.nodes.length > 0 ? Math.max(...erLayout.nodes.map(n => n.x)) + 280 : 600)
   const svgHeight = Math.max(400, erLayout.nodes.length > 0 ? Math.max(...erLayout.nodes.map(n => n.y)) + 250 : 400)
 
+  // ─── Keyboard shortcuts ───
+  // Registers a single keydown listener on `window` and dispatches to the
+  // appropriate handler. We keep the latest closure in a ref so the listener
+  // (attached once on mount) always sees current state without re-registering
+  // on every keystroke.
+  const shortcutHandlerRef = useRef<(e: KeyboardEvent) => void>(() => {})
+  shortcutHandlerRef.current = (e: KeyboardEvent) => {
+    const mod = e.ctrlKey || e.metaKey // Cmd on macOS, Ctrl elsewhere
+
+    // ─── Escape: close any open dialog/modal ───
+    // The shadcn Dialog component (Radix) already closes on Escape, but we
+    // also clear our shortcuts dialog flag and bail out early so we don't
+    // accidentally trigger another shortcut while a dialog is dismissing.
+    if (e.key === 'Escape') {
+      if (showShortcuts) {
+        setShowShortcuts(false)
+        e.preventDefault()
+      }
+      return
+    }
+
+    // ─── Modifier-based shortcuts ───
+    if (!mod) return
+
+    // Cmd/Ctrl + Shift + S → Save current SQL query
+    if (e.shiftKey && (e.key === 'S' || e.key === 's')) {
+      e.preventDefault()
+      saveCurrentQuery()
+      return
+    }
+
+    // Cmd/Ctrl + Shift + E → Export current database
+    if (e.shiftKey && (e.key === 'E' || e.key === 'e')) {
+      e.preventDefault()
+      exportCurrentDatabase()
+      return
+    }
+
+    // Plain Cmd/Ctrl shortcuts (no Shift)
+    if (e.shiftKey) return
+
+    switch (e.key) {
+      case 'Enter':
+        // Only fire when the chat input is focused so Cmd+Enter doesn't grab
+        // the keystroke from the SQL editor or other inputs.
+        if (document.activeElement === chatInputRef.current) {
+          e.preventDefault()
+          sendMessage()
+        }
+        break
+      case 'k':
+      case 'K':
+        e.preventDefault()
+        startNewChat()
+        toast.success('Started a new chat')
+        break
+      case 'b':
+      case 'B':
+        e.preventDefault()
+        setPanelVisible(v => !v)
+        break
+      case '/':
+        e.preventDefault()
+        setShowShortcuts(s => !s)
+        break
+      case '1':
+        e.preventDefault()
+        setActiveTab('data')
+        break
+      case '2':
+        e.preventDefault()
+        setActiveTab('sql')
+        break
+      case '3':
+        e.preventDefault()
+        setActiveTab('explorer')
+        break
+    }
+  }
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => shortcutHandlerRef.current(e)
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [])
+
   return (
-    <div className="flex h-[calc(100vh-44px)] bg-background">
+    <div className="flex h-[calc(100vh-44px)] bg-background relative">
       {/* ─── Left Panel: AI Chat (resizable) ─── */}
-      <div className="flex flex-col border-r bg-background shrink-0" style={{ width: chatWidth }}>
+      {/* When the right panel is hidden the chat expands to full width. */}
+      <div
+        className={cn(
+          'flex flex-col bg-background',
+          panelVisible ? 'border-r shrink-0' : 'flex-1 border-r-0'
+        )}
+        style={panelVisible ? { width: chatWidth } : undefined}
+      >
         {/* Chat Header */}
         <div className="px-3 py-2.5 border-b flex items-center justify-between bg-card shrink-0">
           <div className="flex items-center gap-2 min-w-0">
@@ -1953,10 +2325,124 @@ function StudioPageInner({
               size="sm"
               className="h-5 w-5 p-0"
               onClick={startNewChat}
-              title="New Chat"
+              title="New Chat (⌘K)"
             >
               <Plus className="h-3 w-3" />
             </Button>
+            {/* ─── Conversation History dropdown ─── */}
+            {/* Controlled so we can close it programmatically after loading a
+                conversation. Uses <div> items (not <DropdownMenuItem>) for the
+                conversation rows so the nested delete button can stopPropagation
+                without dismissing the menu. */}
+            <DropdownMenu open={historyOpen} onOpenChange={setHistoryOpen}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-5 w-5 p-0 relative"
+                  title="Conversation History"
+                >
+                  <History className="h-3 w-3" />
+                  {conversations.length > 0 && (
+                    <span className="absolute -top-1 -right-1 bg-amber-500 text-white text-[8px] font-bold rounded-full h-3 min-w-3 px-0.5 flex items-center justify-center leading-none">
+                      {conversations.length > 99 ? '99+' : conversations.length}
+                    </span>
+                  )}
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="w-80">
+                {conversations.length === 0 ? (
+                  <div className="px-2 py-4 text-center text-[11px] text-muted-foreground">
+                    <History className="h-5 w-5 mx-auto mb-1.5 opacity-40" />
+                    No saved conversations yet
+                  </div>
+                ) : (
+                  <>
+                    <div className="px-2 py-1 text-[10px] font-semibold text-muted-foreground flex items-center justify-between">
+                      <span>Recent Conversations</span>
+                      <Badge variant="secondary" className="text-[9px] h-3.5 px-1 leading-none">
+                        {conversations.length}
+                      </Badge>
+                    </div>
+                    <DropdownMenuSeparator />
+                    <div className="max-h-80 overflow-y-auto">
+                      {conversations.map((conv) => {
+                        const isActive = conv.id === activeConversationId
+                        return (
+                          <div
+                            key={conv.id}
+                            className={cn(
+                              'group flex items-start gap-2 px-2 py-1.5 rounded-sm cursor-pointer mx-0.5',
+                              isActive ? 'bg-accent' : 'hover:bg-accent',
+                            )}
+                            onClick={() => { loadConversation(conv); setHistoryOpen(false) }}
+                          >
+                            <MessageSquare className="h-3 w-3 mt-0.5 shrink-0 text-muted-foreground" />
+                            <div className="flex-1 min-w-0">
+                              <div className="text-[11px] font-medium truncate">{conv.title}</div>
+                              <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                                <Clock className="h-2.5 w-2.5 text-muted-foreground shrink-0" />
+                                <span className="text-[9px] text-muted-foreground">{relativeTime(conv.updatedAt)}</span>
+                                {conv.databaseName && (
+                                  <Badge variant="outline" className="text-[8px] h-3 px-1 gap-0.5 leading-none shrink-0">
+                                    <Database className="h-2 w-2" />
+                                    {conv.databaseName.length > 12 ? conv.databaseName.slice(0, 12) + '…' : conv.databaseName}
+                                  </Badge>
+                                )}
+                              </div>
+                            </div>
+                            <button
+                              className="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 transition-opacity shrink-0 p-0.5"
+                              onClick={(e) => { e.stopPropagation(); deleteConversation(conv.id) }}
+                              title="Delete conversation"
+                              aria-label="Delete conversation"
+                            >
+                              <X className="h-3 w-3" />
+                            </button>
+                          </div>
+                        )
+                      })}
+                    </div>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      className="text-[11px] text-destructive focus:text-destructive"
+                      onClick={() => {
+                        setConversations([])
+                        persistSavedConversations([])
+                        if (activeConversationIdRef.current) {
+                          activeConversationIdRef.current = null
+                          setActiveConversationId(null)
+                        }
+                        toast.success('Conversation history cleared')
+                      }}
+                    >
+                      <Trash2 className="h-3 w-3 mr-2" />
+                      Clear all history
+                    </DropdownMenuItem>
+                  </>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-5 w-5 p-0"
+              onClick={() => setShowShortcuts(true)}
+              title="Keyboard Shortcuts (⌘/)"
+            >
+              <Keyboard className="h-3 w-3" />
+            </Button>
+            {panelVisible && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-5 w-5 p-0"
+                onClick={() => setPanelVisible(false)}
+                title="Hide Panel (⌘B)"
+              >
+                <PanelRightClose className="h-3 w-3" />
+              </Button>
+            )}
             {isLiveDbMode && (
               <Badge variant="outline" className="text-[9px] gap-0.5 text-sky-700 dark:text-sky-400 border-sky-400 h-5 animate-pulse">
                 <PlugZap className="h-2.5 w-2.5" />
@@ -2142,6 +2628,7 @@ function StudioPageInner({
         <div className="px-2.5 py-2 border-t bg-card shrink-0">
           <div className="flex gap-1.5">
             <Input
+              ref={chatInputRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
@@ -2174,14 +2661,20 @@ function StudioPageInner({
       </div>
 
       {/* ─── Resize Handle ─── */}
-      <div
-        ref={resizeRef}
-        className="w-1.5 cursor-col-resize bg-border hover:bg-amber-400 transition-colors shrink-0 active:bg-amber-500"
-        onMouseDown={() => setIsResizing(true)}
-      />
+      {/* Hidden when the right panel is collapsed — there's nothing to resize. */}
+      {panelVisible && (
+        <div
+          ref={resizeRef}
+          className="w-1.5 cursor-col-resize bg-border hover:bg-amber-400 transition-colors shrink-0 active:bg-amber-500"
+          onMouseDown={() => setIsResizing(true)}
+        />
+      )}
 
       {/* ─── Right Panel: Data/SQL/Explorer ─── */}
-      <div className="flex-1 flex flex-col min-w-0">
+      {/* The entire panel (header + tabs) is unmounted when `panelVisible`
+          is false so the chat column can take the full viewport width. */}
+      {panelVisible ? (
+        <div className="flex-1 flex flex-col min-w-0">
         {/* Panel Header */}
         <div className="px-3 py-2 border-b flex items-center justify-between bg-card shrink-0">
           <div className="flex items-center gap-2 min-w-0">
@@ -3028,18 +3521,11 @@ function StudioPageInner({
                     <DropdownMenuContent align="end" className="w-80">
                       <DropdownMenuItem
                         disabled={!sqlEditor.trim()}
-                        onClick={() => {
-                          if (sqlEditor.trim()) {
-                            const name = prompt('Name this query:')
-                            if (name) {
-                              setSavedQueries(prev => [...prev, { name, sql: sqlEditor }])
-                              toast.success('Query saved!')
-                            }
-                          }
-                        }}
+                        onClick={saveCurrentQuery}
                       >
                         <Plus className="h-3 w-3 mr-2" />
                         Save Current Query
+                        <kbd className="ml-auto px-1.5 py-0.5 text-[9px] font-mono rounded border bg-muted text-muted-foreground">⌘⇧S</kbd>
                       </DropdownMenuItem>
                       {savedQueries.length > 0 && <DropdownMenuSeparator />}
                       {savedQueries.length === 0 ? (
@@ -3554,6 +4040,22 @@ function StudioPageInner({
           </div>
         )}
       </div>
+      ) : null}
+
+      {/* Floating "Show Panel" button — only rendered when the right panel
+          is collapsed. Anchored to the top-right of the studio container. */}
+      {!panelVisible && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="absolute right-4 top-4 h-8 gap-1.5 shadow-md bg-card hover:bg-accent z-20"
+          onClick={() => setPanelVisible(true)}
+          title="Show Panel (⌘B)"
+        >
+          <PanelRightOpen className="h-3.5 w-3.5" />
+          Show Panel
+        </Button>
+      )}
 
       {/* SQL Confirmation Dialog */}
       <Dialog open={sqlConfirmOpen} onOpenChange={setSqlConfirmOpen}>
@@ -3714,6 +4216,96 @@ function StudioPageInner({
             <Button variant="outline" onClick={() => setAddColumnDialogOpen(false)}>Cancel</Button>
             <Button onClick={handleAddColumn} disabled={!newColumnName.trim()} className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white">
               Add Column
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ─── Keyboard Shortcuts Help Dialog ─── */}
+      {/* Opened via Cmd/Ctrl + / (or the Keyboard icon in the chat header).
+          Lists every shortcut grouped by category. ESC closes (handled both
+          by Radix's default and the global keydown listener above). */}
+      <Dialog open={showShortcuts} onOpenChange={setShowShortcuts}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Keyboard className="h-5 w-5 text-amber-600" />
+              Keyboard Shortcuts
+            </DialogTitle>
+            <DialogDescription>
+              Speed up your workflow with these shortcuts. Use <kbd className="px-1.5 py-0.5 text-[10px] font-mono rounded border bg-muted text-muted-foreground">⌘</kbd> on macOS or <kbd className="px-1.5 py-0.5 text-[10px] font-mono rounded border bg-muted text-muted-foreground">Ctrl</kbd> on Windows/Linux.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 max-h-[60vh] overflow-y-auto pr-1">
+            {/* Chat */}
+            <div>
+              <h4 className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground mb-2">Chat</h4>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Send Message</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘↵</kbd>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">New Chat</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘K</kbd>
+                </div>
+              </div>
+            </div>
+
+            {/* Data */}
+            <div>
+              <h4 className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground mb-2">Data</h4>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Data Tab</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘1</kbd>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">SQL Tab</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘2</kbd>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Explorer Tab</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘3</kbd>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Save Query</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘⇧S</kbd>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Export Database</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘⇧E</kbd>
+                </div>
+              </div>
+            </div>
+
+            {/* View */}
+            <div>
+              <h4 className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground mb-2">View</h4>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Toggle Panel</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘B</kbd>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Shortcuts</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘/</kbd>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Close Dialog</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">Esc</kbd>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              onClick={() => setShowShortcuts(false)}
+              className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white"
+            >
+              Got it
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -25,6 +25,8 @@ import {
   GitBranch,
   CheckCircle,
   Cpu,
+  Star,
+  Quote,
 } from 'lucide-react'
 
 const features = [
@@ -129,6 +131,72 @@ const pricingPlans = [
     cta: 'Contact Sales',
     popular: false,
   },
+]
+
+const trustedCompanies = ['TechCorp', 'DataLabs', 'CloudWave', 'FinTech Inc', 'HealthTech', 'DevHub']
+
+const testimonials = [
+  {
+    quote:
+      'SynthForge AI cut our test data setup time from days to minutes. The multi-agent pipeline produces incredibly realistic datasets.',
+    name: 'Sarah Chen',
+    title: 'Senior Engineer',
+    company: 'TechCorp',
+    initials: 'SC',
+    gradient: 'from-amber-500 to-red-600',
+  },
+  {
+    quote:
+      'We needed HIPAA-compliant test data fast. SynthForge delivered privacy-safe synthetic data that passed our compliance review.',
+    name: 'Dr. Marcus Rivera',
+    title: 'CTO',
+    company: 'HealthTech',
+    initials: 'MR',
+    gradient: 'from-emerald-500 to-teal-600',
+  },
+  {
+    quote:
+      'The live DB connection feature is a game-changer. Our QA team can now test against realistic data without touching production.',
+    name: 'Aisha Patel',
+    title: 'QA Lead',
+    company: 'DataLabs',
+    initials: 'AP',
+    gradient: 'from-rose-500 to-pink-600',
+  },
+  {
+    quote:
+      'Gone are the days of manually creating seed data. The AI understands schema relationships and generates perfect referential integrity.',
+    name: 'Lena Kowalski',
+    title: 'Full Stack Dev',
+    company: 'CloudWave',
+    initials: 'LK',
+    gradient: 'from-violet-500 to-purple-600',
+  },
+  {
+    quote:
+      'We integrated SynthForge into our CI/CD pipeline. Every PR gets fresh test data automatically. It\u2019s brilliant.',
+    name: 'James O\u2019Brien',
+    title: 'DevOps Engineer',
+    company: 'FinTech Inc',
+    initials: 'JO',
+    gradient: 'from-sky-500 to-cyan-600',
+  },
+  {
+    quote:
+      'The schema designer alone is worth it. It proposed optimizations we hadn\u2019t considered. Our DBA was impressed.',
+    name: 'Priya Sharma',
+    title: 'Engineering Manager',
+    company: 'DevHub',
+    initials: 'PS',
+    gradient: 'from-orange-500 to-amber-600',
+  },
+]
+
+const testimonialStats = [
+  { value: '4.9/5', label: 'Average Rating' },
+  { value: '10,000+', label: 'Active Users' },
+  { value: '50M+', label: 'Rows Generated' },
+  { value: '99.5%', label: 'Uptime' },
 ]
 
 export default function LandingPage() {
@@ -275,6 +343,29 @@ export default function LandingPage() {
         </div>
       </section>
 
+      {/* Trusted By Section */}
+      <section className="border-y border-border/40 bg-background/50">
+        <div className="container mx-auto px-4 md:px-6 py-10 md:py-12">
+          <p className="text-center text-xs uppercase tracking-widest text-muted-foreground font-medium mb-8">
+            Trusted by teams at
+          </p>
+          <div className="flex flex-wrap items-center justify-center gap-x-8 gap-y-6 md:gap-x-0">
+            {trustedCompanies.map((company, idx) => (
+              <div
+                key={company}
+                className={`flex items-center ${
+                  idx !== trustedCompanies.length - 1 ? 'md:border-r md:border-border/60' : ''
+                } md:px-8 lg:px-10`}
+              >
+                <span className="text-lg md:text-xl font-bold text-muted-foreground/70 hover:text-amber-600 dark:hover:text-amber-500 transition-colors duration-200 cursor-default select-none tracking-tight">
+                  {company}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
       {/* Features Section */}
       <section className="py-20 md:py-28 bg-muted/30">
         <div className="container mx-auto px-4 md:px-6">
@@ -383,6 +474,85 @@ export default function LandingPage() {
         </div>
       </section>
 
+      {/* Testimonials Section */}
+      <section className="py-20 md:py-28">
+        <div className="container mx-auto px-4 md:px-6">
+          <div className="text-center max-w-2xl mx-auto mb-16">
+            <Badge variant="outline" className="mb-4">Testimonials</Badge>
+            <h2 className="text-3xl md:text-4xl font-bold tracking-tight mb-4">
+              Loved by{' '}
+              <span className="bg-gradient-to-r from-amber-600 to-red-600 bg-clip-text text-transparent">
+                developers
+              </span>{' '}
+              worldwide
+            </h2>
+            <p className="text-muted-foreground text-lg">
+              Join thousands of developers who use SynthForge AI to generate privacy-safe test data
+            </p>
+          </div>
+
+          {/* Testimonial cards */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 max-w-6xl mx-auto">
+            {testimonials.map((t) => (
+              <Card
+                key={t.name}
+                className="group flex flex-col hover:shadow-xl hover:scale-[1.02] transition-all duration-300 border-border/50 overflow-hidden"
+              >
+                <CardContent className="flex flex-col p-6 flex-1">
+                  {/* 5-star rating */}
+                  <div className="flex items-center gap-0.5 mb-4">
+                    {Array.from({ length: 5 }).map((_, i) => (
+                      <Star key={i} className="h-4 w-4 fill-amber-500 text-amber-500" />
+                    ))}
+                  </div>
+
+                  {/* Quote icon + text */}
+                  <Quote className="h-7 w-7 text-amber-600/30 dark:text-amber-500/30 mb-2" />
+                  <p className="text-sm italic text-muted-foreground leading-relaxed mb-6 flex-1">
+                    {t.quote}
+                  </p>
+
+                  <div className="border-t border-border/60 pt-4">
+                    <div className="flex items-center gap-3">
+                      <div
+                        className={`h-10 w-10 rounded-full bg-gradient-to-br ${t.gradient} flex items-center justify-center text-white text-xs font-bold shrink-0 shadow-md`}
+                      >
+                        {t.initials}
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold truncate">{t.name}</p>
+                        <p className="text-xs text-muted-foreground truncate">
+                          {t.title}, {t.company}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+
+          {/* Stats bar */}
+          <div className="mt-16 max-w-5xl mx-auto rounded-2xl border border-border/50 bg-muted/30 p-8">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-6 md:gap-0">
+              {testimonialStats.map((stat, idx) => (
+                <div
+                  key={stat.label}
+                  className={`text-center ${
+                    idx !== testimonialStats.length - 1 ? 'md:border-r md:border-border/60' : ''
+                  }`}
+                >
+                  <div className="text-2xl md:text-3xl font-bold bg-gradient-to-r from-amber-600 to-red-600 bg-clip-text text-transparent">
+                    {stat.value}
+                  </div>
+                  <div className="text-xs text-muted-foreground mt-1">{stat.label}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </section>
+
       {/* Pricing Preview */}
       <section className="py-20 md:py-28 bg-muted/30">
         <div className="container mx-auto px-4 md:px-6">
@@ -444,6 +614,47 @@ export default function LandingPage() {
                 </CardContent>
               </Card>
             ))}
+          </div>
+        </div>
+      </section>
+
+      {/* CTA Banner */}
+      <section className="py-20 md:py-28">
+        <div className="container mx-auto px-4 md:px-6">
+          <div className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-amber-600 to-red-600 px-6 py-16 md:px-12 md:py-20 text-center shadow-2xl shadow-amber-500/20">
+            {/* Decorative blurred white orbs */}
+            <div className="absolute -top-12 -left-12 h-48 w-48 rounded-full bg-white/20 blur-3xl" />
+            <div className="absolute -bottom-16 -right-16 h-56 w-56 rounded-full bg-white/15 blur-3xl" />
+            <div className="absolute top-1/2 left-1/3 h-32 w-32 rounded-full bg-white/10 blur-2xl" />
+
+            <div className="relative max-w-2xl mx-auto">
+              <h2 className="text-3xl md:text-4xl font-bold tracking-tight mb-4 text-white">
+                Start generating synthetic data in minutes
+              </h2>
+              <p className="text-white/80 text-lg mb-8">
+                No credit card required. Free forever for small projects.
+              </p>
+              <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
+                <Button
+                  size="lg"
+                  asChild
+                  className="bg-white text-amber-600 hover:bg-white/90 h-12 px-8 text-base font-semibold shadow-lg"
+                >
+                  <Link href="/signup">
+                    Get Started Free
+                    <ArrowRight className="ml-2 h-4 w-4" />
+                  </Link>
+                </Button>
+                <Button
+                  size="lg"
+                  variant="outline"
+                  asChild
+                  className="h-12 px-8 text-base border-white/40 text-white bg-transparent hover:bg-white/10 hover:text-white hover:border-white/60"
+                >
+                  <Link href="/docs">View Documentation</Link>
+                </Button>
+              </div>
+            </div>
           </div>
         </div>
       </section>
