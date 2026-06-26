@@ -14,6 +14,15 @@ export interface GenerationProgress {
   databaseId?: string
 }
 
+export interface SqlBlockResult {
+  ok: boolean
+  message: string
+  rowCount?: number
+  affectedRows?: number
+  rows?: Record<string, unknown>[]
+  columns?: string[]
+}
+
 export interface Message {
   id: string
   role: 'user' | 'assistant' | 'system'
@@ -30,14 +39,11 @@ export interface Message {
   sqlBlock?: string | null
   sqlBlocks?: string[]
   sqlBlockExecuting?: boolean
-  sqlBlockResult?: {
-    ok: boolean
-    message: string
-    rowCount?: number
-    affectedRows?: number
-    rows?: Record<string, unknown>[]
-    columns?: string[]
-  } | null
+  sqlBlockResult?: SqlBlockResult | null
+  // ─── Per-block execution state (keyed by SQL string) ───
+  // Allows each SQL block in a multi-block message to have its own
+  // executing/result state instead of sharing a single result.
+  sqlBlockStates?: Record<string, { executing: boolean; result: SqlBlockResult | null }>
 }
 
 export interface SchemaTable {

@@ -114,14 +114,15 @@ export function MessageBubble({
             <SqlBlockCard
               sql={message.sqlBlock}
               dialect={activeConnectionDialect}
-              executing={message.sqlBlockExecuting}
-              result={message.sqlBlockResult}
+              executing={message.sqlBlockStates?.[message.sqlBlock]?.executing ?? message.sqlBlockExecuting}
+              result={message.sqlBlockStates?.[message.sqlBlock]?.result ?? message.sqlBlockResult}
               onCopy={() => onCopy(message.sqlBlock!)}
               onOpenInEditor={() => onOpenInEditor(message.sqlBlock!)}
               onExecute={() => onExecuteSqlBlock(message.id, message.sqlBlock!)}
             />
-            {/* Render any additional SQL blocks as read-only previews
-                (the user can copy them into the SQL editor to execute). */}
+            {/* Render any additional SQL blocks — each with its own execute button
+                and per-block result state (so the user can execute any block
+                independently and see results for that specific block). */}
             {message.sqlBlocks && message.sqlBlocks.length > 1 && (
               <div className="mt-1.5 space-y-1">
                 {message.sqlBlocks.slice(1).map((extraSql, idx) => (
@@ -129,6 +130,8 @@ export function MessageBubble({
                     key={idx}
                     sql={extraSql}
                     dialect={activeConnectionDialect}
+                    executing={message.sqlBlockStates?.[extraSql]?.executing}
+                    result={message.sqlBlockStates?.[extraSql]?.result}
                     onCopy={() => onCopy(extraSql)}
                     onOpenInEditor={() => onOpenInEditor(extraSql)}
                     onExecute={() => onExecuteSqlBlock(message.id, extraSql)}

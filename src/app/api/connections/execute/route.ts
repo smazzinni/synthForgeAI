@@ -42,7 +42,14 @@ function getUserIdFromCookies(request: NextRequest): string {
   return DEFAULT_USER_ID
 }
 
-const ALLOWED_STATEMENTS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'WITH', 'TRUNCATE', 'USE', 'SHOW', 'DESCRIBE', 'EXPLAIN']
+const ALLOWED_STATEMENTS = [
+  'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP',
+  'WITH', 'TRUNCATE', 'USE', 'SHOW', 'DESCRIBE', 'EXPLAIN',
+  // MySQL-specific
+  'SET', 'START', 'COMMIT', 'ROLLBACK', 'BEGIN',
+  // PostgreSQL-specific
+  'GRANT', 'REVOKE', 'VACUUM', 'ANALYZE', 'REINDEX',
+]
 
 export async function POST(request: NextRequest) {
   try {
@@ -76,7 +83,7 @@ export async function POST(request: NextRequest) {
     // firstWord check works on SQL that the AI prefixes with explanatory
     // comments (which is exactly the format the chat route's system prompt
     // instructs the AI to produce).
-    const strippedForCheck = stripSqlComments(trimmed)
+    const strippedForCheck = stripSqlComments(trimmed).trim()
     const firstWord = strippedForCheck.split(/\s+/)[0]?.toUpperCase() || ''
     if (!ALLOWED_STATEMENTS.includes(firstWord)) {
       return NextResponse.json({ error: `Statement type "${firstWord}" is not allowed` }, { status: 400 })

@@ -81,6 +81,7 @@ import type {
   SavedQuery,
   StudioPageProps,
   GenerationProgress,
+  SqlBlockResult,
 } from './_lib/types'
 import { INITIAL_GREETING, QUICK_PROMPTS } from './_lib/constants'
 import {
@@ -974,7 +975,23 @@ function StudioPageInner({
     if (q && !initialQuerySent && ready) {
       setInitialQuerySent(true)
       const timer = setTimeout(() => {
-        sendMessage(q)
+        // Check if there's uploaded file content in sessionStorage
+        // (from the dashboard's Upload & Import feature)
+        let fullPrompt = q
+        try {
+          const uploadContent = sessionStorage.getItem('synthforge_upload_content')
+          const uploadFilename = sessionStorage.getItem('synthforge_upload_filename')
+          if (uploadContent && uploadFilename) {
+            fullPrompt = `${q}\n\n--- FILE CONTENT: ${uploadFilename} ---\n${uploadContent}\n--- END FILE CONTENT ---`
+            // Clean up sessionStorage after reading
+            sessionStorage.removeItem('synthforge_upload_content')
+            sessionStorage.removeItem('synthforge_upload_filename')
+            sessionStorage.removeItem('synthforge_upload_type')
+          }
+        } catch {
+          // sessionStorage not available
+        }
+        sendMessage(fullPrompt)
       }, 100)
       return () => clearTimeout(timer)
     }
@@ -1224,11 +1241,18 @@ function StudioPageInner({
       if (!ok) return
     }
 
-    setMessages(prev => prev.map(m =>
-      m.id === messageId
-        ? { ...m, sqlBlockExecuting: true, sqlBlockResult: null }
-        : m
-    ))
+    // Helper to update per-block state for a specific SQL string
+    const updateBlockState = (messageId: string, sqlKey: string, executing: boolean, result: SqlBlockResult | null) => {
+      setMessages(prev => prev.map(m => {
+        if (m.id !== messageId) return m
+        const states = { ...(m.sqlBlockStates || {}) }
+        states[sqlKey] = { executing, result }
+        return { ...m, sqlBlockStates: states }
+      }))
+    }
+
+    // Set executing state for this specific block
+    updateBlockState(messageId, sql, true, null)
 
     try {
       const result = await apiPost<{
@@ -1245,15 +1269,15 @@ function StudioPageInner({
       }, { timeout: 60000 })
 
       if (result.error) {
+        const errResult = { ok: false, message: result.error!, rowCount: 0, affectedRows: 0 }
+        updateBlockState(messageId, sql, false, errResult)
+        // Also update the legacy fields for backward compat
         setMessages(prev => prev.map(m =>
           m.id === messageId
-            ? { ...m, sqlBlockExecuting: false, sqlBlockResult: { ok: false, message: result.error!, rowCount: 0, affectedRows: 0 } }
+            ? { ...m, sqlBlockExecuting: false, sqlBlockResult: errResult }
             : m
         ))
         toast.error(result.error)
-        // BUGFIX (BUG-46): if the connection itself was deleted or became
-        // invalid, clean up the studio's live-mode state so the user
-        // doesn't keep retrying against a dead connection.
         if (/connection.*not found|not have access/i.test(result.error)) {
           setActiveConnectionId(undefined)
           setActiveConnectionName(undefined)
@@ -1263,37 +1287,31 @@ function StudioPageInner({
         return
       }
 
-      // BUGFIX (BUG-37): strip leading SQL comments before computing the
-      // verb, so SQL prefixed with `-- DESTRUCTIVE: ...` is classified
-      // correctly. Otherwise `verb = '--'` and `isMutation = false`,
-      // causing the post-mutation schema refresh to be skipped and the
-      // toast to say "Returned 0 row(s)" instead of "INSERT OK — N rows".
       const stripped = stripSqlComments(sql).trim()
       const verb = stripped.split(/\s+/)[0]?.toUpperCase() || ''
       const isMutation = ['INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE'].includes(verb)
       const affected = result.affectedRows ?? result.rowCount ?? (result.rows?.length || 0)
 
+      const okResult = {
+        ok: true,
+        message: isMutation ? `${verb} OK — ${affected} row(s) affected` : `Returned ${result.rowCount || result.rows?.length || 0} row(s)`,
+        rowCount: result.rowCount || result.rows?.length || 0,
+        affectedRows: affected,
+        rows: result.rows?.slice(0, 50),
+        columns: result.columns,
+      } as SqlBlockResult
+
+      // Update per-block state
+      updateBlockState(messageId, sql, false, okResult)
+      // Also update legacy fields for backward compat (primary block)
       setMessages(prev => prev.map(m =>
         m.id === messageId
-          ? {
-            ...m,
-            sqlBlockExecuting: false,
-            sqlBlockResult: {
-              ok: true,
-              message: isMutation ? `${verb} OK — ${affected} row(s) affected` : `Returned ${result.rowCount || result.rows?.length || 0} row(s)`,
-              rowCount: result.rowCount || result.rows?.length || 0,
-              affectedRows: affected,
-              rows: result.rows?.slice(0, 50),
-              columns: result.columns,
-            },
-          }
+          ? { ...m, sqlBlockExecuting: false, sqlBlockResult: okResult }
           : m
       ))
 
       if (isMutation) {
         toast.success(`${verb} OK — ${affected} row(s) affected`)
-        // Refresh the schema + data from the external DB so the data tab
-        // reflects the change immediately.
         try {
           const refresh = await apiGet<{
             schema?: SchemaTable[]
@@ -1302,20 +1320,12 @@ function StudioPageInner({
           if (refresh.schema) setGeneratedSchema(refresh.schema)
           if (refresh.data) setGeneratedData(refresh.data)
         } catch (err) {
-          // BUGFIX (BUG-45): surface the refresh failure to the user
-          // instead of silently swallowing it. The Data tab will be stale
-          // until they reload the page.
           console.warn('[Studio] Failed to refresh external DB after mutation:', err)
           toast.warning('Mutation succeeded, but the schema/data refresh failed. Reload the page to see the latest state.')
         }
       } else {
-        // For SELECT queries: only show a toast + switch to SQL tab when
-        // the USER manually clicked "Run on live DB". For auto-executed
-        // reads (skipConfirm=true), the results are already shown inline
-        // in the chat card — no toast needed (less noise).
         if (!skipConfirm) {
           toast.success(`Returned ${result.rowCount || result.rows?.length || 0} row(s)`)
-          // Also surface the rows in the SQL tab results area
           if (result.rows && result.rows.length > 0) {
             setSqlResults({
               rows: result.rows,
@@ -1328,9 +1338,11 @@ function StudioPageInner({
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Execution failed'
+      const errResult = { ok: false, message: msg, rowCount: 0, affectedRows: 0 }
+      updateBlockState(messageId, sql, false, errResult)
       setMessages(prev => prev.map(m =>
         m.id === messageId
-          ? { ...m, sqlBlockExecuting: false, sqlBlockResult: { ok: false, message: msg, rowCount: 0, affectedRows: 0 } }
+          ? { ...m, sqlBlockExecuting: false, sqlBlockResult: errResult }
           : m
       ))
       toast.error(msg)
