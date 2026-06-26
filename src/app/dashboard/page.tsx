@@ -304,9 +304,10 @@ export default function DashboardPage() {
     fileName: string
     fileType: string
     schemaInfo: string
+    content?: string
   } | null>(null)
 
-  const handleFileUpload = (file: File) => {
+  const handleFileUpload = async (file: File) => {
     const ext = file.name.split('.').pop()?.toLowerCase() || ''
     const supportedExts = ['sql', 'csv', 'xlsx', 'xls', 'json', 'xml', 'parquet', 'sqlite', 'db', 'dump', 'sql.gz', 'bson']
     if (!supportedExts.some(se => ext.endsWith(se))) {
@@ -318,10 +319,23 @@ export default function DashboardPage() {
       json: 'JSON Data', xml: 'XML Data', parquet: 'Parquet Data', sqlite: 'SQLite Database',
       db: 'Database File', dump: 'SQL Dump', bson: 'MongoDB Export',
     }
+
+    // Read file content for text-based formats (up to 100KB)
+    const textExts = ['sql', 'csv', 'json', 'xml', 'dump']
+    let content: string | undefined
+    if (textExts.includes(ext) && file.size < 100 * 1024) {
+      try {
+        content = await file.text()
+      } catch {
+        // Binary or unreadable — skip content, just pass filename
+      }
+    }
+
     setUploadPreview({
       fileName: file.name,
       fileType: typeMap[ext] || 'Unknown',
       schemaInfo: `Detected ${typeMap[ext] || 'data'} file (${(file.size / 1024).toFixed(1)} KB)`,
+      content,
     })
     toast.success(`File "${file.name}" ready for import`)
   }
@@ -339,9 +353,23 @@ export default function DashboardPage() {
   }
 
   const sendToStudio = () => {
-    if (uploadPreview) {
-      router.push(`/dashboard/studio?q=${encodeURIComponent(`Import and generate data from this schema file: ${uploadPreview.fileName}`)}`)
+    if (!uploadPreview) return
+    // Store the file content in sessionStorage so the studio can access it
+    // (URL query params have a ~2KB practical limit, so we use sessionStorage
+    // for the actual content and just pass a flag in the URL).
+    if (uploadPreview.content) {
+      try {
+        sessionStorage.setItem('synthforge_upload_content', uploadPreview.content)
+        sessionStorage.setItem('synthforge_upload_filename', uploadPreview.fileName)
+        sessionStorage.setItem('synthforge_upload_type', uploadPreview.fileType)
+      } catch {
+        // sessionStorage might be full — fall back to just the filename prompt
+      }
     }
+    const prompt = uploadPreview.content
+      ? `Import and generate data from this ${uploadPreview.fileType} file "${uploadPreview.fileName}". The file content is available in sessionStorage under 'synthforge_upload_content'. Read it, analyze the schema, and generate realistic synthetic data based on it.`
+      : `Import and generate data from this ${uploadPreview.fileType} file: ${uploadPreview.fileName}`
+    router.push(`/dashboard/studio?q=${encodeURIComponent(prompt)}`)
   }
 
   // Recent activity

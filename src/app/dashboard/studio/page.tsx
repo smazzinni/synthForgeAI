@@ -1111,7 +1111,23 @@ function StudioPageInner({
     if (q && !initialQuerySent && ready) {
       setInitialQuerySent(true)
       const timer = setTimeout(() => {
-        sendMessage(q)
+        // Check if there's uploaded file content in sessionStorage
+        // (from the dashboard's Upload & Import feature)
+        let fullPrompt = q
+        try {
+          const uploadContent = sessionStorage.getItem('synthforge_upload_content')
+          const uploadFilename = sessionStorage.getItem('synthforge_upload_filename')
+          if (uploadContent && uploadFilename) {
+            fullPrompt = `${q}\n\n--- FILE CONTENT: ${uploadFilename} ---\n${uploadContent}\n--- END FILE CONTENT ---`
+            // Clean up sessionStorage after reading
+            sessionStorage.removeItem('synthforge_upload_content')
+            sessionStorage.removeItem('synthforge_upload_filename')
+            sessionStorage.removeItem('synthforge_upload_type')
+          }
+        } catch {
+          // sessionStorage not available
+        }
+        sendMessage(fullPrompt)
       }, 100)
       return () => clearTimeout(timer)
     }

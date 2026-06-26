@@ -437,17 +437,95 @@ export async function fetchSampleRows(conn: DbConnectionRecord, tableName: strin
 }
 
 /**
- * Execute arbitrary SQL against the external DB. Used by the AI chat for
- * CRUD operations (INSERT/UPDATE/DELETE/DROP/CREATE/ALTER etc.) as well as
- * read queries (SELECT).
+ * Split a multi-statement SQL string into individual statements.
+ * Handles string literals, dollar-quotes, and comments so semicolons inside
+ * strings/comments are not treated as statement separators.
  */
-export async function executeSql(
-  conn: DbConnectionRecord,
-  sql: string,
-): Promise<ExecuteResult> {
-  const start = Date.now()
-  const entry = await getPool(conn)
+function splitSqlStatements(sql: string): string[] {
+  const statements: string[] = []
+  let current = ''
+  let i = 0
+  const len = sql.length
+  let inSingle = false
+  let inDouble = false
+  let inDollarQuote = false
+  let dollarTag = ''
 
+  while (i < len) {
+    const ch = sql[i]
+    const next = sql[i + 1]
+
+    if (!inDouble && !inDollarQuote && ch === "'") {
+      inSingle = !inSingle
+      current += ch
+      i++
+      continue
+    }
+    if (!inSingle && !inDollarQuote && ch === '"') {
+      inDouble = !inDouble
+      current += ch
+      i++
+      continue
+    }
+
+    if (!inSingle && !inDouble && ch === '$') {
+      const dollarMatch = sql.slice(i).match(/^\$(\w*)\$/)
+      if (dollarMatch) {
+        const tag = dollarMatch[1]
+        if (!inDollarQuote) {
+          inDollarQuote = true
+          dollarTag = tag
+          current += dollarMatch[0]
+          i += dollarMatch[0].length
+          continue
+        } else if (tag === dollarTag) {
+          inDollarQuote = false
+          dollarTag = ''
+          current += dollarMatch[0]
+          i += dollarMatch[0].length
+          continue
+        }
+      }
+    }
+
+    if (!inSingle && !inDouble && !inDollarQuote && ch === '-' && next === '-') {
+      while (i < len && sql[i] !== '\n') { current += sql[i]; i++ }
+      continue
+    }
+
+    if (!inSingle && !inDouble && !inDollarQuote && ch === '/' && next === '*') {
+      current += '/*'
+      i += 2
+      while (i < len && !(sql[i] === '*' && sql[i + 1] === '/')) { current += sql[i]; i++ }
+      if (i < len) { current += '*/'; i += 2 }
+      continue
+    }
+
+    if (!inSingle && !inDouble && !inDollarQuote && ch === ';') {
+      const trimmed = current.trim()
+      if (trimmed) statements.push(trimmed)
+      current = ''
+      i++
+      continue
+    }
+
+    current += ch
+    i++
+  }
+
+  const trimmed = current.trim()
+  if (trimmed) statements.push(trimmed)
+  return statements
+}
+
+/**
+ * Execute a single SQL statement.
+ */
+async function executeSingleStatement(
+  entry: PoolEntry,
+  sql: string,
+  start: number,
+): Promise<ExecuteResult> {
   try {
     if (entry.dialect === 'postgres') {
       const pool = entry.pool as { query: (text: string) => Promise<{ rows: Record<string, unknown>[]; rowCount: number; command?: string }> }
@@ -467,19 +545,6 @@ export async function executeSql(
     const pool = entry.pool as { query: (sql: string, values?: unknown) => Promise<unknown> }
     const raw = await pool.query(sql)
 
-    // mysql2/promise returns:
-    //   - For SELECT: [rows[], fields[]]
-    //   - For INSERT/UPDATE/DELETE: [ResultSetHeader, fields[]]
-    //     where ResultSetHeader is an OBJECT (not an array) with
-    //     { fieldCount, affectedRows, insertId, info, serverStatus, warningStatus }
-    //
-    // BUGFIX (BUG-16): the previous code assumed `raw[0]` was always an
-    // array. For mutations it's the ResultSetHeader object, so:
-    //   - `Array.isArray(raw[0])` is false → `rows = raw` (the 2-element tuple)
-    //   - `Object.keys(rows[0])` returned the ResultSetHeader's keys
-    //   - `affectedRows` was read off the array (always undefined → 0)
-    // The studio then showed "INSERT OK — 0 row(s) affected" and rendered
-    // the ResultSetHeader as if it were a data row.
     const header = Array.isArray(raw) ? raw[0] : raw
     const isResultSetHeader =
       typeof header === 'object' && header !== null && !Array.isArray(header) && 'affectedRows' in header
@@ -489,12 +554,10 @@ export async function executeSql(
     let affectedRows: number
 
     if (isResultSetHeader) {
-      // INSERT / UPDATE / DELETE / DDL
       rows = []
       fields = []
       affectedRows = (header as { affectedRows?: number }).affectedRows || 0
     } else {
-      // SELECT
       rows = (Array.isArray(raw) && Array.isArray(raw[0]) ? raw[0] : raw) as Record<string, unknown>[]
       fields = (Array.isArray(raw) && Array.isArray(raw[1]) ? raw[1] : []) as Array<{ name: string }>
       affectedRows = 0
@@ -518,6 +581,65 @@ export async function executeSql(
       executionTime: Date.now() - start,
       error: err instanceof Error ? err.message : String(err),
     }
+  }
+}
+
+/**
+ * Execute arbitrary SQL against the external DB. Supports multi-statement SQL
+ * (multiple statements separated by semicolons). Each statement is executed
+ * individually and results are aggregated.
+ */
+export async function executeSql(
+  conn: DbConnectionRecord,
+  sql: string,
+): Promise<ExecuteResult> {
+  const start = Date.now()
+  const entry = await getPool(conn)
+
+  // Split multi-statement SQL into individual statements
+  const statements = splitSqlStatements(sql)
+
+  if (statements.length === 0) {
+    return {
+      rows: [], columns: [], rowCount: 0, affectedRows: 0,
+      executionTime: Date.now() - start,
+      error: 'No SQL statements to execute',
+    }
+  }
+
+  // Single statement — execute directly
+  if (statements.length === 1) {
+    return executeSingleStatement(entry, statements[0], start)
+  }
+
+  // Multiple statements — execute each, aggregate results
+  const allRows: Record<string, unknown>[] = []
+  let allColumns: string[] = []
+  let totalAffected = 0
+  let executedCount = 0
+  let lastError: string | undefined
+
+  for (const stmt of statements) {
+    const result = await executeSingleStatement(entry, stmt, start)
+    if (result.error) {
+      lastError = result.error
+    } else {
+      executedCount++
+    }
+    if (result.rows.length > 0) {
+      allRows.push(...result.rows)
+      if (allColumns.length === 0) allColumns = result.columns
+    }
+    totalAffected += result.affectedRows
+  }
+
+  return {
+    rows: allRows.slice(0, 1000),
+    columns: allColumns,
+    rowCount: allRows.length,
+    affectedRows: totalAffected,
+    executionTime: Date.now() - start,
+    error: executedCount === 0 ? (lastError || 'All statements failed') : undefined,
   }
 }
 

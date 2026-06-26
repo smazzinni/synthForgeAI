@@ -76,10 +76,28 @@ export async function POST(request: NextRequest) {
     // firstWord check works on SQL that the AI prefixes with explanatory
     // comments (which is exactly the format the chat route's system prompt
     // instructs the AI to produce).
-    const strippedForCheck = stripSqlComments(trimmed)
-    const firstWord = strippedForCheck.split(/\s+/)[0]?.toUpperCase() || ''
-    if (!ALLOWED_STATEMENTS.includes(firstWord)) {
-      return NextResponse.json({ error: `Statement type "${firstWord}" is not allowed` }, { status: 400 })
+    const strippedForCheck = stripSqlComments(trimmed).trim()
+
+    // For multi-statement SQL, split by semicolons and check the first word
+    // of EACH statement. All statements must use allowed statement types.
+    // IMPORTANT: Each individual statement may ALSO have leading comments
+    // (e.g. "-- Step 1: Get max IDs\nSELECT ..."), so we must stripSqlComments
+    // AGAIN on each split statement before checking its first word.
+    const statementsToCheck = strippedForCheck
+      .split(';')
+      .map(s => stripSqlComments(s).trim())
+      .filter(Boolean)
+
+    for (const stmt of statementsToCheck) {
+      const firstWord = stmt.split(/\s+/)[0]?.toUpperCase() || ''
+      // Skip empty statements (can happen with trailing semicolons or
+      // statements that were entirely comments)
+      if (!firstWord) continue
+      if (!ALLOWED_STATEMENTS.includes(firstWord)) {
+        return NextResponse.json({
+          error: `Statement type "${firstWord}" is not allowed`,
+        }, { status: 400 })
+      }
     }
 
     // Block obviously catastrophic patterns unless the caller explicitly
