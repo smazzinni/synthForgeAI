@@ -31,15 +31,32 @@ async function checkSupabase(): Promise<{ ok: boolean; latencyMs: number; error?
 async function checkAI(): Promise<{ ok: boolean; latencyMs: number; error?: string }> {
   const start = Date.now()
   try {
-    const ZAI = (await import('z-ai-web-dev-sdk')).default
-    const zai = await ZAI.create()
-    // Simple test call
-    const result = await zai.chat.completions.create({
-      messages: [{ role: 'user', content: 'ping' }],
-      max_tokens: 5,
+    const apiKey = process.env.DEEPSEEK_API_KEY
+    if (!apiKey) {
+      return { ok: false, latencyMs: Date.now() - start, error: 'DEEPSEEK_API_KEY not set' }
+    }
+    const baseUrl = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'
+    const model = process.env.DEEPSEEK_MODEL || 'deepseek-chat'
+    // Simple test call to DeepSeek API
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: 'ping' }],
+        max_tokens: 5,
+      }),
     })
-    if (!result.choices?.[0]?.message?.content) {
-      return { ok: false, latencyMs: Date.now() - start, error: 'No response from AI' }
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => 'Unknown error')
+      return { ok: false, latencyMs: Date.now() - start, error: `DeepSeek API ${response.status}: ${errorText.slice(0, 100)}` }
+    }
+    const result = await response.json()
+    if (!result.choices?.[0]?.message) {
+      return { ok: false, latencyMs: Date.now() - start, error: 'No response from DeepSeek' }
     }
     return { ok: true, latencyMs: Date.now() - start }
   } catch (err) {
@@ -53,6 +70,7 @@ function checkEnvVars(): { ok: boolean; latencyMs: number; error?: string } {
   if (!process.env.NEXT_PUBLIC_SUPABASE_URL) missing.push('NEXT_PUBLIC_SUPABASE_URL')
   if (!process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) missing.push('NEXT_PUBLIC_SUPABASE_ANON_KEY')
   if (!process.env.SUPABASE_SERVICE_KEY) missing.push('SUPABASE_SERVICE_KEY')
+  if (!process.env.DEEPSEEK_API_KEY) missing.push('DEEPSEEK_API_KEY')
 
   if (missing.length > 0) {
     return { ok: false, latencyMs: Date.now() - start, error: `Missing env vars: ${missing.join(', ')}` }
@@ -140,7 +158,7 @@ function getRecommendation(failures: Record<string, number>): string {
     recs.push('Supabase connection failing: Check NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY, and SUPABASE_SERVICE_KEY in .env.local')
   }
   if (failures.ai) {
-    recs.push('AI service failing: Check z-ai-web-dev-sdk configuration and network connectivity')
+    recs.push('AI service failing: Check DEEPSEEK_API_KEY and DEEPSEEK_BASE_URL in .env')
   }
   if (failures.envVars) {
     recs.push('Missing environment variables: Create .env.local with required Supabase keys')
