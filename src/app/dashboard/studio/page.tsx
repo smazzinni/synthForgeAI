@@ -341,12 +341,12 @@ function StudioPageInner({
     } catch { /* localStorage unavailable */ }
   }, [savedQueries])
 
-  // ─── Persist current conversation to history whenever messages change ───
-  // Skips the initial greeting (no user messages) and mid-stream saves (a
-  // message with isStreaming=true means the assistant is still generating).
-  // Updates the existing conversation if activeConversationId is set, otherwise
-  // creates a new entry. Keeps the list sorted by updatedAt desc and capped at
-  // MAX_CONVERSATIONS (50).
+  // ─── Persist current conversation to history (debounced) ───
+  // CRITICAL: This effect must NOT depend on `conversations` — including it
+  // creates an infinite loop (effect runs → setConversations → conversations
+  // changes → effect runs again). We use a ref + debounce to coalesce rapid
+  // updates (which happen during SQL streaming + execution) into a single write.
+  const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => {
     if (skipNextPersistRef.current) {
       skipNextPersistRef.current = false
@@ -356,50 +356,64 @@ function StudioPageInner({
     if (!hasUserMsg) return
     if (messages.some(m => m.isStreaming)) return
 
-    const existingId = activeConversationIdRef.current
-    const newId = existingId || (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-      ? crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`)
-    const now = new Date().toISOString()
-    const title = generateConversationTitle(messages)
-
-    setConversations(prev => {
-      const existing = prev.find(c => c.id === newId)
-      // Skip if this exact entry was just written (no-op guard for re-renders
-      // where the deps didn't actually change content).
-      if (existing && existing.updatedAt === now) return prev
-      const conv: SavedConversation = {
-        id: newId,
-        title,
-        messages,
-        schema: generatedSchema,
-        data: generatedData,
-        databaseName,
-        databaseId: currentDatabaseId || null,
-        createdAt: existing?.createdAt || now,
-        updatedAt: now,
-      }
-      let next: SavedConversation[]
-      if (existing) {
-        next = prev.map(c => (c.id === newId ? conv : c))
-      } else {
-        next = [conv, ...prev]
-      }
-      // Keep most-recently-updated first; cap at MAX_CONVERSATIONS.
-      next.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
-      if (next.length > MAX_CONVERSATIONS) next = next.slice(0, MAX_CONVERSATIONS)
-      persistSavedConversations(next)
-      return next
-    })
-
-    // Register the new conversation id so subsequent updates patch this entry
-    // instead of creating duplicates. Use the ref synchronously + state for any
-    // UI that cares (e.g. highlighting the active item in the dropdown).
-    if (!existingId) {
-      activeConversationIdRef.current = newId
-      setActiveConversationId(newId)
+    // Debounce: coalesce rapid message updates (e.g. during SQL streaming)
+    // into a single persistence write. Without this, each token from the AI
+    // stream or each SQL result triggers a separate save, causing rapid
+    // setConversations calls that can trigger "Maximum update depth exceeded".
+    if (persistTimerRef.current) {
+      clearTimeout(persistTimerRef.current)
     }
-  }, [messages, generatedSchema, generatedData, databaseName, currentDatabaseId])
+    persistTimerRef.current = setTimeout(() => {
+      const existingId = activeConversationIdRef.current
+      const newId = existingId || (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`)
+      const now = new Date().toISOString()
+      const title = generateConversationTitle(messages)
+
+      setConversations(prev => {
+        const existing = prev.find(c => c.id === newId)
+        if (existing && existing.updatedAt === now) return prev
+        const conv: SavedConversation = {
+          id: newId,
+          title,
+          messages,
+          schema: generatedSchema,
+          data: generatedData,
+          databaseName,
+          databaseId: currentDatabaseId || null,
+          connectionId: activeConnectionId || null,
+          createdAt: existing?.createdAt || now,
+          updatedAt: now,
+        }
+        let next: SavedConversation[]
+        if (existing) {
+          next = prev.map(c => (c.id === newId ? conv : c))
+        } else {
+          next = [conv, ...prev]
+        }
+        next.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+        if (next.length > MAX_CONVERSATIONS) next = next.slice(0, MAX_CONVERSATIONS)
+        persistSavedConversations(next)
+        return next
+      })
+
+      // Register the new conversation id so subsequent updates patch this
+      // entry instead of creating duplicates. Only set the ref synchronously;
+      // defer the state update to a microtask so it doesn't trigger a
+      // synchronous re-render that would re-run this effect.
+      if (!existingId) {
+        activeConversationIdRef.current = newId
+        queueMicrotask(() => setActiveConversationId(newId))
+      }
+    }, 500) // 500ms debounce — coalesces rapid streaming updates
+
+    return () => {
+      if (persistTimerRef.current) {
+        clearTimeout(persistTimerRef.current)
+      }
+    }
+  }, [messages, generatedSchema, generatedData, databaseName, currentDatabaseId, activeConnectionId])
 
   // Explorer state
   const [favoriteTables, setFavoriteTables] = useState<Set<string>>(new Set())

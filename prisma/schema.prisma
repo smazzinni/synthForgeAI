@@ -81,3 +81,28 @@ model Message {
 
   @@index([conversationId])
 }
+
+// ─── DB Connections (durable persistence) ───
+// Stores user-supplied external DB connection credentials so they persist
+// across server restarts and user logouts. Used as a fallback when the
+// Supabase `db_connections` table is not available.
+model DbConnection {
+  id              String   @id @default(cuid())
+  userId          String   @default("default")
+  name            String
+  dialect         String   @default("postgres")
+  host            String
+  port            Int      @default(5432)
+  username        String
+  password        String
+  database        String   @default("")
+  schema          String?
+  ssl             Boolean  @default(false)
+  status          String   @default("untested")
+  lastConnectedAt DateTime?
+  errorMessage    String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([userId])
+}
