@@ -384,10 +384,10 @@ You are an autonomous agent. When given a complex task:
       stream_options: { include_usage: true },
     }
 
-    // DeepSeek v4 supports reasoning/thinking via the "thinking" field
-    if (DEEPSEEK_THINKING_ENABLED) {
-      deepseekBody.thinking = { type: 'enabled' }
-    }
+    // Note: deepseek-v4-pro returns reasoning_content by default.
+    // The "thinking" field is not needed and may cause errors on some API versions.
+    // DEEPSEEK_THINKING_ENABLED just controls whether we STREAM the reasoning_content
+    // to the frontend (via STREAM_THINKING_CONTENT), not whether the model reasons.
 
     const deepseekResponse = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
       method: 'POST',
@@ -591,9 +591,11 @@ You are an autonomous agent. When given a complex task:
     })
   } catch (error) {
     console.error('[Chat API] Unhandled error:', error)
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error'
     return new Response(JSON.stringify({
       error: 'Internal server error',
-      content: 'I apologize, but I encountered an error processing your request.',
+      content: `I encountered an error: ${errorMessage}`,
+      details: process.env.NODE_ENV === 'development' ? errorMessage : undefined,
     }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' },
