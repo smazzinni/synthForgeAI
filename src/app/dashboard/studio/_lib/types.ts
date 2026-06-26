@@ -79,6 +79,9 @@ export interface SavedConversation {
   data: Record<string, unknown[]>
   databaseName: string
   databaseId: string | null
+  /** External DB connection ID (live-DB mode). Used to find the previous
+   *  conversation when the user re-opens the same DB connection. */
+  connectionId?: string | null
   createdAt: string
   updatedAt: string
 }

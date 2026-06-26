@@ -64,6 +64,22 @@ export function persistSavedConversations(convs: SavedConversation[]): void {
   } catch { /* localStorage unavailable or quota exceeded */ }
 }
 
+/**
+ * Find the most recent conversation for a given external DB connection ID.
+ * Returns null if no conversation exists for that connection.
+ * Used when the user opens a DB connection — we load the previous chat
+ * history instead of starting a fresh conversation each time.
+ */
+export function findConversationByConnectionId(connectionId: string): SavedConversation | null {
+  if (typeof window === 'undefined') return null
+  const convs = loadSavedConversations()
+  // Sort by updatedAt desc to get the most recent first
+  const sorted = convs
+    .filter(c => c.connectionId === connectionId)
+    .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+  return sorted[0] || null
+}
+
 /** Auto-title: first user message truncated to 50 chars, else "New Conversation". */
 export function generateConversationTitle(messages: Message[]): string {
   const firstUser = messages.find(m => m.role === 'user')

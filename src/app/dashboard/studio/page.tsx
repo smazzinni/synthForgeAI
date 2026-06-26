@@ -89,6 +89,7 @@ import {
   loadSavedConversations,
   persistSavedConversations,
   generateConversationTitle,
+  findConversationByConnectionId,
 } from './_lib/conversation-storage'
 import {
   loadQueryHistory,
@@ -223,6 +224,10 @@ function StudioPageInner({
   // Updates the existing conversation if activeConversationId is set, otherwise
   // creates a new entry. Keeps the list sorted by updatedAt desc and capped at
   // MAX_CONVERSATIONS (50).
+  //
+  // For live-DB mode: if there's an existing conversation for the same
+  // connectionId, we reuse it (update instead of creating a new one). This
+  // prevents duplicate conversation entries for the same DB connection.
   useEffect(() => {
     if (skipNextPersistRef.current) {
       skipNextPersistRef.current = false
@@ -233,7 +238,20 @@ function StudioPageInner({
     if (messages.some(m => m.isStreaming)) return
 
     const existingId = activeConversationIdRef.current
-    const newId = existingId || (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+
+    // For live-DB mode: if no active conversation, try to find an existing
+    // one for this connectionId (so we update it instead of creating a duplicate)
+    let effectiveId = existingId
+    if (!effectiveId && activeConnectionId) {
+      const existing = conversations.find(c => c.connectionId === activeConnectionId)
+      if (existing) {
+        effectiveId = existing.id
+        activeConversationIdRef.current = existing.id
+        setActiveConversationId(existing.id)
+      }
+    }
+
+    const newId = effectiveId || (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
       ? crypto.randomUUID()
       : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`)
     const now = new Date().toISOString()
@@ -252,6 +270,7 @@ function StudioPageInner({
         data: generatedData,
         databaseName,
         databaseId: currentDatabaseId || null,
+        connectionId: activeConnectionId || null,
         createdAt: existing?.createdAt || now,
         updatedAt: now,
       }
@@ -275,7 +294,7 @@ function StudioPageInner({
       activeConversationIdRef.current = newId
       setActiveConversationId(newId)
     }
-  }, [messages, generatedSchema, generatedData, databaseName, currentDatabaseId])
+  }, [messages, generatedSchema, generatedData, databaseName, currentDatabaseId, activeConnectionId, conversations])
 
   // Explorer state
   const [favoriteTables, setFavoriteTables] = useState<Set<string>>(new Set())
@@ -315,6 +334,46 @@ function StudioPageInner({
   const messagesRef = useRef<Message[]>(messages)
   const loadingRef = useRef(false)
   const resizeRef = useRef<HTMLDivElement>(null)
+
+  // ─── Lazy loading for chat history ───
+  // Only render the most recent N messages initially. When the user scrolls
+  // to the top of the chat container, load VISIBLE_INCREMENT more older
+  // messages. This prevents rendering hundreds of DOM nodes for long
+  // conversations (which causes jank).
+  const INITIAL_VISIBLE = 30
+  const VISIBLE_INCREMENT = 20
+  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE)
+  const isLoadingMoreRef = useRef(false)
+
+  // Reset visible count when conversation changes (loading a different conv)
+  useEffect(() => {
+    setVisibleCount(INITIAL_VISIBLE)
+  }, [activeConversationId])
+
+  // The messages to actually render (last N, where N = visibleCount)
+  const visibleMessages = visibleCount >= messages.length
+    ? messages
+    : messages.slice(-visibleCount)
+
+  // Handle scroll to top → load more messages
+  const handleChatScroll = useCallback(() => {
+    const container = chatContainerRef.current
+    if (!container) return
+    // If scrolled to near the top (within 50px), load more
+    if (container.scrollTop < 50 && visibleCount < messages.length) {
+      if (isLoadingMoreRef.current) return
+      isLoadingMoreRef.current = true
+      const prevScrollHeight = container.scrollHeight
+      setVisibleCount(prev => Math.min(prev + VISIBLE_INCREMENT, messages.length))
+      // After state updates, preserve scroll position so the user doesn't
+      // jump to the new top (which would be disorienting).
+      requestAnimationFrame(() => {
+        const newScrollHeight = container.scrollHeight
+        container.scrollTop = newScrollHeight - prevScrollHeight
+        isLoadingMoreRef.current = false
+      })
+    }
+  }, [visibleCount, messages.length])
   // Ref to the latest `executeSqlBlock` function. `sendMessage` (defined
   // above `executeSqlBlock`) needs to call it for auto-execution of SELECT
   // queries in live-DB mode, but `const` declarations aren't hoisted. The
@@ -384,23 +443,34 @@ function StudioPageInner({
         }
         setDatabaseName(result.connection.name)
 
-        // Replace the generic welcome message with a live-DB welcome so the
-        // user immediately understands they are connected to a real database
-        // and the assistant can run SQL against it. Only replace the initial
-        // assistant greeting (id === '1') so we never clobber real chat history.
-        setMessages(prev => {
-          const hasRealHistory = prev.some(m => m.role === 'user')
-          if (hasRealHistory) return prev
-          return prev.map(m => m.id === '1' ? {
-            ...m,
-            content: `Connected to live ${conn.dialect} **"${conn.name}"**. I have direct access to this database — ask me anything and I'll run SQL against it.\n\n**Examples:**\n- "show me the first 10 rows of users"\n- "how many rows are in the orders table?"\n- "what tables are in this database?"\n- "add a status column to the orders table"\n\n**How it works:**\n- **SELECT** queries are auto-executed immediately — results appear inline below.\n- **INSERT / UPDATE / DELETE / DDL** operations show a confirmation dialog before executing.`,
-          } : m)
-        })
+        // Check if there's a previous conversation for this connection.
+        // If so, load it instead of showing the generic welcome message.
+        // This makes the chat history persistent per DB connection.
+        const existingConv = findConversationByConnectionId(conn.id)
+        if (existingConv && existingConv.messages.some(m => m.role === 'user')) {
+          // Load the previous conversation history
+          skipNextPersistRef.current = true
+          activeConversationIdRef.current = existingConv.id
+          setActiveConversationId(existingConv.id)
+          setMessages(existingConv.messages)
+          if (existingConv.schema?.length) setGeneratedSchema(existingConv.schema)
+          if (existingConv.data && Object.keys(existingConv.data).length > 0) setGeneratedData(existingConv.data)
+          toast.success(`Connected to ${result.connection.name} — chat history restored`)
+        } else {
+          // No previous conversation — show the welcome message
+          setMessages(prev => {
+            const hasRealHistory = prev.some(m => m.role === 'user')
+            if (hasRealHistory) return prev
+            return prev.map(m => m.id === '1' ? {
+              ...m,
+              content: `Connected to live ${conn.dialect} **"${conn.name}"**. I have direct access to this database — ask me anything and I'll run SQL against it.\n\n**Examples:**\n- "show me the first 10 rows of users"\n- "how many rows are in the orders table?"\n- "what tables are in this database?"\n- "add a status column to the orders table"\n\n**How it works:**\n- **SELECT** queries are auto-executed immediately — results appear inline below.\n- **INSERT / UPDATE / DELETE / DDL** operations show a confirmation dialog before executing.`,
+            } : m)
+          })
+          toast.success(`Connected to ${result.connection.name}`)
+        }
 
         if (result.error) {
           toast.warning(`Schema introspection warning: ${result.error}`)
-        } else {
-          toast.success(`Connected to ${result.connection.name}`)
         }
       } catch (err) {
         if (!cancelled) {
@@ -1102,6 +1172,10 @@ function StudioPageInner({
     setGeneratedData(conv.data || {})
     setDatabaseName(conv.databaseName || '')
     setCurrentDatabaseId(conv.databaseId || undefined)
+    // Restore the connectionId if this was a live-DB conversation
+    if (conv.connectionId) {
+      setActiveConnectionId(conv.connectionId)
+    }
     // Reset the backend conversation id — the loaded chat is a fresh backend
     // session (the backend conversation endpoint is keyed by databaseId, not
     // by the localStorage history id).
@@ -1287,9 +1361,17 @@ function StudioPageInner({
         return
       }
 
+      // Strip comments and check ALL statements for mutation keywords.
+      // With multi-statement SQL, the first statement might be USE or a
+      // comment, but later statements might be CREATE TABLE / INSERT.
       const stripped = stripSqlComments(sql).trim()
-      const verb = stripped.split(/\s+/)[0]?.toUpperCase() || ''
-      const isMutation = ['INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE'].includes(verb)
+      const allStatements = stripped.split(';').map(s => stripSqlComments(s).trim()).filter(Boolean)
+      const mutationVerbs = ['INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'USE']
+      const firstMutationVerb = allStatements
+        .map(s => s.split(/\s+/)[0]?.toUpperCase() || '')
+        .find(v => mutationVerbs.includes(v)) || ''
+      const verb = firstMutationVerb || allStatements[0]?.split(/\s+/)[0]?.toUpperCase() || ''
+      const isMutation = mutationVerbs.includes(verb)
       const affected = result.affectedRows ?? result.rowCount ?? (result.rows?.length || 0)
 
       const okResult = {
@@ -2118,8 +2200,28 @@ function StudioPageInner({
         )}
 
         {/* Chat Messages */}
-        <div ref={chatContainerRef} className="flex-1 overflow-y-auto px-2.5 py-3 space-y-2.5 scroll-smooth">
-          {messages.map((message) => (
+        <div ref={chatContainerRef} onScroll={handleChatScroll} className="flex-1 overflow-y-auto px-2.5 py-3 space-y-2.5 scroll-smooth">
+          {/* Show "load more" indicator when there are older messages not rendered */}
+          {visibleCount < messages.length && (
+            <div className="text-center py-1.5">
+              <button
+                onClick={() => {
+                  const container = chatContainerRef.current
+                  if (!container) return
+                  const prevScrollHeight = container.scrollHeight
+                  setVisibleCount(prev => Math.min(prev + VISIBLE_INCREMENT, messages.length))
+                  requestAnimationFrame(() => {
+                    const newScrollHeight = container.scrollHeight
+                    container.scrollTop = newScrollHeight - prevScrollHeight
+                  })
+                }}
+                className="text-[10px] text-muted-foreground hover:text-foreground underline"
+              >
+                Load {Math.min(VISIBLE_INCREMENT, messages.length - visibleCount)} older messages
+              </button>
+            </div>
+          )}
+          {visibleMessages.map((message) => (
             <MessageBubble
               key={message.id}
               message={message}
