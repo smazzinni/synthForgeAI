@@ -590,27 +590,31 @@ export async function POST(request: NextRequest) {
           // ═══════════════════════════════════════════════════════════
           // CONTINUATION MECHANISM (Fix 2)
           // After the main stream ends, check if all expected tables got
-          // data. If any are missing, make focused follow-up API calls for
-          // each missing table and stream the resulting records through the
-          // same SSE stream.
+          // data. If any are missing OR got fewer rows than requested,
+          // make focused follow-up API calls for each incomplete table.
           // ═══════════════════════════════════════════════════════════
           if (!clientCancelled) {
             const expectedTables = body.schema.map(s => s.name)
             const generatedTables = Object.keys(allTableData)
-            const missingTables = expectedTables.filter(
-              t => !generatedTables.includes(t) || (allTableData[t]?.length || 0) === 0
-            )
+
+            // Check for both completely missing tables AND tables with
+            // fewer rows than requested (partial generation due to token limits)
+            const incompleteTables = expectedTables.filter(t => {
+              const generated = allTableData[t]?.length || 0
+              const requested = body.rowCounts[t] || 0
+              return generated === 0 || (requested > 0 && generated < requested)
+            })
 
             console.log(`[Generate-Stream] Expected tables: [${expectedTables.join(', ')}]`)
-            console.log(`[Generate-Stream] Generated tables: [${generatedTables.join(', ')}] (rows: ${generatedTables.map(t => `${t}=${allTableData[t]?.length || 0}`).join(', ')})`)
+            console.log(`[Generate-Stream] Generated tables: [${generatedTables.join(', ')}] (rows: ${generatedTables.map(t => `${t}=${allTableData[t]?.length || 0}/${body.rowCounts[t] || 0}`).join(', ')})`)
 
-            if (missingTables.length > 0) {
-              console.warn(`[Generate-Stream] ⚠️ ${missingTables.length} table(s) missing data. Triggering continuation: [${missingTables.join(', ')}]`)
+            if (incompleteTables.length > 0) {
+              console.warn(`[Generate-Stream] ⚠️ ${incompleteTables.length} table(s) need more data. Triggering continuation: [${incompleteTables.join(', ')}]`)
 
               safeEnqueue(sendSSE({
                 type: 'progress',
                 table: '',
-                message: `Continuing generation for ${missingTables.length} remaining table${missingTables.length === 1 ? '' : 's'}...`,
+                message: `Continuing generation for ${incompleteTables.length} table${incompleteTables.length === 1 ? '' : 's'} that need more rows...`,
                 totalInserted,
                 targetRows: totalRows,
               }))
@@ -618,21 +622,23 @@ export async function POST(request: NextRequest) {
               // Wrap the entire continuation phase in a top-level try/catch
               // so a failure never propagates to the outer catch (best-effort).
               try {
-                for (const missingTable of missingTables) {
+                for (const incompleteTable of incompleteTables) {
                   if (clientCancelled) break
 
-                  const tableSchema = body.schema.find(s => s.name === missingTable)
+                  const tableSchema = body.schema.find(s => s.name === incompleteTable)
                   if (!tableSchema) {
-                    console.warn(`[Generate-Stream] Continuation: schema not found for ${missingTable}, skipping.`)
+                    console.warn(`[Generate-Stream] Continuation: schema not found for ${incompleteTable}, skipping.`)
                     continue
                   }
 
-                  const rowCount = body.rowCounts[missingTable] || 10
-                  console.log(`[Generate-Stream] Continuation: generating ${rowCount} rows for [${missingTable}]`)
+                  const requestedRows = body.rowCounts[incompleteTable] || 10
+                  const alreadyGenerated = allTableData[incompleteTable]?.length || 0
+                  const remainingRows = Math.max(0, requestedRows - alreadyGenerated)
+                  console.log(`[Generate-Stream] Continuation: generating ${remainingRows} more rows for [${incompleteTable}] (${alreadyGenerated}/${requestedRows} already generated)`)
 
                   const continuationPrompt = buildContinuationPrompt(
-                    missingTable,
-                    rowCount,
+                    incompleteTable,
+                    remainingRows,
                     tableSchema.columns,
                   )
 
@@ -648,7 +654,7 @@ export async function POST(request: NextRequest) {
                         model: DEEPSEEK_MODEL,
                         messages: [
                           { role: 'system', content: continuationPrompt },
-                          { role: 'user', content: `Generate ${rowCount} records for ${missingTable} now.` },
+                          { role: 'user', content: `Generate ${remainingRows} more records for ${incompleteTable} now.` },
                         ],
                         stream: true,
                         max_tokens: DEEPSEEK_MAX_TOKENS,
@@ -656,31 +662,31 @@ export async function POST(request: NextRequest) {
                       }),
                     })
                   } catch (fetchErr) {
-                    console.warn(`[Generate-Stream] Continuation fetch failed for ${missingTable}:`, fetchErr)
+                    console.warn(`[Generate-Stream] Continuation fetch failed for ${incompleteTable}:`, fetchErr)
                     continue
                   }
 
                   if (!contResponse.ok) {
                     const contErrText = await contResponse.text().catch(() => 'Unknown error')
-                    console.warn(`[Generate-Stream] Continuation HTTP ${contResponse.status} for ${missingTable}:`, contErrText)
+                    console.warn(`[Generate-Stream] Continuation HTTP ${contResponse.status} for ${incompleteTable}:`, contErrText)
                     continue
                   }
 
                   const contReader = contResponse.body?.getReader()
                   if (!contReader) {
-                    console.warn(`[Generate-Stream] Continuation: no response body for ${missingTable}`)
+                    console.warn(`[Generate-Stream] Continuation: no response body for ${incompleteTable}`)
                     continue
                   }
 
                   // Set currentTable to the missing table and reset counters
-                  currentTable = missingTable
-                  currentTableInserted = (allTableData[missingTable]?.length) || 0
+                  currentTable = incompleteTable
+                  currentTableInserted = (allTableData[incompleteTable]?.length) || 0
                   lastFlushTime = Date.now()
 
                   safeEnqueue(sendSSE({
                     type: 'progress',
-                    table: missingTable,
-                    message: `Streaming records into [${missingTable}]`,
+                    table: incompleteTable,
+                    message: `Streaming records into [${incompleteTable}]`,
                     rowsInserted: 0,
                     totalInserted,
                     targetRows: rowCount,
@@ -791,7 +797,7 @@ export async function POST(request: NextRequest) {
                       }
                     }
                   } catch (contErr) {
-                    console.warn(`[Generate-Stream] Continuation stream error for ${missingTable}:`, contErr)
+                    console.warn(`[Generate-Stream] Continuation stream error for ${incompleteTable}:`, contErr)
                   }
 
                   // Flush any remaining records queued for this table
@@ -803,13 +809,13 @@ export async function POST(request: NextRequest) {
                     }
                   }
 
-                  const finalCount = allTableData[missingTable]?.length || 0
-                  console.log(`[Generate-Stream] Continuation complete for [${missingTable}]: ${finalCount} rows (finish_reason: ${contFinishReason || 'n/a'})`)
+                  const finalCount = allTableData[incompleteTable]?.length || 0
+                  console.log(`[Generate-Stream] Continuation complete for [${incompleteTable}]: ${finalCount} rows (finish_reason: ${contFinishReason || 'n/a'})`)
 
                   // Mark this continuation table complete
                   safeEnqueue(sendSSE({
                     type: 'table_complete',
-                    table: missingTable,
+                    table: incompleteTable,
                     totalRows: finalCount,
                   }))
 
