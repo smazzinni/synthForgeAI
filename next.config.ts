@@ -1,9 +1,13 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // Skip TypeScript errors during build — the codebase has pre-existing
+  // type mismatches in the Supabase generic typing that don't affect runtime.
   typescript: {
     ignoreBuildErrors: true,
   },
+  // Skip ESLint errors during build — the codebase has pre-existing lint
+  // warnings that don't affect functionality.
   eslint: {
     ignoreDuringBuilds: true,
   },

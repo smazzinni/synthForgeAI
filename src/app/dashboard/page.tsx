@@ -32,6 +32,23 @@ import {
   ArrowUpFromLine,
   PlugZap,
   Table2,
+  ShoppingBag,
+  HeartPulse,
+  Cloud,
+  Users2,
+  DollarSign,
+  Cpu,
+  GraduationCap,
+  Building2,
+  ShoppingCart,
+  Stethoscope,
+  Smartphone,
+  CreditCard,
+  Wifi,
+  BookOpen,
+  Home,
+  Layers3,
+  Flame,
   Info,
   ExternalLink,
   CircleDot,
@@ -50,6 +67,93 @@ interface DatabaseItem {
   created_at?: string
   updated_at?: string
 }
+
+// ─── Quick-Start Templates ───
+// Pre-built database templates users can generate with one click. Each sends
+// a structured prompt to the AI studio so the multi-agent pipeline can design
+// the schema + generate data immediately.
+const templates = [
+  {
+    icon: ShoppingCart,
+    title: 'E-Commerce',
+    description: 'Users, products, orders, payments, reviews',
+    tables: 5,
+    rows: 50,
+    color: 'from-amber-500 to-orange-600',
+    bgColor: 'bg-amber-50 dark:bg-amber-950/20',
+    prompt: 'Generate an e-commerce database with users, products, orders, payments, and reviews. 50 rows per table with realistic US-based names, product catalog, and order history.',
+  },
+  {
+    icon: Stethoscope,
+    title: 'Healthcare',
+    description: 'Patients, appointments, providers, prescriptions',
+    tables: 6,
+    rows: 30,
+    color: 'from-emerald-500 to-teal-600',
+    bgColor: 'bg-emerald-50 dark:bg-emerald-950/20',
+    prompt: 'Generate a healthcare management database with patients, providers, appointments, prescriptions, medical_records, and departments. 30 rows per table with HIPAA-safe synthetic data.',
+  },
+  {
+    icon: CreditCard,
+    title: 'SaaS Billing',
+    description: 'Accounts, subscriptions, invoices, usage logs',
+    tables: 5,
+    rows: 40,
+    color: 'from-violet-500 to-purple-600',
+    bgColor: 'bg-violet-50 dark:bg-violet-950/20',
+    prompt: 'Generate a SaaS subscription billing database with accounts, plans, subscriptions, invoices, and usage_logs. 40 rows per table with realistic subscription tiers and billing cycles.',
+  },
+  {
+    icon: Smartphone,
+    title: 'Social Media',
+    description: 'Users, posts, comments, likes, follows',
+    tables: 5,
+    rows: 60,
+    color: 'from-sky-500 to-cyan-600',
+    bgColor: 'bg-sky-50 dark:bg-sky-950/20',
+    prompt: 'Generate a social media platform database with users, posts, comments, likes, and follows. 60 rows per table with realistic content and engagement patterns.',
+  },
+  {
+    icon: DollarSign,
+    title: 'FinTech',
+    description: 'Accounts, transactions, cards, transfers',
+    tables: 6,
+    rows: 50,
+    color: 'from-green-500 to-emerald-600',
+    bgColor: 'bg-green-50 dark:bg-green-950/20',
+    prompt: 'Generate a fintech banking database with accounts, transactions, cards, transfers, merchants, and categories. 50 rows per table with realistic financial data and PCI-compliant synthetic values.',
+  },
+  {
+    icon: Wifi,
+    title: 'IoT Telemetry',
+    description: 'Devices, sensors, readings, alerts',
+    tables: 4,
+    rows: 100,
+    color: 'from-blue-500 to-indigo-600',
+    bgColor: 'bg-blue-50 dark:bg-blue-950/20',
+    prompt: 'Generate an IoT telemetry database with devices, sensors, readings, and alerts. 100 rows per table with realistic sensor data, timestamps, and alert thresholds.',
+  },
+  {
+    icon: BookOpen,
+    title: 'Education',
+    description: 'Students, courses, enrollments, grades',
+    tables: 5,
+    rows: 40,
+    color: 'from-rose-500 to-pink-600',
+    bgColor: 'bg-rose-50 dark:bg-rose-950/20',
+    prompt: 'Generate an education management database with students, courses, enrollments, assignments, and grades. 40 rows per table with realistic academic data and grade distributions.',
+  },
+  {
+    icon: Home,
+    title: 'Real Estate',
+    description: 'Properties, agents, listings, transactions',
+    tables: 5,
+    rows: 35,
+    color: 'from-orange-500 to-red-600',
+    bgColor: 'bg-orange-50 dark:bg-orange-950/20',
+    prompt: 'Generate a real estate database with properties, agents, listings, transactions, and clients. 35 rows per table with realistic property details and market values.',
+  },
+]
 
 // Mini sparkline component
 function MiniSparkline({ data, color = '#f59e0b' }: { data: number[]; color?: string }) {
@@ -200,10 +304,9 @@ export default function DashboardPage() {
     fileName: string
     fileType: string
     schemaInfo: string
-    content?: string
   } | null>(null)
 
-  const handleFileUpload = async (file: File) => {
+  const handleFileUpload = (file: File) => {
     const ext = file.name.split('.').pop()?.toLowerCase() || ''
     const supportedExts = ['sql', 'csv', 'xlsx', 'xls', 'json', 'xml', 'parquet', 'sqlite', 'db', 'dump', 'sql.gz', 'bson']
     if (!supportedExts.some(se => ext.endsWith(se))) {
@@ -215,23 +318,10 @@ export default function DashboardPage() {
       json: 'JSON Data', xml: 'XML Data', parquet: 'Parquet Data', sqlite: 'SQLite Database',
       db: 'Database File', dump: 'SQL Dump', bson: 'MongoDB Export',
     }
-
-    // Read file content for text-based formats (up to 100KB)
-    const textExts = ['sql', 'csv', 'json', 'xml', 'dump']
-    let content: string | undefined
-    if (textExts.includes(ext) && file.size < 100 * 1024) {
-      try {
-        content = await file.text()
-      } catch {
-        // Binary or unreadable — skip content, just pass filename
-      }
-    }
-
     setUploadPreview({
       fileName: file.name,
       fileType: typeMap[ext] || 'Unknown',
       schemaInfo: `Detected ${typeMap[ext] || 'data'} file (${(file.size / 1024).toFixed(1)} KB)`,
-      content,
     })
     toast.success(`File "${file.name}" ready for import`)
   }
@@ -249,23 +339,9 @@ export default function DashboardPage() {
   }
 
   const sendToStudio = () => {
-    if (!uploadPreview) return
-    // Store the file content in sessionStorage so the studio can access it
-    // (URL query params have a ~2KB practical limit, so we use sessionStorage
-    // for the actual content and just pass a flag in the URL).
-    if (uploadPreview.content) {
-      try {
-        sessionStorage.setItem('synthforge_upload_content', uploadPreview.content)
-        sessionStorage.setItem('synthforge_upload_filename', uploadPreview.fileName)
-        sessionStorage.setItem('synthforge_upload_type', uploadPreview.fileType)
-      } catch {
-        // sessionStorage might be full — fall back to just the filename prompt
-      }
+    if (uploadPreview) {
+      router.push(`/dashboard/studio?q=${encodeURIComponent(`Import and generate data from this schema file: ${uploadPreview.fileName}`)}`)
     }
-    const prompt = uploadPreview.content
-      ? `Import and generate data from this ${uploadPreview.fileType} file "${uploadPreview.fileName}". The file content is available in sessionStorage under 'synthforge_upload_content'. Read it, analyze the schema, and generate realistic synthetic data based on it.`
-      : `Import and generate data from this ${uploadPreview.fileType} file: ${uploadPreview.fileName}`
-    router.push(`/dashboard/studio?q=${encodeURIComponent(prompt)}`)
   }
 
   // Recent activity
@@ -455,6 +531,66 @@ export default function DashboardPage() {
             </CardContent>
           </Card>
         ))}
+      </div>
+
+      {/* Quick-Start Templates Gallery */}
+      <div className="mb-8">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h2 className="text-lg font-semibold flex items-center gap-2">
+              <Layers3 className="h-5 w-5 text-amber-600" />
+              Quick-Start Templates
+            </h2>
+            <p className="text-xs text-muted-foreground mt-0.5">Generate a complete database with one click — AI designs the schema and creates realistic data</p>
+          </div>
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+          {templates.map((tpl, tplIdx) => (
+            <button
+              key={tpl.title}
+              onClick={() => router.push(`/dashboard/studio?q=${encodeURIComponent(tpl.prompt)}`)}
+              className="group relative text-left rounded-xl border border-border/60 bg-card hover:border-transparent hover:shadow-lg transition-all duration-300 overflow-hidden"
+            >
+              {/* Gradient glow on hover — amber→red, 5% opacity */}
+              <div className={`absolute -inset-px bg-gradient-to-br from-amber-500 to-red-600 opacity-0 group-hover:opacity-[0.05] transition-opacity duration-300 rounded-xl`} />
+              {/* Top accent bar */}
+              <div className={`h-1 bg-gradient-to-r ${tpl.color}`} />
+              <div className="relative p-5">
+                {/* Popular badge for E-Commerce */}
+                {tplIdx === 0 && (
+                  <span className="absolute top-2 right-2 inline-flex items-center gap-0.5 text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-gradient-to-r from-amber-500 to-red-500 text-white shadow-sm">
+                    <Flame className="h-2.5 w-2.5" />
+                    Popular
+                  </span>
+                )}
+                {/* Table count badge top-right */}
+                {tplIdx !== 0 && (
+                  <span className="absolute top-2 right-2 text-[9px] px-1.5 py-0.5 rounded-full bg-muted/60 text-muted-foreground font-medium">
+                    {tpl.tables} tbl
+                  </span>
+                )}
+                <div className="flex items-start justify-between mb-3">
+                  <div className={`h-10 w-10 rounded-xl bg-gradient-to-br ${tpl.color} flex items-center justify-center shadow-md group-hover:scale-110 group-hover:-rotate-3 transition-transform duration-300`}>
+                    <tpl.icon className="h-5 w-5 text-white" />
+                  </div>
+                  <ArrowRight className="h-4 w-4 text-muted-foreground/40 group-hover:text-foreground group-hover:translate-x-0.5 transition-all" />
+                </div>
+                <h3 className="font-semibold text-sm mb-1">{tpl.title}</h3>
+                <p className="text-[11px] text-muted-foreground leading-snug mb-3 line-clamp-2">{tpl.description}</p>
+                <div className="flex items-center gap-2">
+                  <Badge variant="outline" className="text-[9px] px-1.5 py-0 h-4 font-medium">
+                    <Table2 className="h-2 w-2 mr-0.5" />
+                    {tpl.tables} tables
+                  </Badge>
+                  <Badge variant="outline" className="text-[9px] px-1.5 py-0 h-4 font-medium">
+                    <BarChart3 className="h-2 w-2 mr-0.5" />
+                    {tpl.rows} rows
+                  </Badge>
+                </div>
+              </div>
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">

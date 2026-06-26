@@ -14,15 +14,6 @@ export interface GenerationProgress {
   databaseId?: string
 }
 
-export interface SqlBlockResult {
-  ok: boolean
-  message: string
-  rowCount?: number
-  affectedRows?: number
-  rows?: Record<string, unknown>[]
-  columns?: string[]
-}
-
 export interface Message {
   id: string
   role: 'user' | 'assistant' | 'system'
@@ -39,11 +30,14 @@ export interface Message {
   sqlBlock?: string | null
   sqlBlocks?: string[]
   sqlBlockExecuting?: boolean
-  sqlBlockResult?: SqlBlockResult | null
-  // ─── Per-block execution state (keyed by SQL string) ───
-  // Allows each SQL block in a multi-block message to have its own
-  // executing/result state instead of sharing a single result.
-  sqlBlockStates?: Record<string, { executing: boolean; result: SqlBlockResult | null }>
+  sqlBlockResult?: {
+    ok: boolean
+    message: string
+    rowCount?: number
+    affectedRows?: number
+    rows?: Record<string, unknown>[]
+    columns?: string[]
+  } | null
 }
 
 export interface SchemaTable {
@@ -62,32 +56,4 @@ export interface StudioPageProps {
   initialConnectionId?: string
   initialConnectionName?: string
   initialConnectionDialect?: 'postgres' | 'mysql'
-}
-
-/**
- * Persisted conversation entry in localStorage history.
- *
- * Stores the full message list plus the generated schema/data/databaseName/
- * databaseId so the entire studio state can be restored when a user reopens
- * a past conversation from the History dropdown.
- */
-export interface SavedConversation {
-  id: string
-  title: string
-  messages: Message[]
-  schema: SchemaTable[]
-  data: Record<string, unknown[]>
-  databaseName: string
-  databaseId: string | null
-  /** External DB connection ID (live-DB mode). Used to find the previous
-   *  conversation when the user re-opens the same DB connection. */
-  connectionId?: string | null
-  createdAt: string
-  updatedAt: string
-}
-
-/** A named, user-saved SQL snippet for the SQL workspace. */
-export interface SavedQuery {
-  name: string
-  sql: string
 }

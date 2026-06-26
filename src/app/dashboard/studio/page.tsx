@@ -5,6 +5,14 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { Card, CardContent } from '@/components/ui/card'
+import { Separator } from '@/components/ui/separator'
+import { ScrollArea } from '@/components/ui/scroll-area'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import {
   Tooltip,
   TooltipContent,
@@ -26,6 +34,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import {
@@ -37,7 +46,11 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import {
+  Send,
   Loader2,
+  Bot,
+  User,
+  Sparkles,
   Brain,
   ChevronDown,
   Database,
@@ -48,20 +61,46 @@ import {
   Trash2,
   Copy,
   Download,
+  Play,
+  History,
+  Star,
+  StarOff,
   Plus,
   FileJson,
   FileSpreadsheet,
   FileText,
+  X,
+  ZoomIn,
+  ZoomOut,
+  Move,
   AlertTriangle,
+  CheckCircle2,
+  Shield,
+  Wand2,
   PlugZap,
+  Square,
+  RotateCcw,
+  KeyRound,
+  Link2,
+  Layers,
+  MousePointerClick,
   RefreshCw,
+  Search,
+  ArrowRight,
+  Columns,
+  ChevronRight,
+  Keyboard,
+  PanelRightClose,
   PanelRightOpen,
+  Clock,
+  MessageSquare,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
 import { apiPost, apiPatch, apiDelete, apiGet, invalidateCache } from '@/lib/api-client'
 import {
   parseAgentStatus,
+  parseInteractiveOptions,
   parseAllInteractiveOptions,
   parseBeginGeneration,
   cleanDisplayText,
@@ -74,29 +113,7 @@ import {
   type BeginGenerationSignal,
 } from '@/lib/ai-agents'
 // Extracted types + helpers + sub-components (kept the main file focused)
-import type {
-  Message,
-  SchemaTable,
-  SavedConversation,
-  SavedQuery,
-  StudioPageProps,
-  GenerationProgress,
-  SqlBlockResult,
-} from './_lib/types'
-import { INITIAL_GREETING, QUICK_PROMPTS } from './_lib/constants'
-import {
-  MAX_CONVERSATIONS,
-  loadSavedConversations,
-  persistSavedConversations,
-  generateConversationTitle,
-  findConversationByConnectionId,
-} from './_lib/conversation-storage'
-import {
-  loadQueryHistory,
-  saveQueryHistory,
-  loadSavedQueries,
-  saveSavedQueries,
-} from './_lib/query-storage'
+import type { Message, SchemaTable, StudioPageProps, GenerationProgress } from './_lib/types'
 import {
   exportAsCSV,
   exportAsJSON,
@@ -104,28 +121,114 @@ import {
   parseAIResponse,
   extractSchema,
   extractAllSqlBlocks,
+  extractSqlBlock,
   generateSchemaSQL as generateSchemaSQLHelper,
   computeERLayout as computeERLayoutHelper,
+  getDataColumnKind,
+  humanizeColumnName,
+  columnPlainEnglishHint,
 } from './_lib/utils'
 import { AgentIcon } from './_components/agent-icon'
-import { ChatHeader, type ConversationHistoryItem } from './_components/chat-header'
-import { ShortcutsDialog } from './_components/shortcuts-dialog'
-import { SchemaPreviewPanel } from './_components/schema-preview-panel'
-import { DataTab } from './_components/data-tab'
-import { SqlTab } from './_components/sql-tab'
-import { ExplorerTab } from './_components/explorer-tab'
-import { MessageBubble } from './_components/message-bubble'
-import { ChatInput } from './_components/chat-input'
-import {
-  buildInitialGenerationProgress,
-  applyProgressEvent,
-  applyTableCompleteEvent,
-  buildCompletedProgress,
-  applyErrorEvent,
-  formatProgressMessage,
-  formatCompleteMessage,
-  formatTableCompleteMessage,
-} from './_lib/generation-helpers'
+import { ShowMoreText } from './_components/show-more-text'
+import { SqlBlockCard } from './_components/sql-block-card'
+
+
+// ─── Conversation history (localStorage persistence) ───
+// Saves up to 50 most recent conversations so users can reload past sessions
+// from the History dropdown in the chat header. Each conversation stores the
+// full message list plus the generated schema/data/databaseName/databaseId so
+// the entire studio state can be restored on load.
+const CONVERSATION_STORAGE_KEY = 'synthforge_conversations'
+const MAX_CONVERSATIONS = 50
+
+interface SavedConversation {
+  id: string
+  title: string
+  messages: Message[]
+  schema: SchemaTable[]
+  data: Record<string, unknown[]>
+  databaseName: string
+  databaseId: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+// SSR-safe lazy loader. Guards against malformed JSON, missing fields, and
+// string-vs-Date timestamp mismatches (localStorage serializes Date → string).
+function loadSavedConversations(): SavedConversation[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = localStorage.getItem(CONVERSATION_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .filter((c: unknown): c is Record<string, unknown> => typeof c === 'object' && c !== null)
+      .map((c): SavedConversation => {
+        const rawMsgs = Array.isArray(c.messages) ? c.messages : []
+        const messages: Message[] = rawMsgs.map((m: Record<string, unknown>, i: number) => ({
+          id: String(m.id ?? `m-${i}`),
+          role: (m.role as Message['role']) || 'assistant',
+          content: String(m.content ?? ''),
+          reasoningContent: m.reasoningContent != null ? String(m.reasoningContent) : undefined,
+          agentName: m.agentName != null ? String(m.agentName) : undefined,
+          timestamp: new Date(typeof m.timestamp === 'string' ? m.timestamp : Date.now()),
+          isStreaming: false,
+        }))
+        return {
+          id: String(c.id ?? ''),
+          title: String(c.title ?? 'New Conversation'),
+          messages,
+          schema: Array.isArray(c.schema) ? (c.schema as SchemaTable[]) : [],
+          data: (c.data && typeof c.data === 'object' && !Array.isArray(c.data))
+            ? (c.data as Record<string, unknown[]>)
+            : {},
+          databaseName: String(c.databaseName ?? ''),
+          databaseId: c.databaseId != null ? String(c.databaseId) : null,
+          createdAt: String(c.createdAt ?? new Date().toISOString()),
+          updatedAt: String(c.updatedAt ?? new Date().toISOString()),
+        }
+      })
+  } catch {
+    return []
+  }
+}
+
+function persistSavedConversations(convs: SavedConversation[]) {
+  if (typeof window === 'undefined') return
+  try {
+    localStorage.setItem(CONVERSATION_STORAGE_KEY, JSON.stringify(convs))
+  } catch { /* localStorage unavailable or quota exceeded */ }
+}
+
+// Auto-title: first user message truncated to 50 chars, else "New Conversation".
+function generateConversationTitle(messages: Message[]): string {
+  const firstUser = messages.find(m => m.role === 'user')
+  if (!firstUser) return 'New Conversation'
+  const text = firstUser.content.trim()
+  if (!text) return 'New Conversation'
+  return text.length > 50 ? text.slice(0, 50) + '…' : text
+}
+
+// Compact relative time for the history list ("2h ago", "just now", …).
+function relativeTime(iso: string): string {
+  const then = new Date(iso).getTime()
+  if (Number.isNaN(then)) return ''
+  const diff = Math.max(0, Date.now() - then)
+  const sec = Math.floor(diff / 1000)
+  if (sec < 60) return 'just now'
+  const min = Math.floor(sec / 60)
+  if (min < 60) return `${min}m ago`
+  const hr = Math.floor(min / 60)
+  if (hr < 24) return `${hr}h ago`
+  const day = Math.floor(hr / 24)
+  if (day < 7) return `${day}d ago`
+  const wk = Math.floor(day / 7)
+  if (wk < 5) return `${wk}w ago`
+  const mo = Math.floor(day / 30)
+  if (mo < 12) return `${mo}mo ago`
+  return `${Math.floor(day / 365)}y ago`
+}
 
 
 // ─── Main Studio Page Component ───
@@ -165,7 +268,7 @@ function StudioPageInner({
         ? `Connected to live ${initialConnectionDialect || 'DB'} **"${initialConnectionName || ''}"**. I have direct access to this database — ask me anything and I'll run SQL against it.\n\n**Examples:**\n- "show me the first 10 rows of users"\n- "how many rows are in the orders table?"\n- "what tables are in this database?"\n- "delete all users created before 2020"\n- "add a status column to the orders table"\n- "drop the legacy_logs table"\n\n**How it works:**\n- **SELECT** queries are auto-executed immediately — results appear inline below.\n- **INSERT / UPDATE / DELETE / DDL** operations show a confirmation dialog before executing.\n- Destructive operations (DROP, TRUNCATE, DELETE without WHERE) are clearly badged.`
         : databaseId
         ? `You're editing database **"${initialName || databaseId}"**. Describe changes or ask me to add more data.`
-        : INITIAL_GREETING,
+        : 'Welcome to **SynthForge AI Studio**! I can help you generate synthetic data.\n\nDescribe the database you need, and I\'ll design the schema, generate realistic data, and ensure quality compliance.\n\nFor example: "Generate an e-commerce database with users, orders, and products"',
       agentName: 'Orchestrator',
       timestamp: new Date(),
     },
@@ -205,17 +308,37 @@ function StudioPageInner({
   // Persist query history + saved queries to localStorage so they survive
   // page reloads. Previously these were in-memory only, so users lost their
   // saved queries every time they navigated away from the studio.
-  const [queryHistory, setQueryHistory] = useState<string[]>(() => loadQueryHistory())
-  const [savedQueries, setSavedQueries] = useState<SavedQuery[]>(() => loadSavedQueries())
+  const [queryHistory, setQueryHistory] = useState<string[]>(() => {
+    if (typeof window === 'undefined') return []
+    try {
+      const raw = localStorage.getItem('synthforge_query_history')
+      return raw ? JSON.parse(raw) : []
+    } catch {
+      return []
+    }
+  })
+  const [savedQueries, setSavedQueries] = useState<Array<{ name: string; sql: string }>>(() => {
+    if (typeof window === 'undefined') return []
+    try {
+      const raw = localStorage.getItem('synthforge_saved_queries')
+      return raw ? JSON.parse(raw) : []
+    } catch {
+      return []
+    }
+  })
   const [sqlConfirmOpen, setSqlConfirmOpen] = useState(false)
   const [sqlConfirmQuery, setSqlConfirmQuery] = useState('')
 
   // Persist query history + saved queries whenever they change
   useEffect(() => {
-    saveQueryHistory(queryHistory)
+    try {
+      localStorage.setItem('synthforge_query_history', JSON.stringify(queryHistory))
+    } catch { /* localStorage unavailable */ }
   }, [queryHistory])
   useEffect(() => {
-    saveSavedQueries(savedQueries)
+    try {
+      localStorage.setItem('synthforge_saved_queries', JSON.stringify(savedQueries))
+    } catch { /* localStorage unavailable */ }
   }, [savedQueries])
 
   // ─── Persist current conversation to history whenever messages change ───
@@ -224,10 +347,6 @@ function StudioPageInner({
   // Updates the existing conversation if activeConversationId is set, otherwise
   // creates a new entry. Keeps the list sorted by updatedAt desc and capped at
   // MAX_CONVERSATIONS (50).
-  //
-  // For live-DB mode: if there's an existing conversation for the same
-  // connectionId, we reuse it (update instead of creating a new one). This
-  // prevents duplicate conversation entries for the same DB connection.
   useEffect(() => {
     if (skipNextPersistRef.current) {
       skipNextPersistRef.current = false
@@ -238,20 +357,7 @@ function StudioPageInner({
     if (messages.some(m => m.isStreaming)) return
 
     const existingId = activeConversationIdRef.current
-
-    // For live-DB mode: if no active conversation, try to find an existing
-    // one for this connectionId (so we update it instead of creating a duplicate)
-    let effectiveId = existingId
-    if (!effectiveId && activeConnectionId) {
-      const existing = conversations.find(c => c.connectionId === activeConnectionId)
-      if (existing) {
-        effectiveId = existing.id
-        activeConversationIdRef.current = existing.id
-        setActiveConversationId(existing.id)
-      }
-    }
-
-    const newId = effectiveId || (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    const newId = existingId || (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
       ? crypto.randomUUID()
       : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`)
     const now = new Date().toISOString()
@@ -270,7 +376,6 @@ function StudioPageInner({
         data: generatedData,
         databaseName,
         databaseId: currentDatabaseId || null,
-        connectionId: activeConnectionId || null,
         createdAt: existing?.createdAt || now,
         updatedAt: now,
       }
@@ -294,7 +399,7 @@ function StudioPageInner({
       activeConversationIdRef.current = newId
       setActiveConversationId(newId)
     }
-  }, [messages, generatedSchema, generatedData, databaseName, currentDatabaseId, activeConnectionId, conversations])
+  }, [messages, generatedSchema, generatedData, databaseName, currentDatabaseId])
 
   // Explorer state
   const [favoriteTables, setFavoriteTables] = useState<Set<string>>(new Set())
@@ -334,46 +439,6 @@ function StudioPageInner({
   const messagesRef = useRef<Message[]>(messages)
   const loadingRef = useRef(false)
   const resizeRef = useRef<HTMLDivElement>(null)
-
-  // ─── Lazy loading for chat history ───
-  // Only render the most recent N messages initially. When the user scrolls
-  // to the top of the chat container, load VISIBLE_INCREMENT more older
-  // messages. This prevents rendering hundreds of DOM nodes for long
-  // conversations (which causes jank).
-  const INITIAL_VISIBLE = 30
-  const VISIBLE_INCREMENT = 20
-  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE)
-  const isLoadingMoreRef = useRef(false)
-
-  // Reset visible count when conversation changes (loading a different conv)
-  useEffect(() => {
-    setVisibleCount(INITIAL_VISIBLE)
-  }, [activeConversationId])
-
-  // The messages to actually render (last N, where N = visibleCount)
-  const visibleMessages = visibleCount >= messages.length
-    ? messages
-    : messages.slice(-visibleCount)
-
-  // Handle scroll to top → load more messages
-  const handleChatScroll = useCallback(() => {
-    const container = chatContainerRef.current
-    if (!container) return
-    // If scrolled to near the top (within 50px), load more
-    if (container.scrollTop < 50 && visibleCount < messages.length) {
-      if (isLoadingMoreRef.current) return
-      isLoadingMoreRef.current = true
-      const prevScrollHeight = container.scrollHeight
-      setVisibleCount(prev => Math.min(prev + VISIBLE_INCREMENT, messages.length))
-      // After state updates, preserve scroll position so the user doesn't
-      // jump to the new top (which would be disorienting).
-      requestAnimationFrame(() => {
-        const newScrollHeight = container.scrollHeight
-        container.scrollTop = newScrollHeight - prevScrollHeight
-        isLoadingMoreRef.current = false
-      })
-    }
-  }, [visibleCount, messages.length])
   // Ref to the latest `executeSqlBlock` function. `sendMessage` (defined
   // above `executeSqlBlock`) needs to call it for auto-execution of SELECT
   // queries in live-DB mode, but `const` declarations aren't hoisted. The
@@ -425,15 +490,13 @@ function StudioPageInner({
           return
         }
 
-        const conn = result.connection
-
-        if (conn.status === 'failed') {
-          toast.error(`Connection test failed: ${conn.error_message || 'unknown error'}`)
+        if (result.connection.status === 'failed') {
+          toast.error(`Connection test failed: ${result.connection.error_message || 'unknown error'}`)
         }
 
-        setActiveConnectionId(conn.id)
-        setActiveConnectionName(conn.name)
-        setActiveConnectionDialect(conn.dialect)
+        setActiveConnectionId(result.connection.id)
+        setActiveConnectionName(result.connection.name)
+        setActiveConnectionDialect(result.connection.dialect)
 
         if (result.schema && result.schema.length > 0) {
           setGeneratedSchema(result.schema)
@@ -443,34 +506,23 @@ function StudioPageInner({
         }
         setDatabaseName(result.connection.name)
 
-        // Check if there's a previous conversation for this connection.
-        // If so, load it instead of showing the generic welcome message.
-        // This makes the chat history persistent per DB connection.
-        const existingConv = findConversationByConnectionId(conn.id)
-        if (existingConv && existingConv.messages.some(m => m.role === 'user')) {
-          // Load the previous conversation history
-          skipNextPersistRef.current = true
-          activeConversationIdRef.current = existingConv.id
-          setActiveConversationId(existingConv.id)
-          setMessages(existingConv.messages)
-          if (existingConv.schema?.length) setGeneratedSchema(existingConv.schema)
-          if (existingConv.data && Object.keys(existingConv.data).length > 0) setGeneratedData(existingConv.data)
-          toast.success(`Connected to ${result.connection.name} — chat history restored`)
-        } else {
-          // No previous conversation — show the welcome message
-          setMessages(prev => {
-            const hasRealHistory = prev.some(m => m.role === 'user')
-            if (hasRealHistory) return prev
-            return prev.map(m => m.id === '1' ? {
-              ...m,
-              content: `Connected to live ${conn.dialect} **"${conn.name}"**. I have direct access to this database — ask me anything and I'll run SQL against it.\n\n**Examples:**\n- "show me the first 10 rows of users"\n- "how many rows are in the orders table?"\n- "what tables are in this database?"\n- "add a status column to the orders table"\n\n**How it works:**\n- **SELECT** queries are auto-executed immediately — results appear inline below.\n- **INSERT / UPDATE / DELETE / DDL** operations show a confirmation dialog before executing.`,
-            } : m)
-          })
-          toast.success(`Connected to ${result.connection.name}`)
-        }
+        // Replace the generic welcome message with a live-DB welcome so the
+        // user immediately understands they are connected to a real database
+        // and the assistant can run SQL against it. Only replace the initial
+        // assistant greeting (id === '1') so we never clobber real chat history.
+        setMessages(prev => {
+          const hasRealHistory = prev.some(m => m.role === 'user')
+          if (hasRealHistory) return prev
+          return prev.map(m => m.id === '1' ? {
+            ...m,
+            content: `Connected to live ${result.connection.dialect} **"${result.connection.name}"**. I have direct access to this database — ask me anything and I'll run SQL against it.\n\n**Examples:**\n- "show me the first 10 rows of users"\n- "how many rows are in the orders table?"\n- "what tables are in this database?"\n- "add a status column to the orders table"\n\n**How it works:**\n- **SELECT** queries are auto-executed immediately — results appear inline below.\n- **INSERT / UPDATE / DELETE / DDL** operations show a confirmation dialog before executing.`,
+          } : m)
+        })
 
         if (result.error) {
           toast.warning(`Schema introspection warning: ${result.error}`)
+        } else {
+          toast.success(`Connected to ${result.connection.name}`)
         }
       } catch (err) {
         if (!cancelled) {
@@ -1045,23 +1097,7 @@ function StudioPageInner({
     if (q && !initialQuerySent && ready) {
       setInitialQuerySent(true)
       const timer = setTimeout(() => {
-        // Check if there's uploaded file content in sessionStorage
-        // (from the dashboard's Upload & Import feature)
-        let fullPrompt = q
-        try {
-          const uploadContent = sessionStorage.getItem('synthforge_upload_content')
-          const uploadFilename = sessionStorage.getItem('synthforge_upload_filename')
-          if (uploadContent && uploadFilename) {
-            fullPrompt = `${q}\n\n--- FILE CONTENT: ${uploadFilename} ---\n${uploadContent}\n--- END FILE CONTENT ---`
-            // Clean up sessionStorage after reading
-            sessionStorage.removeItem('synthforge_upload_content')
-            sessionStorage.removeItem('synthforge_upload_filename')
-            sessionStorage.removeItem('synthforge_upload_type')
-          }
-        } catch {
-          // sessionStorage not available
-        }
-        sendMessage(fullPrompt)
+        sendMessage(q)
       }, 100)
       return () => clearTimeout(timer)
     }
@@ -1172,10 +1208,6 @@ function StudioPageInner({
     setGeneratedData(conv.data || {})
     setDatabaseName(conv.databaseName || '')
     setCurrentDatabaseId(conv.databaseId || undefined)
-    // Restore the connectionId if this was a live-DB conversation
-    if (conv.connectionId) {
-      setActiveConnectionId(conv.connectionId)
-    }
     // Reset the backend conversation id — the loaded chat is a fresh backend
     // session (the backend conversation endpoint is keyed by databaseId, not
     // by the localStorage history id).
@@ -1214,7 +1246,7 @@ function StudioPageInner({
     setConversationId('')
     if (!isLiveDbMode) {
       setGeneratedSchema([])
-      setGeneratedData({})
+      setGeneratedData([])
       setDatabaseName('')
       setCurrentDatabaseId(undefined)
     }
@@ -1315,18 +1347,11 @@ function StudioPageInner({
       if (!ok) return
     }
 
-    // Helper to update per-block state for a specific SQL string
-    const updateBlockState = (messageId: string, sqlKey: string, executing: boolean, result: SqlBlockResult | null) => {
-      setMessages(prev => prev.map(m => {
-        if (m.id !== messageId) return m
-        const states = { ...(m.sqlBlockStates || {}) }
-        states[sqlKey] = { executing, result }
-        return { ...m, sqlBlockStates: states }
-      }))
-    }
-
-    // Set executing state for this specific block
-    updateBlockState(messageId, sql, true, null)
+    setMessages(prev => prev.map(m =>
+      m.id === messageId
+        ? { ...m, sqlBlockExecuting: true, sqlBlockResult: null }
+        : m
+    ))
 
     try {
       const result = await apiPost<{
@@ -1343,15 +1368,15 @@ function StudioPageInner({
       }, { timeout: 60000 })
 
       if (result.error) {
-        const errResult = { ok: false, message: result.error!, rowCount: 0, affectedRows: 0 }
-        updateBlockState(messageId, sql, false, errResult)
-        // Also update the legacy fields for backward compat
         setMessages(prev => prev.map(m =>
           m.id === messageId
-            ? { ...m, sqlBlockExecuting: false, sqlBlockResult: errResult }
+            ? { ...m, sqlBlockExecuting: false, sqlBlockResult: { ok: false, message: result.error!, rowCount: 0, affectedRows: 0 } }
             : m
         ))
         toast.error(result.error)
+        // BUGFIX (BUG-46): if the connection itself was deleted or became
+        // invalid, clean up the studio's live-mode state so the user
+        // doesn't keep retrying against a dead connection.
         if (/connection.*not found|not have access/i.test(result.error)) {
           setActiveConnectionId(undefined)
           setActiveConnectionName(undefined)
@@ -1361,39 +1386,37 @@ function StudioPageInner({
         return
       }
 
-      // Strip comments and check ALL statements for mutation keywords.
-      // With multi-statement SQL, the first statement might be USE or a
-      // comment, but later statements might be CREATE TABLE / INSERT.
+      // BUGFIX (BUG-37): strip leading SQL comments before computing the
+      // verb, so SQL prefixed with `-- DESTRUCTIVE: ...` is classified
+      // correctly. Otherwise `verb = '--'` and `isMutation = false`,
+      // causing the post-mutation schema refresh to be skipped and the
+      // toast to say "Returned 0 row(s)" instead of "INSERT OK — N rows".
       const stripped = stripSqlComments(sql).trim()
-      const allStatements = stripped.split(';').map(s => stripSqlComments(s).trim()).filter(Boolean)
-      const mutationVerbs = ['INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'USE']
-      const firstMutationVerb = allStatements
-        .map(s => s.split(/\s+/)[0]?.toUpperCase() || '')
-        .find(v => mutationVerbs.includes(v)) || ''
-      const verb = firstMutationVerb || allStatements[0]?.split(/\s+/)[0]?.toUpperCase() || ''
-      const isMutation = mutationVerbs.includes(verb)
+      const verb = stripped.split(/\s+/)[0]?.toUpperCase() || ''
+      const isMutation = ['INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE'].includes(verb)
       const affected = result.affectedRows ?? result.rowCount ?? (result.rows?.length || 0)
 
-      const okResult = {
-        ok: true,
-        message: isMutation ? `${verb} OK — ${affected} row(s) affected` : `Returned ${result.rowCount || result.rows?.length || 0} row(s)`,
-        rowCount: result.rowCount || result.rows?.length || 0,
-        affectedRows: affected,
-        rows: result.rows?.slice(0, 50),
-        columns: result.columns,
-      } as SqlBlockResult
-
-      // Update per-block state
-      updateBlockState(messageId, sql, false, okResult)
-      // Also update legacy fields for backward compat (primary block)
       setMessages(prev => prev.map(m =>
         m.id === messageId
-          ? { ...m, sqlBlockExecuting: false, sqlBlockResult: okResult }
+          ? {
+            ...m,
+            sqlBlockExecuting: false,
+            sqlBlockResult: {
+              ok: true,
+              message: isMutation ? `${verb} OK — ${affected} row(s) affected` : `Returned ${result.rowCount || result.rows?.length || 0} row(s)`,
+              rowCount: result.rowCount || result.rows?.length || 0,
+              affectedRows: affected,
+              rows: result.rows?.slice(0, 50),
+              columns: result.columns,
+            },
+          }
           : m
       ))
 
       if (isMutation) {
         toast.success(`${verb} OK — ${affected} row(s) affected`)
+        // Refresh the schema + data from the external DB so the data tab
+        // reflects the change immediately.
         try {
           const refresh = await apiGet<{
             schema?: SchemaTable[]
@@ -1402,12 +1425,20 @@ function StudioPageInner({
           if (refresh.schema) setGeneratedSchema(refresh.schema)
           if (refresh.data) setGeneratedData(refresh.data)
         } catch (err) {
+          // BUGFIX (BUG-45): surface the refresh failure to the user
+          // instead of silently swallowing it. The Data tab will be stale
+          // until they reload the page.
           console.warn('[Studio] Failed to refresh external DB after mutation:', err)
           toast.warning('Mutation succeeded, but the schema/data refresh failed. Reload the page to see the latest state.')
         }
       } else {
+        // For SELECT queries: only show a toast + switch to SQL tab when
+        // the USER manually clicked "Run on live DB". For auto-executed
+        // reads (skipConfirm=true), the results are already shown inline
+        // in the chat card — no toast needed (less noise).
         if (!skipConfirm) {
           toast.success(`Returned ${result.rowCount || result.rows?.length || 0} row(s)`)
+          // Also surface the rows in the SQL tab results area
           if (result.rows && result.rows.length > 0) {
             setSqlResults({
               rows: result.rows,
@@ -1420,11 +1451,9 @@ function StudioPageInner({
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Execution failed'
-      const errResult = { ok: false, message: msg, rowCount: 0, affectedRows: 0 }
-      updateBlockState(messageId, sql, false, errResult)
       setMessages(prev => prev.map(m =>
         m.id === messageId
-          ? { ...m, sqlBlockExecuting: false, sqlBlockResult: errResult }
+          ? { ...m, sqlBlockExecuting: false, sqlBlockResult: { ok: false, message: msg, rowCount: 0, affectedRows: 0 } }
           : m
       ))
       toast.error(msg)
@@ -1564,8 +1593,16 @@ function StudioPageInner({
 
     const genProgressId = (Date.now() + 2).toString()
 
-    const initialProgress = buildInitialGenerationProgress(signal, currentDatabaseId)
-    setGenerationProgress(initialProgress)
+    setGenerationProgress({
+      isGenerating: true,
+      currentTable: '',
+      rowsInserted: 0,
+      totalInserted: 0,
+      targetRows: Object.values(signal.rowCounts).reduce((s, n) => s + n, 0),
+      tablesGenerated: 0,
+      statusMessages: ['Generating database schema...'],
+      databaseId: currentDatabaseId,
+    })
 
     // Add a generation progress message to chat
     setMessages(prev => [...prev, {
@@ -1573,7 +1610,15 @@ function StudioPageInner({
       role: 'assistant' as const,
       content: '',
       agentName: 'Data Generator',
-      generationProgress: initialProgress,
+      generationProgress: {
+        isGenerating: true,
+        currentTable: '',
+        rowsInserted: 0,
+        totalInserted: 0,
+        targetRows: Object.values(signal.rowCounts).reduce((s, n) => s + n, 0),
+        tablesGenerated: 0,
+        statusMessages: ['Generating database schema...'],
+      },
       timestamp: new Date(),
     }])
 
@@ -1607,6 +1652,7 @@ function StudioPageInner({
       const decoder = new TextDecoder()
       let sseBuffer = ''
       const accumulatedData: Record<string, unknown[]> = {}
+      let totalInserted = 0
       // Local mutable copy of the database id so that the `complete` handler
       // can read the most recent value, even if `database_created` fired
       // mid-stream after this closure captured the initial value.
@@ -1638,8 +1684,19 @@ function StudioPageInner({
             }
 
             if (event.type === 'progress') {
-              const statusMsg = formatProgressMessage(event)
-              setGenerationProgress(prev => applyProgressEvent(prev, event))
+              const statusMsg = event.message
+                || (event.table
+                  ? `Streaming records into [${event.table}] — ${event.totalInserted || 0} rows`
+                  : `${event.totalInserted || 0} rows inserted`)
+
+              setGenerationProgress(prev => ({
+                ...prev,
+                currentTable: event.table || prev.currentTable,
+                rowsInserted: event.rowsInserted || 0,
+                totalInserted: event.totalInserted || prev.totalInserted,
+                targetRows: event.targetRows || prev.targetRows,
+                statusMessages: [...prev.statusMessages.slice(-5), statusMsg],
+              }))
 
               // Update the progress message in chat
               setMessages(prev => prev.map(m =>
@@ -1662,6 +1719,7 @@ function StudioPageInner({
 
             if (event.type === 'table_complete') {
               const tableName = event.table || ''
+              const tableRows = event.totalRows || 0
 
               // Extract schema for this table
               const tableSchema = signal.schema.find(s => s.name === tableName)
@@ -1674,8 +1732,13 @@ function StudioPageInner({
                 })
               }
 
-              const completeMsg = formatTableCompleteMessage(event)
-              setGenerationProgress(prev => applyTableCompleteEvent(prev, event))
+              const completeMsg = `[${tableName}] — ${tableRows.toLocaleString()} rows inserted`
+
+              setGenerationProgress(prev => ({
+                ...prev,
+                tablesGenerated: prev.tablesGenerated + 1,
+                statusMessages: [...prev.statusMessages.slice(-5), completeMsg],
+              }))
 
               setMessages(prev => prev.map(m =>
                 m.id === genProgressId
@@ -1692,6 +1755,7 @@ function StudioPageInner({
             }
 
             if (event.type === 'complete') {
+              const durationSec = ((event.durationMs || 0) / 1000).toFixed(1)
               const totalRows = event.totalRows || 0
               const tablesGen = event.tablesGenerated || 0
 
@@ -1720,8 +1784,15 @@ function StudioPageInner({
                 setGeneratedData(accumulatedData)
               }
 
-              const finalMsg = formatCompleteMessage(event)
-              setGenerationProgress(prev => buildCompletedProgress(prev, event))
+              const finalMsg = `Generation complete — ${totalRows.toLocaleString()} rows across ${tablesGen} tables (${durationSec}s)`
+
+              setGenerationProgress(prev => ({
+                ...prev,
+                isGenerating: false,
+                tablesGenerated: tablesGen,
+                totalInserted: totalRows,
+                statusMessages: [...prev.statusMessages.slice(-5), finalMsg],
+              }))
 
               // Update the progress message to show completion
               setMessages(prev => prev.map(m =>
@@ -1752,7 +1823,11 @@ function StudioPageInner({
             if (event.type === 'error') {
               const errorMsg = event.message || 'Generation failed'
 
-              setGenerationProgress(prev => applyErrorEvent(prev, event))
+              setGenerationProgress(prev => ({
+                ...prev,
+                isGenerating: false,
+                statusMessages: [...prev.statusMessages, `Error: ${errorMsg}`],
+              }))
 
               setMessages(prev => prev.map(m =>
                 m.id === genProgressId
@@ -1786,8 +1861,12 @@ function StudioPageInner({
       if ((err as Error).name === 'AbortError') return
 
       const errorMsg = err instanceof Error ? err.message : 'Generation failed'
-      const errEvent = { type: 'error' as const, message: errorMsg }
-      setGenerationProgress(prev => applyErrorEvent(prev, errEvent))
+
+      setGenerationProgress(prev => ({
+        ...prev,
+        isGenerating: false,
+        statusMessages: [...prev.statusMessages, `Error: ${errorMsg}`],
+      }))
 
       setMessages(prev => prev.map(m =>
         m.id === genProgressId
@@ -1803,6 +1882,107 @@ function StudioPageInner({
 
       toast.error(`Generation failed: ${errorMsg}`)
     }
+  }
+
+  // ─── Render formatted message content ───
+  const renderMessageContent = (message: Message) => {
+    if (message.role === 'user') {
+      return <span className="whitespace-pre-wrap break-words" style={{ overflowWrap: 'break-word', wordBreak: 'break-word' }}>{message.content}</span>
+    }
+
+    // ─── Render generation progress UI ───
+    if (message.generationProgress) {
+      const gp = message.generationProgress
+      const progressPercent = gp.targetRows > 0 ? Math.min(100, Math.round((gp.totalInserted / gp.targetRows) * 100)) : 0
+
+      return (
+        <div className="space-y-2">
+          {/* Progress bar */}
+          <div className="flex items-center gap-2">
+            {gp.isGenerating && <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-500 shrink-0" />}
+            {!gp.isGenerating && gp.totalInserted > 0 && <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500 shrink-0" />}
+            <div className="flex-1">
+              <div className="flex items-center justify-between mb-0.5">
+                <span className="text-[10px] font-medium text-foreground">
+                  {gp.isGenerating ? 'Generating...' : 'Complete'}
+                </span>
+                <span className="text-[9px] text-muted-foreground">{progressPercent}%</span>
+              </div>
+              <div className="w-full h-1.5 bg-muted rounded-full overflow-hidden">
+                <div
+                  className={`h-full rounded-full transition-all duration-500 ${gp.isGenerating ? 'bg-emerald-500' : 'bg-emerald-600'}`}
+                  style={{ width: `${progressPercent}%` }}
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Current table */}
+          {gp.currentTable && gp.isGenerating && (
+            <div className="flex items-center gap-1.5 text-[9px]">
+              <div className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+              <span className="text-muted-foreground">Streaming into</span>
+              <span className="font-mono font-semibold text-emerald-600 dark:text-emerald-400">[{gp.currentTable}]</span>
+              <span className="text-muted-foreground">—</span>
+              <span className="font-mono">{gp.totalInserted.toLocaleString()}</span>
+              <span className="text-muted-foreground">/ {gp.targetRows.toLocaleString()} rows</span>
+            </div>
+          )}
+
+          {/* Status messages */}
+          {gp.statusMessages.length > 0 && (
+            <div className="space-y-0.5 pl-1">
+              {gp.statusMessages.slice(-5).map((msg, i) => (
+                <div key={i} className="text-[9px] flex items-center gap-1">
+                  {msg.startsWith('[') && msg.includes('rows inserted') ? (
+                    <span className="text-emerald-600 dark:text-emerald-400 font-medium">{msg}</span>
+                  ) : msg.startsWith('Error') ? (
+                    <span className="text-destructive font-medium">{msg}</span>
+                  ) : msg.startsWith('Generation complete') ? (
+                    <span className="text-emerald-600 dark:text-emerald-400 font-semibold">{msg}</span>
+                  ) : (
+                    <span className="text-muted-foreground">{msg}</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Summary when complete */}
+          {!gp.isGenerating && gp.tablesGenerated > 0 && (
+            <div className="flex items-center gap-2 text-[9px] text-muted-foreground pt-0.5 border-t border-border/50">
+              <span>{gp.tablesGenerated} tables</span>
+              <span>·</span>
+              <span>{gp.totalInserted.toLocaleString()} rows</span>
+            </div>
+          )}
+        </div>
+      )
+    }
+
+    let content = message.content
+    if (!content) {
+      if (message.isStreaming) {
+        return (
+          <div className="flex items-center gap-2">
+            <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+            <span className="text-xs text-muted-foreground">Thinking...</span>
+          </div>
+        )
+      }
+      return null
+    }
+
+    // Clean any residual raw JSON blocks — also during streaming
+    content = cleanDisplayText(content)
+    // Strip <think/> and <thinking/> tags that may appear in streaming
+    content = content.replace(/<think[\s\S]*?<\/think>/gi, '')
+    content = content.replace(/<thinking[\s\S]*?<\/thinking>/gi, '')
+    content = content.trim()
+
+    if (!content) return null
+
+    return <ShowMoreText content={content} isStreaming={message.isStreaming} />
   }
 
   // ─── Data editing state ───
@@ -2123,33 +2303,166 @@ function StudioPageInner({
         style={panelVisible ? { width: chatWidth } : undefined}
       >
         {/* Chat Header */}
-        <ChatHeader
-          isLiveDbMode={isLiveDbMode}
-          activeConnectionName={activeConnectionName}
-          activeConnectionDialect={activeConnectionDialect}
-          conversations={conversations}
-          activeConversationId={activeConversationId}
-          historyOpen={historyOpen}
-          onHistoryOpenChange={setHistoryOpen}
-          onNewChat={startNewChat}
-          onLoadConversation={(conv) => loadConversation(conv as SavedConversation)}
-          onDeleteConversation={deleteConversation}
-          onClearAllConversations={() => {
-            setConversations([])
-            persistSavedConversations([])
-            if (activeConversationIdRef.current) {
-              activeConversationIdRef.current = null
-              setActiveConversationId(null)
-            }
-            toast.success('Conversation history cleared')
-          }}
-          onShowShortcuts={() => setShowShortcuts(true)}
-          onTogglePanel={() => setPanelVisible(false)}
-          loading={loading}
-          panelVisible={panelVisible}
-          hasGeneratedData={hasGeneratedData}
-          tableCount={Object.keys(generatedData).length}
-        />
+        <div className="px-3 py-2.5 border-b flex items-center justify-between bg-card shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className={`h-6 w-6 rounded-lg flex items-center justify-center shrink-0 ${isLiveDbMode ? 'bg-gradient-to-br from-sky-500 to-indigo-600' : 'bg-gradient-to-br from-amber-500 to-red-600'}`}>
+              {isLiveDbMode ? <PlugZap className="h-3 w-3 text-white" /> : <Sparkles className="h-3 w-3 text-white" />}
+            </div>
+            <div className="min-w-0">
+              <h2 className="text-xs font-semibold truncate">
+                {isLiveDbMode ? (activeConnectionName || 'Live DB') : 'SynthForge AI'}
+              </h2>
+              <p className="text-[9px] text-muted-foreground truncate">
+                {isLiveDbMode
+                  ? `LIVE ${activeConnectionDialect || 'postgres'} · CRUD mode`
+                  : 'DeepSeek v4 · streaming'}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-5 w-5 p-0"
+              onClick={startNewChat}
+              title="New Chat (⌘K)"
+            >
+              <Plus className="h-3 w-3" />
+            </Button>
+            {/* ─── Conversation History dropdown ─── */}
+            {/* Controlled so we can close it programmatically after loading a
+                conversation. Uses <div> items (not <DropdownMenuItem>) for the
+                conversation rows so the nested delete button can stopPropagation
+                without dismissing the menu. */}
+            <DropdownMenu open={historyOpen} onOpenChange={setHistoryOpen}>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-5 w-5 p-0 relative"
+                  title="Conversation History"
+                >
+                  <History className="h-3 w-3" />
+                  {conversations.length > 0 && (
+                    <span className="absolute -top-1 -right-1 bg-amber-500 text-white text-[8px] font-bold rounded-full h-3 min-w-3 px-0.5 flex items-center justify-center leading-none">
+                      {conversations.length > 99 ? '99+' : conversations.length}
+                    </span>
+                  )}
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="w-80">
+                {conversations.length === 0 ? (
+                  <div className="px-2 py-4 text-center text-[11px] text-muted-foreground">
+                    <History className="h-5 w-5 mx-auto mb-1.5 opacity-40" />
+                    No saved conversations yet
+                  </div>
+                ) : (
+                  <>
+                    <div className="px-2 py-1 text-[10px] font-semibold text-muted-foreground flex items-center justify-between">
+                      <span>Recent Conversations</span>
+                      <Badge variant="secondary" className="text-[9px] h-3.5 px-1 leading-none">
+                        {conversations.length}
+                      </Badge>
+                    </div>
+                    <DropdownMenuSeparator />
+                    <div className="max-h-80 overflow-y-auto">
+                      {conversations.map((conv) => {
+                        const isActive = conv.id === activeConversationId
+                        return (
+                          <div
+                            key={conv.id}
+                            className={cn(
+                              'group flex items-start gap-2 px-2 py-1.5 rounded-sm cursor-pointer mx-0.5',
+                              isActive ? 'bg-accent' : 'hover:bg-accent',
+                            )}
+                            onClick={() => { loadConversation(conv); setHistoryOpen(false) }}
+                          >
+                            <MessageSquare className="h-3 w-3 mt-0.5 shrink-0 text-muted-foreground" />
+                            <div className="flex-1 min-w-0">
+                              <div className="text-[11px] font-medium truncate">{conv.title}</div>
+                              <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                                <Clock className="h-2.5 w-2.5 text-muted-foreground shrink-0" />
+                                <span className="text-[9px] text-muted-foreground">{relativeTime(conv.updatedAt)}</span>
+                                {conv.databaseName && (
+                                  <Badge variant="outline" className="text-[8px] h-3 px-1 gap-0.5 leading-none shrink-0">
+                                    <Database className="h-2 w-2" />
+                                    {conv.databaseName.length > 12 ? conv.databaseName.slice(0, 12) + '…' : conv.databaseName}
+                                  </Badge>
+                                )}
+                              </div>
+                            </div>
+                            <button
+                              className="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 transition-opacity shrink-0 p-0.5"
+                              onClick={(e) => { e.stopPropagation(); deleteConversation(conv.id) }}
+                              title="Delete conversation"
+                              aria-label="Delete conversation"
+                            >
+                              <X className="h-3 w-3" />
+                            </button>
+                          </div>
+                        )
+                      })}
+                    </div>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      className="text-[11px] text-destructive focus:text-destructive"
+                      onClick={() => {
+                        setConversations([])
+                        persistSavedConversations([])
+                        if (activeConversationIdRef.current) {
+                          activeConversationIdRef.current = null
+                          setActiveConversationId(null)
+                        }
+                        toast.success('Conversation history cleared')
+                      }}
+                    >
+                      <Trash2 className="h-3 w-3 mr-2" />
+                      Clear all history
+                    </DropdownMenuItem>
+                  </>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-5 w-5 p-0"
+              onClick={() => setShowShortcuts(true)}
+              title="Keyboard Shortcuts (⌘/)"
+            >
+              <Keyboard className="h-3 w-3" />
+            </Button>
+            {panelVisible && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-5 w-5 p-0"
+                onClick={() => setPanelVisible(false)}
+                title="Hide Panel (⌘B)"
+              >
+                <PanelRightClose className="h-3 w-3" />
+              </Button>
+            )}
+            {isLiveDbMode && (
+              <Badge variant="outline" className="text-[9px] gap-0.5 text-sky-700 dark:text-sky-400 border-sky-400 h-5 animate-pulse">
+                <PlugZap className="h-2.5 w-2.5" />
+                LIVE
+              </Badge>
+            )}
+            {loading && (
+              <Badge variant="secondary" className="text-[9px] gap-0.5 animate-pulse h-5">
+                <Brain className="h-2.5 w-2.5" />
+                Thinking
+              </Badge>
+            )}
+            {hasGeneratedData && !loading && (
+              <Badge variant="outline" className="text-[9px] gap-0.5 text-emerald-600 border-emerald-300 h-5">
+                <Database className="h-2.5 w-2.5" />
+                {Object.keys(generatedData).length} tables
+              </Badge>
+            )}
+          </div>
+        </div>
 
         {/* Agent status bar */}
         {loading && messages.length > 0 && (() => {
@@ -2200,37 +2513,102 @@ function StudioPageInner({
         )}
 
         {/* Chat Messages */}
-        <div ref={chatContainerRef} onScroll={handleChatScroll} className="flex-1 overflow-y-auto px-2.5 py-3 space-y-2.5 scroll-smooth">
-          {/* Show "load more" indicator when there are older messages not rendered */}
-          {visibleCount < messages.length && (
-            <div className="text-center py-1.5">
-              <button
-                onClick={() => {
-                  const container = chatContainerRef.current
-                  if (!container) return
-                  const prevScrollHeight = container.scrollHeight
-                  setVisibleCount(prev => Math.min(prev + VISIBLE_INCREMENT, messages.length))
-                  requestAnimationFrame(() => {
-                    const newScrollHeight = container.scrollHeight
-                    container.scrollTop = newScrollHeight - prevScrollHeight
-                  })
-                }}
-                className="text-[10px] text-muted-foreground hover:text-foreground underline"
-              >
-                Load {Math.min(VISIBLE_INCREMENT, messages.length - visibleCount)} older messages
-              </button>
-            </div>
-          )}
-          {visibleMessages.map((message) => (
-            <MessageBubble
+        <div ref={chatContainerRef} className="flex-1 overflow-y-auto px-2.5 py-3 space-y-2.5 scroll-smooth">
+          {messages.map((message) => (
+            <div
               key={message.id}
-              message={message}
-              activeConnectionDialect={activeConnectionDialect}
-              onOptionClick={handleOptionClick}
-              onExecuteSqlBlock={(messageId, sql) => executeSqlBlock(messageId, sql)}
-              onCopy={copyToClipboard}
-              onOpenInEditor={(sql) => { setSqlEditor(sql); setActiveTab('sql') }}
-            />
+              className={`flex gap-1.5 ${message.role === 'user' ? 'justify-end' : ''}`}
+            >
+              {message.role === 'assistant' && (
+                <AgentIcon agentName={message.agentName} size="sm" />
+              )}
+              <div
+                className={`max-w-[88%] rounded-lg px-2.5 py-2 overflow-hidden ${
+                  message.role === 'user'
+                    ? 'bg-primary text-primary-foreground'
+                    : 'bg-muted/70'
+                }`}
+                style={{ overflowWrap: 'break-word', wordBreak: 'break-word' }}
+              >
+                {message.role === 'assistant' && (
+                  <p className="text-[9px] font-medium text-amber-600 dark:text-amber-400 mb-0.5 flex items-center gap-1">
+                    {message.agentName || 'Orchestrator'}
+                    {message.isStreaming && (
+                      <span className="flex items-center gap-0.5">
+                        <span className="inline-block h-1 w-1 rounded-full bg-amber-500 animate-pulse" />
+                        <span className="inline-block h-1 w-1 rounded-full bg-amber-500 animate-pulse [animation-delay:0.2s]" />
+                        <span className="inline-block h-1 w-1 rounded-full bg-amber-500 animate-pulse [animation-delay:0.4s]" />
+                      </span>
+                    )}
+                  </p>
+                )}
+                {renderMessageContent(message)}
+
+                {/* Interactive options buttons - show during streaming too, but disabled */}
+                {message.role === 'assistant' && message.interactiveOptions && (
+                  <div className="mt-2 space-y-1.5">
+                    <p className="text-[10px] font-medium text-muted-foreground">
+                      {message.interactiveOptions.question}
+                    </p>
+                    <div className="flex flex-wrap gap-1">
+                      {message.interactiveOptions.choices.map((choice) => (
+                        <button
+                          key={choice.value}
+                          onClick={() => handleOptionClick(choice)}
+                          disabled={message.isStreaming}
+                          className={`text-[10px] px-2.5 py-1 rounded-full border transition-colors ${
+                            message.isStreaming ? 'opacity-50 cursor-not-allowed' : ''
+                          } ${
+                            message.interactiveOptions!.multi
+                              ? 'border-violet-300 bg-violet-50 dark:bg-violet-950/30 text-violet-700 dark:text-violet-400 hover:bg-violet-100 dark:hover:bg-violet-950/50'
+                              : 'border-amber-300 bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-950/50'
+                          }`}
+                        >
+                          {choice.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* ─── SQL block(s) (live DB mode) ─── */}
+                {message.role === 'assistant' && message.sqlBlock && (
+                  <>
+                    {/* Render the primary SQL block (with execute button + result) */}
+                    <SqlBlockCard
+                      sql={message.sqlBlock}
+                      dialect={activeConnectionDialect}
+                      executing={message.sqlBlockExecuting}
+                      result={message.sqlBlockResult}
+                      onCopy={() => copyToClipboard(message.sqlBlock!)}
+                      onOpenInEditor={() => { setSqlEditor(message.sqlBlock!); setActiveTab('sql') }}
+                      onExecute={() => executeSqlBlock(message.id, message.sqlBlock!)}
+                    />
+                    {/* Render any additional SQL blocks as read-only previews
+                        (the user can copy them into the SQL editor to execute). */}
+                    {message.sqlBlocks && message.sqlBlocks.length > 1 && (
+                      <div className="mt-1.5 space-y-1">
+                        {message.sqlBlocks.slice(1).map((extraSql, idx) => (
+                          <SqlBlockCard
+                            key={idx}
+                            sql={extraSql}
+                            dialect={activeConnectionDialect}
+                            onCopy={() => copyToClipboard(extraSql)}
+                            onOpenInEditor={() => { setSqlEditor(extraSql); setActiveTab('sql') }}
+                            onExecute={() => executeSqlBlock(message.id, extraSql)}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+              {message.role === 'user' && (
+                <div className="h-5 w-5 rounded-full bg-primary flex items-center justify-center shrink-0 mt-0.5">
+                  <User className="h-2.5 w-2.5 text-primary-foreground" />
+                </div>
+              )}
+            </div>
           ))}
           {loading && messages.length > 0 && !messages[messages.length - 1]?.isStreaming && (
             <div className="flex gap-1.5">
@@ -2247,17 +2625,39 @@ function StudioPageInner({
         </div>
 
         {/* Chat Input */}
-        <ChatInput
-          value={input}
-          onChange={setInput}
-          onSend={() => sendMessage()}
-          onStop={handleStopGeneration}
-          disabled={loading}
-          connectionLoading={connectionLoading}
-          placeholder={isLiveDbMode ? 'Ask me to edit, delete, drop, or query your live DB...' : 'Describe the data you need...'}
-          inputRef={chatInputRef}
-          onKeyDown={handleKeyDown}
-        />
+        <div className="px-2.5 py-2 border-t bg-card shrink-0">
+          <div className="flex gap-1.5">
+            <Input
+              ref={chatInputRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder={isLiveDbMode ? 'Ask me to edit, delete, drop, or query your live DB...' : 'Describe the data you need...'}
+              disabled={loading || connectionLoading}
+              className="flex-1 text-xs h-8"
+            />
+            {loading ? (
+              <Button
+                onClick={handleStopGeneration}
+                size="sm"
+                variant="destructive"
+                className="h-8 w-8 p-0"
+                title="Stop generation"
+              >
+                <Square className="h-3.5 w-3.5" />
+              </Button>
+            ) : (
+              <Button
+                onClick={() => sendMessage()}
+                disabled={!input.trim()}
+                size="sm"
+                className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white h-8 w-8 p-0"
+              >
+                <Send className="h-3.5 w-3.5" />
+              </Button>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* ─── Resize Handle ─── */}
@@ -2427,17 +2827,99 @@ function StudioPageInner({
             rows) plus clickable table chips that select the table in the Data
             tab. Defaults open so the totals are visible immediately. */}
         {hasGeneratedData && (
-          <SchemaPreviewPanel
-            schema={generatedSchema}
-            data={generatedData}
-            selectedTable={selectedTable}
-            onSelectTable={(tableName) => {
-              setSelectedTable(tableName)
-              setVisibleRows(20)
-              setDataSearchQuery('')
-              setActiveTab('data')
-            }}
-          />
+          <Collapsible
+            open={schemaPanelOpen}
+            onOpenChange={setSchemaPanelOpen}
+            className="border-b bg-gradient-to-r from-amber-50/60 to-red-50/40 dark:from-amber-950/20 dark:to-red-950/10 shrink-0"
+          >
+            <CollapsibleTrigger asChild>
+              <button
+                type="button"
+                className="w-full flex items-center gap-2 px-3 py-1.5 hover:bg-amber-100/50 dark:hover:bg-amber-950/30 transition-colors text-left"
+              >
+                <div className="h-5 w-5 rounded-md bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center shrink-0">
+                  <Database className="h-2.5 w-2.5 text-white" />
+                </div>
+                <span className="text-[11px] font-semibold text-foreground">Schema</span>
+                {/* Totals summary — always visible so the user sees counts even
+                    when the panel is collapsed. */}
+                <div className="flex items-center gap-1 ml-1">
+                  <Badge variant="outline" className="text-[9px] gap-0.5 h-4 px-1 border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30">
+                    <Table2 className="h-2 w-2" />
+                    {schemaStats.tableCount} tables
+                  </Badge>
+                  <Badge variant="outline" className="text-[9px] gap-0.5 h-4 px-1 border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30">
+                    <Columns className="h-2 w-2" />
+                    {schemaStats.columnCount} cols
+                  </Badge>
+                  <Badge variant="outline" className="text-[9px] gap-0.5 h-4 px-1 border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30">
+                    <Database className="h-2 w-2" />
+                    {schemaStats.rowCount.toLocaleString()} rows
+                  </Badge>
+                </div>
+                <ChevronDown className={`h-3 w-3 ml-auto text-muted-foreground transition-transform ${schemaPanelOpen ? 'rotate-180' : ''}`} />
+              </button>
+            </CollapsibleTrigger>
+            <CollapsibleContent>
+              <div className="px-3 pb-2 pt-0.5">
+                {/* Column-type breakdown — e.g. "3 uuid, 2 varchar, 1 timestamp" */}
+                {schemaStats.typeBreakdown.size > 0 && (
+                  <div className="flex items-center gap-1 flex-wrap mb-1.5">
+                    <span className="text-[9px] text-muted-foreground uppercase tracking-wider">Types:</span>
+                    {[...schemaStats.typeBreakdown.entries()]
+                      .sort((a, b) => b[1] - a[1])
+                      .slice(0, 8)
+                      .map(([type, count]) => (
+                        <Badge key={type} variant="secondary" className="text-[8px] font-mono px-1 py-0 h-3.5 bg-amber-100/80 dark:bg-amber-900/30 text-amber-800 dark:text-amber-300">
+                          {count} {type}
+                        </Badge>
+                      ))}
+                  </div>
+                )}
+                <Separator className="mb-1.5 bg-amber-200/50 dark:bg-amber-800/30" />
+                {/* Compact scrollable list of tables — clickable to select in Data tab */}
+                <div className="max-h-32 overflow-y-auto pr-1 space-y-0.5
+                                [&::-webkit-scrollbar]:w-1.5
+                                [&::-webkit-scrollbar-thumb]:rounded-full
+                                [&::-webkit-scrollbar-thumb]:bg-amber-300/60
+                                dark:[&::-webkit-scrollbar-thumb]:bg-amber-700/50">
+                  {generatedSchema.map((table) => {
+                    const rows = generatedData[table.name]
+                    const rowCount = Array.isArray(rows) ? rows.length : 0
+                    const isActive = selectedTable === table.name
+                    return (
+                      <button
+                        key={table.name}
+                        type="button"
+                        onClick={() => {
+                          setSelectedTable(table.name)
+                          setVisibleRows(20)
+                          setDataSearchQuery('')
+                          setActiveTab('data')
+                        }}
+                        className={`w-full flex items-center gap-1.5 px-1.5 py-1 rounded text-[10px] transition-colors group ${
+                          isActive
+                            ? 'bg-amber-100 dark:bg-amber-900/40 text-amber-900 dark:text-amber-200'
+                            : 'hover:bg-amber-50 dark:hover:bg-amber-950/30 text-foreground/80'
+                        }`}
+                        title={`${table.name} — ${table.columns.length} columns, ${rowCount} rows`}
+                      >
+                        <Table2 className={`h-2.5 w-2.5 shrink-0 ${isActive ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground'}`} />
+                        <span className="font-mono font-medium truncate flex-1 text-left">{table.name}</span>
+                        <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 gap-0.5 border-amber-300/60 dark:border-amber-700/50 text-muted-foreground shrink-0">
+                          <Columns className="h-2 w-2" />
+                          {table.columns.length}
+                        </Badge>
+                        <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 min-w-[20px] text-center shrink-0 border-amber-300/60 dark:border-amber-700/50 text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30">
+                          {rowCount}
+                        </Badge>
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
         )}
 
         {hasGeneratedData ? (
@@ -2461,98 +2943,1070 @@ function StudioPageInner({
 
             {/* ─── Data Tab ─── */}
             <TabsContent value="data" className="flex-1 overflow-hidden m-0">
-              <DataTab
-                schema={generatedSchema}
-                data={generatedData}
-                selectedTable={selectedTable}
-                currentTableData={currentTableData}
-                currentTableColumns={currentTableColumns}
-                currentTableSchema={currentTableSchema}
-                headerColumns={headerColumns}
-                displayedRows={displayedRows}
-                filteredTableData={filteredTableData}
-                hasMoreRows={hasMoreRows}
-                dataSearchQuery={dataSearchQuery}
-                visibleRows={visibleRows}
-                selectedRows={selectedRows}
-                editingCell={editingCell}
-                editingCellValue={editingCellValue}
-                setDataSearchQuery={setDataSearchQuery}
-                setVisibleRows={setVisibleRows}
-                setSelectedRows={setSelectedRows}
-                setEditingCell={setEditingCell}
-                setEditingCellValue={setEditingCellValue}
-                isLiveDbMode={isLiveDbMode}
-                onSelectTable={(name) => { setSelectedTable(name); setVisibleRows(20); setDataSearchQuery('') }}
-                onViewInExplorer={() => setActiveTab('explorer')}
-                onAddTableClick={() => setAddTableDialogOpen(true)}
-                onAddColumnClick={() => setAddColumnDialogOpen(true)}
-                onAddRow={handleAddRow}
-                onDeleteSelectedRows={handleDeleteSelectedRows}
-                onCellEdit={handleCellEdit}
-                onCopyToClipboard={copyToClipboard}
-                onRefreshSchema={async () => {
-                  if (!activeConnectionId) return
-                  try {
-                    toast.info('Refreshing schema from live DB...')
-                    const refresh = await apiGet<{
-                      schema?: SchemaTable[]
-                      data?: Record<string, unknown[]>
-                    }>(`/api/connections/${activeConnectionId}?include=introspect`, { cacheTtl: 0, force: true, timeout: 30000 })
-                    if (refresh.schema) setGeneratedSchema(refresh.schema)
-                    if (refresh.data) setGeneratedData(refresh.data)
-                    setSelectedTable('')
-                    toast.success(`Loaded ${refresh.schema?.length || 0} tables from live DB`)
-                  } catch (err) {
-                    toast.error(err instanceof Error ? err.message : 'Failed to refresh')
-                  }
-                }}
-                onExportJSON={exportAsJSON}
-                onExportCSV={exportAsCSV}
-                onExportSQL={exportAsSQL}
-              />
+              <div className="flex h-full">
+                {/* Table selector sidebar */}
+                <div className="w-44 border-r bg-muted/30 flex flex-col shrink-0">
+                  <div className="px-2 py-1.5 border-b flex items-center justify-between">
+                    <div className="flex items-center gap-1 text-muted-foreground">
+                      <Layers className="h-3 w-3" />
+                      <span className="text-[10px] font-semibold uppercase tracking-wider">Tables</span>
+                    </div>
+                    <div className="flex items-center gap-0.5">
+                      {isLiveDbMode && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-4 w-4 p-0"
+                          onClick={async () => {
+                            if (!activeConnectionId) return
+                            try {
+                              toast.info('Refreshing schema from live DB...')
+                              const refresh = await apiGet<{
+                                schema?: SchemaTable[]
+                                data?: Record<string, unknown[]>
+                              }>(`/api/connections/${activeConnectionId}?include=introspect`, { cacheTtl: 0, force: true, timeout: 30000 })
+                              if (refresh.schema) setGeneratedSchema(refresh.schema)
+                              if (refresh.data) setGeneratedData(refresh.data)
+                              setSelectedTable('')
+                              toast.success(`Loaded ${refresh.schema?.length || 0} tables from live DB`)
+                            } catch (err) {
+                              toast.error(err instanceof Error ? err.message : 'Failed to refresh')
+                            }
+                          }}
+                          title="Refresh schema from live DB"
+                        >
+                          <RotateCcw className="h-2.5 w-2.5" />
+                        </Button>
+                      )}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-4 w-4 p-0"
+                        onClick={() => setAddTableDialogOpen(true)}
+                        title="Add Table"
+                      >
+                        <Plus className="h-2.5 w-2.5" />
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="flex-1 overflow-y-auto p-1 space-y-0.5 max-h-96">
+                    {Object.entries(generatedData).map(([tableName, rows]) => {
+                      const rowCount = Array.isArray(rows) ? rows.length : 0
+                      const isActive = selectedTable === tableName
+                      return (
+                        <button
+                          key={tableName}
+                          onClick={() => { setSelectedTable(tableName); setVisibleRows(20); setDataSearchQuery('') }}
+                          className={`w-full text-left px-2 py-1 rounded text-[11px] font-medium transition-colors flex items-center gap-1.5 group ${
+                            isActive
+                              ? 'bg-accent text-accent-foreground'
+                              : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
+                          }`}
+                          title={`${tableName} — ${rowCount} row${rowCount === 1 ? '' : 's'}`}
+                        >
+                          <Table2 className={`h-2.5 w-2.5 shrink-0 ${isActive ? 'text-amber-600 dark:text-amber-400' : ''}`} />
+                          <span className="truncate">{tableName}</span>
+                          {/* Row count badge — amber-tinted so it reads as a row
+                              count at a glance (matches the example "users (10)"). */}
+                          <Badge
+                            variant="outline"
+                            className={`ml-auto text-[8px] px-1 py-0 min-w-[20px] text-center h-3.5 shrink-0 transition-colors ${
+                              isActive
+                                ? 'border-amber-400 dark:border-amber-600 bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300'
+                                : 'border-amber-300/60 dark:border-amber-700/40 bg-amber-50 dark:bg-amber-950/20 text-amber-700 dark:text-amber-400 group-hover:bg-amber-100 dark:group-hover:bg-amber-900/40'
+                            }`}
+                          >
+                            {rowCount}
+                          </Badge>
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+
+                {/* Data grid */}
+                <div className="flex-1 flex flex-col min-w-0">
+                  {!selectedTable ? (
+                    // ─── Empty state 1: no table selected ───
+                    <div className="flex-1 flex items-center justify-center p-4">
+                      <div className="text-center max-w-sm">
+                        <div className="mx-auto mb-3 h-10 w-10 rounded-full bg-primary/10 flex items-center justify-center">
+                          <Database className="h-5 w-5 text-primary" />
+                        </div>
+                        <p className="text-sm font-medium text-foreground">Pick a table on the left</p>
+                        <p className="mt-1 text-[11px] text-muted-foreground">
+                          Tables you generate or import will appear in the sidebar. Column headers are tinted so you can spot relationships at a glance:
+                        </p>
+                        <div className="mt-3 flex items-center justify-center gap-1.5 text-[10px]">
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-primary/40 bg-primary/10 text-primary">
+                            <KeyRound className="h-2.5 w-2.5" />PK
+                          </span>
+                          <span className="text-muted-foreground">primary key</span>
+                          <span className="mx-0.5 text-muted-foreground/50">·</span>
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-400">
+                            <Link2 className="h-2.5 w-2.5" />FK
+                          </span>
+                          <span className="text-muted-foreground">foreign key</span>
+                        </div>
+                      </div>
+                    </div>
+                  ) : headerColumns.length === 0 ? (
+                    // ─── Empty state 2: table selected but no columns yet ───
+                    <div className="flex-1 flex items-center justify-center p-4">
+                      <div className="text-center max-w-sm">
+                        <div className="mx-auto mb-3 h-10 w-10 rounded-full bg-muted flex items-center justify-center">
+                          <Table2 className="h-5 w-5 text-muted-foreground" />
+                        </div>
+                        <p className="text-sm font-medium text-foreground">No columns in this table yet</p>
+                        <p className="mt-1 text-[11px] text-muted-foreground mb-3">
+                          Add a column to start building out the schema for &ldquo;{selectedTable}&rdquo;.
+                        </p>
+                        <Button variant="outline" size="sm" className="h-7 text-[11px] gap-1" onClick={() => setAddColumnDialogOpen(true)}>
+                          <Plus className="h-3 w-3" />Add Column
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    // ─── Table selected with columns (may have 0 rows) ───
+                    <>
+                      <div className="px-2.5 py-1.5 border-b flex items-center justify-between shrink-0 gap-2">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <Table2 className="h-3.5 w-3.5 text-amber-600 shrink-0" />
+                          <div className="flex flex-col min-w-0 leading-tight">
+                            <span className="text-xs font-semibold truncate">{selectedTable}</span>
+                            <Badge variant="outline" className="text-[9px] px-1 py-0 h-3.5 w-fit">
+                              {currentTableData.length} row{currentTableData.length === 1 ? '' : 's'}
+                            </Badge>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-0.5 shrink-0">
+                          <Button variant="ghost" size="sm" className="h-5 text-[9px] gap-0.5 px-1" onClick={handleAddRow} title="Add Row">
+                            <Plus className="h-2.5 w-2.5" />Row
+                          </Button>
+                          <Button variant="ghost" size="sm" className="h-5 text-[9px] gap-0.5 px-1" onClick={() => setAddColumnDialogOpen(true)} title="Add Column">
+                            <Plus className="h-2.5 w-2.5" />Col
+                          </Button>
+                          {selectedRows.size > 0 && (
+                            <Button variant="ghost" size="sm" className="h-5 text-[9px] gap-0.5 px-1 text-destructive hover:text-destructive" onClick={handleDeleteSelectedRows} title="Delete Selected Rows">
+                              <Trash2 className="h-2.5 w-2.5" />Del
+                            </Button>
+                          )}
+                          <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => copyToClipboard(JSON.stringify(currentTableData, null, 2))} title="Copy as JSON">
+                            <Copy className="h-2.5 w-2.5" />
+                          </Button>
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button variant="ghost" size="sm" className="h-5 w-5 p-0" title="Download table">
+                                <Download className="h-2.5 w-2.5" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end" className="text-xs">
+                              <DropdownMenuItem onClick={() => exportAsJSON(currentTableData, `${selectedTable}.json`)}>
+                                <FileJson className="mr-2 h-3 w-3" />
+                                JSON (.json)
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => exportAsCSV(currentTableData as Record<string, unknown>[], `${selectedTable}.csv`)}>
+                                <FileSpreadsheet className="mr-2 h-3 w-3" />
+                                CSV (.csv)
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={() => {
+                                const singleSchema = generatedSchema.find(s => s.name === selectedTable)
+                                const singleData = selectedTable ? { [selectedTable]: generatedData[selectedTable] || [] } : {}
+                                exportAsSQL(singleSchema ? [singleSchema] : [], singleData, `${selectedTable}.sql`)
+                              }}>
+                                <FileText className="mr-2 h-3 w-3" />
+                                SQL Dump (.sql)
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                          <span className="hidden sm:inline-flex items-center gap-1 text-[9px] text-muted-foreground/80 border border-border rounded px-1.5 py-0.5 bg-muted/30 ml-1" title="Double-click any cell to edit it in place">
+                            <MousePointerClick className="h-2.5 w-2.5" />
+                            Double-click a cell to edit
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* ─── Table Info card + row search ───
+                          Compact at-a-glance summary of the selected table
+                          (column count, row count, type breakdown) plus a
+                          "View in Explorer" shortcut, and a search box that
+                          filters rows within this table by any cell value. */}
+                      <div className="px-2.5 py-1.5 border-b bg-muted/20 shrink-0 flex items-center gap-2 flex-wrap">
+                        <Card className="px-2 py-1 shadow-none border-amber-200/60 dark:border-amber-800/40 bg-amber-50/40 dark:bg-amber-950/20">
+                          <CardContent className="p-0 flex items-center gap-2">
+                            <Table2 className="h-3 w-3 text-amber-600 dark:text-amber-400 shrink-0" />
+                            <span className="text-[11px] font-bold text-foreground truncate max-w-[120px]">{selectedTable}</span>
+                            <Separator orientation="vertical" className="h-3.5 bg-amber-300/50 dark:bg-amber-700/40" />
+                            <span className="text-[9px] text-muted-foreground">
+                              <span className="font-semibold text-foreground">{currentTableSchema?.columns.length || headerColumns.length}</span> cols
+                            </span>
+                            <span className="text-[9px] text-muted-foreground">
+                              <span className="font-semibold text-foreground">{currentTableData.length.toLocaleString()}</span> rows
+                            </span>
+                            {currentTableSchema && currentTableSchema.columns.length > 0 && (
+                              <>
+                                <Separator orientation="vertical" className="h-3.5 bg-amber-300/50 dark:bg-amber-700/40" />
+                                <div className="flex items-center gap-0.5 flex-wrap max-w-[280px]">
+                                  {(() => {
+                                    const counts = new Map<string, number>()
+                                    for (const c of currentTableSchema.columns) {
+                                      const norm = c.type.toLowerCase().replace(/\(.*\)/g, '').trim() || c.type
+                                      counts.set(norm, (counts.get(norm) || 0) + 1)
+                                    }
+                                    return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([t, n]) => (
+                                      <Badge key={t} variant="outline" className="text-[8px] font-mono px-1 py-0 h-3 border-amber-300/60 dark:border-amber-700/40 text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30">
+                                        {n} {t}
+                                      </Badge>
+                                    ))
+                                  })()}
+                                </div>
+                              </>
+                            )}
+                          </CardContent>
+                        </Card>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-5 text-[9px] gap-0.5 px-1.5 text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/30 ml-auto"
+                          onClick={() => setActiveTab('explorer')}
+                          title="View this table in the Explorer tab"
+                        >
+                          <ArrowRight className="h-2.5 w-2.5" />
+                          View in Explorer
+                        </Button>
+                        <div className="relative w-40">
+                          <Search className="absolute left-1.5 top-1/2 -translate-y-1/2 h-2.5 w-2.5 text-muted-foreground pointer-events-none" />
+                          <Input
+                            value={dataSearchQuery}
+                            onChange={(e) => { setDataSearchQuery(e.target.value); setVisibleRows(20) }}
+                            placeholder="Filter rows…"
+                            className="h-5 text-[10px] pl-6 pr-5"
+                          />
+                          {dataSearchQuery && (
+                            <button
+                              onClick={() => setDataSearchQuery('')}
+                              className="absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                              title="Clear filter"
+                            >
+                              <X className="h-2.5 w-2.5" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex-1 overflow-auto max-h-[500px]">
+                        <table className="w-full text-[11px] border-collapse">
+                          <thead className="sticky top-0 z-10 bg-background">
+                            <tr className="border-b">
+                              <th className="text-left py-1.5 px-1 font-medium text-muted-foreground bg-muted/50 border-r border-b border-border w-6">
+                                <input
+                                  type="checkbox"
+                                  className="h-3 w-3"
+                                  checked={selectedRows.size === displayedRows.length && displayedRows.length > 0}
+                                  onChange={(e) => {
+                                    if (e.target.checked) {
+                                      setSelectedRows(new Set(displayedRows.map((_, i) => i)))
+                                    } else {
+                                      setSelectedRows(new Set())
+                                    }
+                                  }}
+                                />
+                              </th>
+                              <th className="text-left py-1.5 px-2 font-medium text-muted-foreground bg-muted/50 border-r border-b border-border w-8">#</th>
+                              {headerColumns.map((col) => {
+                                const kind = getDataColumnKind(col)
+                                const colType = currentTableSchema?.columns.find(c => c.name === col)?.type
+                                const hint = columnPlainEnglishHint(col)
+                                return (
+                                  <th
+                                    key={col}
+                                    className={cn(
+                                      'text-left align-top py-1.5 px-2 font-medium whitespace-nowrap border-r last:border-r-0 min-w-[104px]',
+                                      kind === 'pk' && 'bg-primary/10 border-b-2 border-b-primary',
+                                      kind === 'fk' && 'bg-sky-500/10 dark:bg-sky-950/35 border-b-2 border-b-sky-500/55',
+                                      kind === 'regular' && 'bg-muted/40 border-b border-border',
+                                    )}
+                                  >
+                                    <div className="flex flex-col gap-0.5">
+                                      <div className="flex items-center gap-1">
+                                        {kind === 'pk' && (
+                                          <Badge variant="outline" className="text-[7px] px-1 py-0 h-3.5 gap-0.5 border-primary/40 bg-primary/10 text-primary shrink-0">
+                                            <KeyRound className="h-2 w-2" />PK
+                                          </Badge>
+                                        )}
+                                        {kind === 'fk' && (
+                                          <Badge variant="outline" className="text-[7px] px-1 py-0 h-3.5 gap-0.5 border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-400 shrink-0">
+                                            <Link2 className="h-2 w-2" />FK
+                                          </Badge>
+                                        )}
+                                        <span className="text-[11px] font-semibold text-foreground">{humanizeColumnName(col)}</span>
+                                      </div>
+                                      <div className="flex items-center gap-1">
+                                        <span className="font-mono text-[9px] text-muted-foreground">{col}</span>
+                                        {colType && (
+                                          <Badge variant="outline" className="text-[7px] px-0.5 py-0 h-3 font-mono">
+                                            {colType}
+                                          </Badge>
+                                        )}
+                                      </div>
+                                      {hint && (
+                                        <p className="text-[8px] text-muted-foreground/80 leading-tight">{hint}</p>
+                                      )}
+                                    </div>
+                                  </th>
+                                )
+                              })}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {displayedRows.length === 0 ? (
+                              // ─── Empty state 3: table selected, columns exist, no rows ───
+                              <tr>
+                                <td colSpan={headerColumns.length + 2} className="py-6 text-center text-xs text-muted-foreground italic">
+                                  {dataSearchQuery
+                                    ? <>No rows match <span className="font-semibold not-italic text-foreground">&ldquo;{dataSearchQuery}&rdquo;</span>. <button onClick={() => setDataSearchQuery('')} className="text-amber-600 dark:text-amber-400 underline not-italic">Clear filter</button></>
+                                    : <>No rows yet. Click <span className="font-semibold not-italic text-foreground">Row</span> above to add one.</>}
+                                </td>
+                              </tr>
+                            ) : (
+                              displayedRows.map((row, i) => (
+                                <tr key={i} className={cn(
+                                  'border-b transition-colors',
+                                  // Zebra striping — alternate rows get a subtle
+                                  // muted background so wide tables are easier to
+                                  // scan. Selected rows override with amber tint.
+                                  i % 2 === 1 ? 'bg-muted/30' : 'bg-background',
+                                  'hover:bg-amber-50/60 dark:hover:bg-amber-950/20',
+                                  selectedRows.has(i) && 'bg-amber-50 dark:bg-amber-950/30',
+                                )}>
+                                  <td className="py-1 px-1 border-r bg-muted/20">
+                                    <input
+                                      type="checkbox"
+                                      className="h-3 w-3"
+                                      checked={selectedRows.has(i)}
+                                      onChange={(e) => {
+                                        setSelectedRows(prev => {
+                                          const next = new Set(prev)
+                                          if (e.target.checked) next.add(i)
+                                          else next.delete(i)
+                                          return next
+                                        })
+                                      }}
+                                    />
+                                  </td>
+                                  <td className="py-1 px-2 text-muted-foreground font-mono text-[9px] border-r bg-muted/20">
+                                    {i + 1}
+                                  </td>
+                                  {currentTableColumns.map((colName) => {
+                                    const val = (row as Record<string, unknown>)[colName]
+                                    const kind = getDataColumnKind(colName)
+                                    return (
+                                      <td
+                                        key={colName}
+                                        className={cn(
+                                          'py-1 px-2 font-mono text-[10px] whitespace-nowrap max-w-[180px] truncate border-r last:border-r-0',
+                                          kind === 'pk' && 'bg-primary/[0.07]',
+                                          kind === 'fk' && 'bg-sky-500/[0.08] dark:bg-sky-950/25',
+                                        )}
+                                        onDoubleClick={() => {
+                                          setEditingCell({ row: i, col: colName })
+                                          setEditingCellValue(val === null ? '' : String(val))
+                                        }}
+                                      >
+                                        {editingCell?.row === i && editingCell?.col === colName ? (
+                                          <input
+                                            type="text"
+                                            className="w-full h-5 text-[10px] font-mono px-1 border border-amber-400 rounded bg-background focus:outline-none"
+                                            value={editingCellValue}
+                                            autoFocus
+                                            onChange={(e) => setEditingCellValue(e.target.value)}
+                                            onBlur={() => handleCellEdit(i, colName, editingCellValue)}
+                                            onKeyDown={(e) => {
+                                              if (e.key === 'Enter') handleCellEdit(i, colName, editingCellValue)
+                                              if (e.key === 'Escape') setEditingCell(null)
+                                            }}
+                                          />
+                                        ) : val === null ? (
+                                          <span className="text-muted-foreground italic">NULL</span>
+                                        ) : typeof val === 'boolean' ? (
+                                          <Badge variant={val ? 'default' : 'secondary'} className="text-[8px] px-1 py-0">
+                                            {String(val)}
+                                          </Badge>
+                                        ) : typeof val === 'number' ? (
+                                          <span className="text-blue-600 dark:text-blue-400">{String(val)}</span>
+                                        ) : (
+                                          String(val ?? '')
+                                        )}
+                                      </td>
+                                    )
+                                  })}
+                                </tr>
+                              ))
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                      {/* ─── Data grid footer ───
+                          Always-visible "Rows: X of Y" counter so the user
+                          knows how many rows are shown vs. the total (after
+                          any search filter is applied). When more rows are
+                          available below the visibleRows cap, also shows a
+                          "Load more" button on the right. */}
+                      <div className="px-2.5 py-1.5 border-t bg-muted/30 shrink-0 flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground min-w-0">
+                          <span className="shrink-0">
+                            Rows: <span className="font-semibold text-foreground">{displayedRows.length.toLocaleString()}</span>
+                            {' '}of{' '}
+                            <span className="font-semibold text-foreground">{filteredTableData.length.toLocaleString()}</span>
+                          </span>
+                          {dataSearchQuery && currentTableData.length !== filteredTableData.length && (
+                            <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 gap-0.5 border-amber-300/60 dark:border-amber-700/40 text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30 shrink-0">
+                              <Search className="h-2 w-2" />
+                              filtered from {currentTableData.length.toLocaleString()}
+                            </Badge>
+                          )}
+                        </div>
+                        {hasMoreRows && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="text-[10px] h-6 shrink-0"
+                            onClick={() => setVisibleRows(prev => prev + 20)}
+                          >
+                            Load more ({filteredTableData.length - visibleRows} remaining)
+                            <ChevronDown className="ml-1 h-2.5 w-2.5" />
+                          </Button>
+                        )}
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
             </TabsContent>
 
             {/* ─── SQL Tab ─── */}
             <TabsContent value="sql" className="flex-1 overflow-hidden m-0">
-              <SqlTab
-                sqlEditor={sqlEditor}
-                setSqlEditor={setSqlEditor}
-                sqlResults={sqlResults}
-                setSqlResults={setSqlResults}
-                sqlExecuting={sqlExecuting}
-                queryHistory={queryHistory}
-                setQueryHistory={setQueryHistory}
-                savedQueries={savedQueries}
-                setSavedQueries={setSavedQueries}
-                databaseName={databaseName}
-                onExecute={executeSQL}
-                onGenerateSchemaSQL={generateSchemaSQL}
-                onAIGenerate={generateAIQL}
-                onCopy={copyToClipboard}
-                onSaveCurrentQuery={saveCurrentQuery}
-              />
+              <div className="flex flex-col h-full">
+                {/* SQL Editor */}
+                <div className="flex-1 flex flex-col min-h-0">
+                  <div className="px-3 py-1.5 border-b flex items-center justify-between shrink-0 bg-muted/30">
+                    <span className="text-[10px] font-medium text-muted-foreground">SQL Editor</span>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-5 text-[9px] gap-0.5 px-1.5"
+                        onClick={generateAIQL}
+                        title="Ask AI to generate SQL"
+                      >
+                        <Wand2 className="h-2.5 w-2.5" />
+                        AI Generate
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-5 text-[9px] gap-0.5 px-1.5"
+                        onClick={() => setSqlEditor(generateSchemaSQL())}
+                      >
+                        <Code2 className="h-2.5 w-2.5" />
+                        Schema
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="flex-1 relative">
+                    <textarea
+                      value={sqlEditor}
+                      onChange={(e) => setSqlEditor(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                          e.preventDefault()
+                          executeSQL(sqlEditor)
+                        }
+                      }}
+                      placeholder="-- Write SQL here... (Ctrl+Enter to execute)&#10;SELECT * FROM users LIMIT 10;"
+                      className="w-full h-full p-3 text-[12px] font-mono bg-background resize-none focus:outline-none leading-relaxed"
+                      spellCheck={false}
+                    />
+                  </div>
+                </div>
+
+                {/* SQL toolbar */}
+                <div className="px-3 py-1.5 border-t flex items-center gap-1.5 bg-muted/30 shrink-0">
+                  <Button
+                    variant="default"
+                    size="sm"
+                    className="h-6 text-[10px] gap-1 bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white"
+                    onClick={() => executeSQL(sqlEditor)}
+                    disabled={sqlExecuting || !sqlEditor.trim()}
+                  >
+                    {sqlExecuting ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : <Play className="h-2.5 w-2.5" />}
+                    Run
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 text-[10px] gap-1"
+                    onClick={() => copyToClipboard(sqlEditor || generateSchemaSQL())}
+                  >
+                    <Copy className="h-2.5 w-2.5" />
+                    Copy
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 text-[10px] gap-1"
+                    onClick={() => {
+                      const content = sqlEditor || generateSchemaSQL()
+                      const blob = new Blob([content], { type: 'text/sql' })
+                      const url = URL.createObjectURL(blob)
+                      const a = document.createElement('a')
+                      a.href = url
+                      a.download = `${databaseName || 'schema'}.sql`
+                      a.click()
+                      URL.revokeObjectURL(url)
+                    }}
+                  >
+                    <Download className="h-2.5 w-2.5" />
+                    Download
+                  </Button>
+
+                  <div className="flex-1" />
+
+                  {/* Query history dropdown */}
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="ghost" size="sm" className="h-6 text-[10px] gap-0.5">
+                        <History className="h-2.5 w-2.5" />
+                        History ({queryHistory.length})
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-80">
+                      {queryHistory.length === 0 ? (
+                        <DropdownMenuItem disabled>No queries yet</DropdownMenuItem>
+                      ) : (
+                        <>
+                          {queryHistory.map((q, i) => (
+                            <DropdownMenuItem key={i} onClick={() => setSqlEditor(q)}>
+                              <code className="text-[10px] truncate max-w-[260px] flex-1">{q}</code>
+                            </DropdownMenuItem>
+                          ))}
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            className="text-destructive focus:text-destructive"
+                            onClick={() => {
+                              setQueryHistory([])
+                              toast.success('Query history cleared')
+                            }}
+                          >
+                            <Trash2 className="h-3 w-3 mr-2" />
+                            Clear History
+                          </DropdownMenuItem>
+                        </>
+                      )}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+
+                  {/* Saved queries */}
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-6 text-[10px] gap-0.5"
+                      >
+                        <Save className="h-2.5 w-2.5" />
+                        Saved ({savedQueries.length})
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-80">
+                      <DropdownMenuItem
+                        disabled={!sqlEditor.trim()}
+                        onClick={saveCurrentQuery}
+                      >
+                        <Plus className="h-3 w-3 mr-2" />
+                        Save Current Query
+                        <kbd className="ml-auto px-1.5 py-0.5 text-[9px] font-mono rounded border bg-muted text-muted-foreground">⌘⇧S</kbd>
+                      </DropdownMenuItem>
+                      {savedQueries.length > 0 && <DropdownMenuSeparator />}
+                      {savedQueries.length === 0 ? (
+                        <DropdownMenuItem disabled>No saved queries yet</DropdownMenuItem>
+                      ) : (
+                        savedQueries.map((sq, i) => (
+                          <div key={i} className="group flex items-center px-2 py-1.5 hover:bg-accent rounded-sm cursor-pointer" onClick={() => setSqlEditor(sq.sql)}>
+                            <span className="text-[10px] font-medium mr-2 truncate max-w-[100px]">{sq.name}</span>
+                            <code className="text-[9px] text-muted-foreground truncate flex-1 max-w-[140px]">{sq.sql}</code>
+                            <button
+                              className="ml-1 opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 transition-opacity shrink-0"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setSavedQueries(prev => prev.filter((_, idx) => idx !== i))
+                                toast.success(`Deleted "${sq.name}"`)
+                              }}
+                              title="Delete saved query"
+                            >
+                              <X className="h-3 w-3" />
+                            </button>
+                          </div>
+                        ))
+                      )}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+
+                {/* SQL Results */}
+                {sqlResults && (
+                  <div className="border-t max-h-64 overflow-auto shrink-0">
+                    <div className="px-3 py-1 border-b bg-muted/30 flex items-center justify-between sticky top-0 z-10">
+                      <span className="text-[10px] font-medium text-muted-foreground">
+                        Results ({sqlResults.rows.length} rows · {sqlResults.executionTime}ms)
+                      </span>
+                      <div className="flex items-center gap-1">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-5 text-[9px] gap-0.5 px-1"
+                          onClick={() => exportAsCSV(sqlResults.rows, 'query_results.csv')}
+                        >
+                          <Download className="h-2.5 w-2.5" />
+                          CSV
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-5 text-[9px] gap-0.5 px-1"
+                          onClick={() => exportAsJSON(sqlResults.rows, 'query_results.json')}
+                        >
+                          <Download className="h-2.5 w-2.5" />
+                          JSON
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-5 w-5 p-0"
+                          onClick={() => setSqlResults(null)}
+                        >
+                          <X className="h-2.5 w-2.5" />
+                        </Button>
+                      </div>
+                    </div>
+                    <table className="w-full text-[11px] border-collapse">
+                      <thead className="sticky top-[33px] z-10 bg-background">
+                        <tr className="border-b">
+                          {sqlResults.columns.map((col) => (
+                            <th key={col} className="text-left py-1 px-2 font-medium text-muted-foreground bg-muted/50 whitespace-nowrap">
+                              {col}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {sqlResults.rows.slice(0, 100).map((row, i) => (
+                          <tr key={i} className="border-b hover:bg-muted/30">
+                            {sqlResults.columns.map((col) => (
+                              <td key={col} className="py-1 px-2 font-mono text-[10px] whitespace-nowrap max-w-[200px] truncate">
+                                {row[col] === null ? <span className="italic text-muted-foreground">NULL</span> : String(row[col] ?? '')}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
             </TabsContent>
 
             {/* ─── Explorer Tab ─── */}
             <TabsContent value="explorer" className="flex-1 overflow-hidden m-0">
-              <ExplorerTab
-                schema={generatedSchema}
-                data={generatedData}
-                selectedTable={selectedTable}
-                erLayout={erLayout}
-                favoriteTables={favoriteTables}
-                setFavoriteTables={setFavoriteTables}
-                explorerZoom={explorerZoom}
-                setExplorerZoom={setExplorerZoom}
-                explorerPan={explorerPan}
-                setExplorerPan={setExplorerPan}
-                isPanning={isPanning}
-                setIsPanning={setIsPanning}
-                panStart={panStart}
-                setPanStart={setPanStart}
-                onSelectTable={(name) => { setSelectedTable(name); setActiveTab('data'); setVisibleRows(20) }}
-              />
+              <div className="flex h-full">
+                {/* Schema tree sidebar */}
+                <div className="w-56 border-r bg-muted/30 flex flex-col shrink-0 overflow-hidden">
+                  <div className="px-2 py-1.5 border-b shrink-0">
+                    <p className="text-[9px] font-semibold text-muted-foreground uppercase tracking-wider">Schema Tree</p>
+                  </div>
+                  <ScrollArea className="flex-1 min-h-0 p-1.5">
+                    <div className="space-y-1.5">
+                      {generatedSchema.map((table) => {
+                        const tableData = generatedData[table.name] as Record<string, unknown>[] | undefined
+                        const isFav = favoriteTables.has(table.name)
+                        return (
+                          <div key={table.name} className="rounded border bg-card overflow-hidden">
+                            <div className="px-2 py-1 bg-muted/50 flex items-center gap-1.5 border-b">
+                              <Table2 className="h-2.5 w-2.5 text-amber-600" />
+                              <span className="text-[10px] font-semibold">{table.name}</span>
+                              <Badge variant="outline" className="text-[7px] ml-auto px-0.5 py-0">
+                                {tableData?.length || 0} rows
+                              </Badge>
+                              <button
+                                onClick={() => {
+                                  setFavoriteTables(prev => {
+                                    const next = new Set(prev)
+                                    if (next.has(table.name)) next.delete(table.name)
+                                    else next.add(table.name)
+                                    return next
+                                  })
+                                }}
+                                className="ml-0.5"
+                              >
+                                {isFav ? (
+                                  <Star className="h-2.5 w-2.5 text-amber-500 fill-amber-500" />
+                                ) : (
+                                  <StarOff className="h-2.5 w-2.5 text-muted-foreground/50" />
+                                )}
+                              </button>
+                            </div>
+                            <div className="p-1 space-y-px">
+                              {table.columns.map((col) => (
+                                <div key={col.name} className="flex items-center justify-between px-1 py-px rounded text-[9px] hover:bg-muted/50">
+                                  <div className="flex items-center gap-0.5">
+                                    {col.name === 'id' && (
+                                      <Badge variant="secondary" className="text-[6px] px-0.5 py-0 bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">PK</Badge>
+                                    )}
+                                    {col.name.endsWith('_id') && col.name !== 'id' && (
+                                      <Badge variant="secondary" className="text-[6px] px-0.5 py-0 bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-400">FK</Badge>
+                                    )}
+                                    <span className="font-mono">{col.name}</span>
+                                  </div>
+                                  <span className="text-muted-foreground font-mono text-[8px]">{col.type}</span>
+                                </div>
+                              ))}
+                            </div>
+                            {/* Quick preview */}
+                            {tableData && tableData.length > 0 && (
+                              <button
+                                onClick={() => { setSelectedTable(table.name); setActiveTab('data'); setVisibleRows(20) }}
+                                className="w-full px-2 py-1 text-[9px] text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-950/30 border-t transition-colors"
+                              >
+                                Preview first 5 rows →
+                              </button>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </ScrollArea>
+                </div>
+
+                {/* ER Diagram visualization */}
+                <div className="flex-1 relative overflow-hidden bg-muted/10">
+                  {/* Zoom controls */}
+                  <div className="absolute top-2 right-2 z-10 flex items-center gap-1 bg-card border rounded-lg px-1.5 py-1 shadow-sm">
+                    <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => setExplorerZoom(z => Math.max(0.3, z - 0.2))}>
+                      <ZoomOut className="h-3 w-3" />
+                    </Button>
+                    <span className="text-[9px] font-mono min-w-[32px] text-center">{Math.round(explorerZoom * 100)}%</span>
+                    <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => setExplorerZoom(z => Math.min(2, z + 0.2))}>
+                      <ZoomIn className="h-3 w-3" />
+                    </Button>
+                    <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => { setExplorerZoom(1); setExplorerPan({ x: 0, y: 0 }) }}>
+                      <Move className="h-3 w-3" />
+                    </Button>
+                  </div>
+
+                  <div
+                    className="w-full h-full overflow-auto cursor-grab active:cursor-grabbing"
+                    onMouseDown={(e) => {
+                      setIsPanning(true)
+                      setPanStart({ x: e.clientX - explorerPan.x, y: e.clientY - explorerPan.y })
+                    }}
+                    onMouseMove={(e) => {
+                      if (isPanning) {
+                        setExplorerPan({
+                          x: e.clientX - panStart.x,
+                          y: e.clientY - panStart.y,
+                        })
+                      }
+                    }}
+                    onMouseUp={() => setIsPanning(false)}
+                    onMouseLeave={() => setIsPanning(false)}
+                  >
+                    <svg
+                      width={svgWidth}
+                      height={svgHeight}
+                      style={{
+                        transform: `translate(${explorerPan.x}px, ${explorerPan.y}px) scale(${explorerZoom})`,
+                        transformOrigin: '0 0',
+                      }}
+                    >
+                      {/* SVG defs for arrowheads */}
+                      <defs>
+                        {/* Arrow pointing to the "many" side (filled triangle) */}
+                        <marker id="arrowhead-many" markerWidth="12" markerHeight="8" refX="12" refY="4" orient="auto" markerUnits="strokeWidth">
+                          <path d="M0,0 L12,4 L0,8 L3,4 Z" fill="#8b5cf6" />
+                        </marker>
+                        {/* "One" indicator — single perpendicular line */}
+                        <marker id="arrowhead-one" markerWidth="8" markerHeight="12" refX="4" refY="6" orient="auto" markerUnits="strokeWidth">
+                          <line x1="4" y1="0" x2="4" y2="12" stroke="#8b5cf6" strokeWidth="2" />
+                        </marker>
+                        {/* Crow's foot for "many" side */}
+                        <marker id="crowfoot-many" markerWidth="14" markerHeight="14" refX="14" refY="7" orient="auto" markerUnits="strokeWidth">
+                          <line x1="0" y1="0" x2="14" y2="7" stroke="#8b5cf6" strokeWidth="1.5" />
+                          <line x1="0" y1="14" x2="14" y2="7" stroke="#8b5cf6" strokeWidth="1.5" />
+                          <line x1="0" y1="7" x2="14" y2="7" stroke="#8b5cf6" strokeWidth="1.5" />
+                        </marker>
+                        {/* Simple filled arrow for the "to" end */}
+                        <marker id="arrow-filled" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto" markerUnits="strokeWidth">
+                          <polygon points="0,0 10,3.5 0,7" fill="#7c3aed" />
+                        </marker>
+                      </defs>
+
+                      {/* Render relationship lines with arrows and labels */}
+                      {erLayout.edges.map((edge, i) => {
+                        const fromNode = erLayout.nodes.find(n => n.name === edge.from)
+                        const toNode = erLayout.nodes.find(n => n.name === edge.to)
+                        if (!fromNode || !toNode) return null
+
+                        // Calculate edge endpoints at node borders
+                        const fromNodeWidth = 200
+                        const fromHeaderHeight = 24
+                        const fromColHeight = 14
+                        const fromNodeHeight = fromHeaderHeight + Math.min(fromNode.schema.columns.length, 8) * fromColHeight + 8
+
+                        const toNodeWidth = 200
+                        const toHeaderHeight = 24
+                        const toColHeight = 14
+                        const toNodeHeight = toHeaderHeight + Math.min(toNode.schema.columns.length, 8) * toColHeight + 8
+
+                        const fromCenterX = fromNode.x + fromNodeWidth / 2
+                        const fromCenterY = fromNode.y + fromNodeHeight / 2
+                        const toCenterX = toNode.x + toNodeWidth / 2
+                        const toCenterY = toNode.y + toNodeHeight / 2
+
+                        // Calculate intersection points with node rectangles
+                        const dx = toCenterX - fromCenterX
+                        const dy = toCenterY - fromCenterY
+
+                        // Determine from edge point
+                        let fromX: number, fromY: number
+                        if (Math.abs(dx) * fromNodeHeight > Math.abs(dy) * fromNodeWidth) {
+                          // Exit from left or right side
+                          fromX = dx > 0 ? fromNode.x + fromNodeWidth : fromNode.x
+                          fromY = fromCenterY + (fromX - fromCenterX) * (dy / dx)
+                        } else {
+                          // Exit from top or bottom
+                          fromY = dy > 0 ? fromNode.y + fromNodeHeight : fromNode.y
+                          fromX = fromCenterX + (fromY - fromCenterY) * (dx / dy)
+                        }
+
+                        // Determine to edge point
+                        let toX: number, toY: number
+                        if (Math.abs(dx) * toNodeHeight > Math.abs(dy) * toNodeWidth) {
+                          toX = dx > 0 ? toNode.x : toNode.x + toNodeWidth
+                          toY = toCenterY + (toX - toCenterX) * (dy / dx)
+                        } else {
+                          toY = dy > 0 ? toNode.y : toNode.y + toNodeHeight
+                          toX = toCenterX + (toY - toCenterY) * (dx / dy)
+                        }
+
+                        // Check if the FK column is optional (nullable) — for line style
+                        const fkColumn = fromNode.schema.columns.find(c => c.name === edge.fromCol)
+                        const isOptional = fkColumn?.type?.toLowerCase().includes('null') || false
+
+                        // Midpoint for label
+                        const midX = (fromX + toX) / 2
+                        const midY = (fromY + toY) / 2
+
+                        // Edge label background rect
+                        const labelText = edge.fromCol
+                        const labelWidth = labelText.length * 5.5 + 8
+                        const labelHeight = 12
+
+                        return (
+                          <g key={`edge-${i}`}>
+                            {/* Background line (wider, semi-transparent for glow effect) */}
+                            <line
+                              x1={fromX}
+                              y1={fromY}
+                              x2={toX}
+                              y2={toY}
+                              stroke="#8b5cf6"
+                              strokeWidth={4}
+                              strokeDasharray={isOptional ? '8 4' : 'none'}
+                              opacity={0.15}
+                            />
+                            {/* Main connection line */}
+                            <line
+                              x1={fromX}
+                              y1={fromY}
+                              x2={toX}
+                              y2={toY}
+                              stroke="#7c3aed"
+                              strokeWidth={2}
+                              strokeDasharray={isOptional ? '8 4' : 'none'}
+                              markerEnd="url(#arrow-filled)"
+                            />
+
+                            {/* FK column label at midpoint */}
+                            <rect
+                              x={midX - labelWidth / 2}
+                              y={midY - labelHeight / 2 - 9}
+                              width={labelWidth}
+                              height={labelHeight}
+                              rx={3}
+                              fill="#ffffff"
+                              stroke="#8b5cf6"
+                              strokeWidth={0.8}
+                            />
+                            <text
+                              x={midX}
+                              y={midY - 3}
+                              textAnchor="middle"
+                              fill="#6d28d9"
+                              fontSize={7}
+                              fontWeight={500}
+                              fontFamily="monospace"
+                            >
+                              {labelText}
+                            </text>
+
+                            {/* "1" label at the "one" end (near toNode/target) */}
+                            <text
+                              x={toX + (fromX - toX) * 0.1}
+                              y={toY + (fromY - toY) * 0.1 - 5}
+                              textAnchor="middle"
+                              fill="#7c3aed"
+                              fontSize={10}
+                              fontWeight={700}
+                            >
+                              1
+                            </text>
+
+                            {/* "N" label at the "many" end (near fromNode/source) */}
+                            <text
+                              x={fromX + (toX - fromX) * 0.1}
+                              y={fromY + (toY - fromY) * 0.1 - 5}
+                              textAnchor="middle"
+                              fill="#7c3aed"
+                              fontSize={10}
+                              fontWeight={700}
+                            >
+                              N
+                            </text>
+                          </g>
+                        )
+                      })}
+
+                      {/* Render table nodes */}
+                      {erLayout.nodes.map((node) => {
+                        const isFav = favoriteTables.has(node.name)
+                        const headerHeight = 24
+                        const colHeight = 14
+                        const nodeWidth = 200
+                        const nodeHeight = headerHeight + Math.min(node.schema.columns.length, 8) * colHeight + 8
+
+                        return (
+                          <g
+                            key={node.name}
+                            onClick={() => { setSelectedTable(node.name); setActiveTab('data'); setVisibleRows(20) }}
+                            className="cursor-pointer"
+                          >
+                            {/* Shadow */}
+                            <rect
+                              x={node.x + 2}
+                              y={node.y + 2}
+                              width={nodeWidth}
+                              height={nodeHeight}
+                              rx={6}
+                              fill="rgba(0,0,0,0.08)"
+                            />
+                            {/* Main box */}
+                            <rect
+                              x={node.x}
+                              y={node.y}
+                              width={nodeWidth}
+                              height={nodeHeight}
+                              rx={6}
+                              fill="#ffffff"
+                              stroke={selectedTable === node.name ? '#d97706' : '#f59e0b'}
+                              strokeWidth={selectedTable === node.name ? 2.5 : 1}
+                            />
+                            {/* Header */}
+                            <rect
+                              x={node.x}
+                              y={node.y}
+                              width={nodeWidth}
+                              height={headerHeight}
+                              rx={6}
+                              fill="#fef3c7"
+                            />
+                            <rect
+                              x={node.x}
+                              y={node.y + headerHeight - 6}
+                              width={nodeWidth}
+                              height={6}
+                              fill="#fef3c7"
+                            />
+                            {/* Table name */}
+                            <text
+                              x={node.x + 10}
+                              y={node.y + 16}
+                              fill="#92400e"
+                              fontSize={10}
+                              fontWeight={700}
+                            >
+                              {isFav && '★ '}{node.name}
+                            </text>
+                            {/* Row count badge */}
+                            <text
+                              x={node.x + nodeWidth - 10}
+                              y={node.y + 16}
+                              textAnchor="end"
+                              fill="#6b7280"
+                              fontSize={8}
+                            >
+                              {node.rows} rows
+                            </text>
+                            {/* Columns */}
+                            {node.schema.columns.slice(0, 8).map((col, ci) => (
+                              <g key={col.name}>
+                                <text
+                                  x={node.x + 10}
+                                  y={node.y + headerHeight + 10 + ci * colHeight}
+                                  fill={col.name === 'id' || col.name.endsWith('_id') ? '#b45309' : '#374151'}
+                                  fontSize={8}
+                                  fontFamily="monospace"
+                                >
+                                  {col.name === 'id' ? '🔑 ' : col.name.endsWith('_id') ? '🔗 ' : ''}{col.name}
+                                </text>
+                                <text
+                                  x={node.x + nodeWidth - 10}
+                                  y={node.y + headerHeight + 10 + ci * colHeight}
+                                  textAnchor="end"
+                                  fill="#9ca3af"
+                                  fontSize={7}
+                                  fontFamily="monospace"
+                                >
+                                  {col.type}
+                                </text>
+                              </g>
+                            ))}
+                            {node.schema.columns.length > 8 && (
+                              <text
+                                x={node.x + 10}
+                                y={node.y + headerHeight + 10 + 8 * colHeight}
+                                fill="#9ca3af"
+                                fontSize={7}
+                              >
+                                +{node.schema.columns.length - 8} more columns...
+                              </text>
+                            )}
+                          </g>
+                        )
+                      })}
+                    </svg>
+                  </div>
+
+                  {Object.keys(generatedData).length <= 1 && (
+                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                      <div className="text-center text-muted-foreground">
+                        <GitBranch className="h-6 w-6 mx-auto mb-1.5 opacity-20" />
+                        <p className="text-[10px]">ER diagram appears with</p>
+                        <p className="text-[10px]">multiple connected tables</p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
             </TabsContent>
           </Tabs>
         ) : (
@@ -2567,7 +4021,12 @@ function StudioPageInner({
                 Describe the database you need in the AI chat, and I&apos;ll design the schema and generate realistic data.
               </p>
               <div className="flex flex-wrap gap-1.5 justify-center">
-                {QUICK_PROMPTS.map((example) => (
+                {[
+                  'E-commerce with users, orders, products',
+                  'Hospital management system',
+                  'Social media platform',
+                  'SaaS subscription billing',
+                ].map((example) => (
                   <button
                     key={example}
                     onClick={() => setInput(example)}
@@ -2766,7 +4225,91 @@ function StudioPageInner({
       {/* Opened via Cmd/Ctrl + / (or the Keyboard icon in the chat header).
           Lists every shortcut grouped by category. ESC closes (handled both
           by Radix's default and the global keydown listener above). */}
-      <ShortcutsDialog open={showShortcuts} onOpenChange={setShowShortcuts} />
+      <Dialog open={showShortcuts} onOpenChange={setShowShortcuts}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Keyboard className="h-5 w-5 text-amber-600" />
+              Keyboard Shortcuts
+            </DialogTitle>
+            <DialogDescription>
+              Speed up your workflow with these shortcuts. Use <kbd className="px-1.5 py-0.5 text-[10px] font-mono rounded border bg-muted text-muted-foreground">⌘</kbd> on macOS or <kbd className="px-1.5 py-0.5 text-[10px] font-mono rounded border bg-muted text-muted-foreground">Ctrl</kbd> on Windows/Linux.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 max-h-[60vh] overflow-y-auto pr-1">
+            {/* Chat */}
+            <div>
+              <h4 className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground mb-2">Chat</h4>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Send Message</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘↵</kbd>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">New Chat</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘K</kbd>
+                </div>
+              </div>
+            </div>
+
+            {/* Data */}
+            <div>
+              <h4 className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground mb-2">Data</h4>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Data Tab</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘1</kbd>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">SQL Tab</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘2</kbd>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Explorer Tab</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘3</kbd>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Save Query</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘⇧S</kbd>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Export Database</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘⇧E</kbd>
+                </div>
+              </div>
+            </div>
+
+            {/* View */}
+            <div>
+              <h4 className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground mb-2">View</h4>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Toggle Panel</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘B</kbd>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Shortcuts</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">⌘/</kbd>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Close Dialog</span>
+                  <kbd className="px-2 py-1 text-xs font-mono rounded border bg-muted text-muted-foreground">Esc</kbd>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              onClick={() => setShowShortcuts(false)}
+              className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white"
+            >
+              Got it
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
