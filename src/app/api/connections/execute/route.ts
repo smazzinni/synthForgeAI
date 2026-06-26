@@ -84,9 +84,23 @@ export async function POST(request: NextRequest) {
     // comments (which is exactly the format the chat route's system prompt
     // instructs the AI to produce).
     const strippedForCheck = stripSqlComments(trimmed).trim()
-    const firstWord = strippedForCheck.split(/\s+/)[0]?.toUpperCase() || ''
-    if (!ALLOWED_STATEMENTS.includes(firstWord)) {
-      return NextResponse.json({ error: `Statement type "${firstWord}" is not allowed` }, { status: 400 })
+
+    // For multi-statement SQL, split by semicolons and check the first word
+    // of EACH statement. All statements must use allowed statement types.
+    // This prevents embedding a disallowed statement (e.g. EXEC, SHUTDOWN)
+    // after an allowed one.
+    const statementsToCheck = strippedForCheck
+      .split(';')
+      .map(s => s.trim())
+      .filter(Boolean)
+
+    for (const stmt of statementsToCheck) {
+      const firstWord = stmt.split(/\s+/)[0]?.toUpperCase() || ''
+      if (firstWord && !ALLOWED_STATEMENTS.includes(firstWord)) {
+        return NextResponse.json({
+          error: `Statement type "${firstWord}" is not allowed`,
+        }, { status: 400 })
+      }
     }
 
     // Block obviously catastrophic patterns unless the caller explicitly

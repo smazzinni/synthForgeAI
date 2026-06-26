@@ -441,6 +441,114 @@ export async function fetchSampleRows(conn: DbConnectionRecord, tableName: strin
  * CRUD operations (INSERT/UPDATE/DELETE/DROP/CREATE/ALTER etc.) as well as
  * read queries (SELECT).
  */
+/**
+ * Split a multi-statement SQL string into individual statements.
+ * Handles:
+ * - Semicolons inside string literals (single and double quoted)
+ * - Semicolons inside dollar-quoted strings (PostgreSQL dollar-quote)
+ * - Comments (line comments and block comments)
+ * - Trailing semicolons and whitespace
+ *
+ * Returns an array of trimmed statement strings (empty statements filtered out).
+ */
+function splitSqlStatements(sql: string): string[] {
+  const statements: string[] = []
+  let current = ''
+  let i = 0
+  const len = sql.length
+  let inSingle = false
+  let inDouble = false
+  let inDollarQuote = false
+  let dollarTag = ''
+
+  while (i < len) {
+    const ch = sql[i]
+    const next = sql[i + 1]
+    const next2 = sql[i + 2]
+
+    // Handle string literals
+    if (!inDouble && !inDollarQuote && ch === "'") {
+      inSingle = !inSingle
+      current += ch
+      i++
+      continue
+    }
+    if (!inSingle && !inDollarQuote && ch === '"') {
+      inDouble = !inDouble
+      current += ch
+      i++
+      continue
+    }
+
+    // Handle PostgreSQL dollar-quoted strings ($$...$$ or $tag$...$tag$)
+    if (!inSingle && !inDouble && ch === '$') {
+      // Try to match a dollar-quote tag
+      const dollarMatch = sql.slice(i).match(/^\$(\w*)\$/)
+      if (dollarMatch) {
+        const tag = dollarMatch[1]
+        if (!inDollarQuote) {
+          // Opening dollar quote
+          inDollarQuote = true
+          dollarTag = tag
+          current += dollarMatch[0]
+          i += dollarMatch[0].length
+          continue
+        } else if (tag === dollarTag) {
+          // Closing dollar quote (same tag)
+          inDollarQuote = false
+          dollarTag = ''
+          current += dollarMatch[0]
+          i += dollarMatch[0].length
+          continue
+        }
+      }
+    }
+
+    // Handle line comments
+    if (!inSingle && !inDouble && !inDollarQuote && ch === '-' && next === '-') {
+      // Skip to end of line
+      while (i < len && sql[i] !== '\n') {
+        current += sql[i]
+        i++
+      }
+      continue
+    }
+
+    // Handle block comments
+    if (!inSingle && !inDouble && !inDollarQuote && ch === '/' && next === '*') {
+      current += '/*'
+      i += 2
+      while (i < len && !(sql[i] === '*' && sql[i + 1] === '/')) {
+        current += sql[i]
+        i++
+      }
+      if (i < len) {
+        current += '*/'
+        i += 2
+      }
+      continue
+    }
+
+    // Handle statement separator (semicolon)
+    if (!inSingle && !inDouble && !inDollarQuote && ch === ';') {
+      const trimmed = current.trim()
+      if (trimmed) statements.push(trimmed)
+      current = ''
+      i++
+      continue
+    }
+
+    current += ch
+    i++
+  }
+
+  // Don't forget the last statement (if no trailing semicolon)
+  const trimmed = current.trim()
+  if (trimmed) statements.push(trimmed)
+
+  return statements
+}
+
 export async function executeSql(
   conn: DbConnectionRecord,
   sql: string,
@@ -448,6 +556,79 @@ export async function executeSql(
   const start = Date.now()
   const entry = await getPool(conn)
 
+  // Split multi-statement SQL into individual statements.
+  // Both PostgreSQL and MySQL drivers fail on multi-statement strings by default
+  // (PostgreSQL's pg driver ignores everything after the first semicolon;
+  // MySQL's mysql2 driver throws a syntax error). We split and execute each
+  // statement separately, aggregating results.
+  const statements = splitSqlStatements(sql)
+
+  if (statements.length === 0) {
+    return {
+      rows: [], columns: [], rowCount: 0, affectedRows: 0,
+      executionTime: Date.now() - start,
+      error: 'No SQL statements to execute',
+    }
+  }
+
+  // If only one statement, execute directly (original behavior)
+  if (statements.length === 1) {
+    return executeSingleStatement(entry, statements[0], start)
+  }
+
+  // Multiple statements: execute each in order, aggregate results
+  const allRows: Record<string, unknown>[] = []
+  let allColumns: string[] = []
+  let totalAffected = 0
+  let totalRowCount = 0
+  let lastError: string | undefined
+  const errors: string[] = []
+  let executedCount = 0
+
+  for (let idx = 0; idx < statements.length; idx++) {
+    const stmt = statements[idx]
+    const result = await executeSingleStatement(entry, stmt, start)
+
+    if (result.error) {
+      errors.push(`Statement ${idx + 1}: ${result.error}`)
+      lastError = result.error
+      // Continue executing remaining statements — don't abort the whole batch
+      // just because one statement failed (e.g. CREATE TABLE IF NOT EXISTS
+      // might fail if the table exists, but subsequent INSERTs should still run)
+    } else {
+      executedCount++
+    }
+
+    // Aggregate rows (only from SELECT-like queries that return rows)
+    if (result.rows.length > 0) {
+      allRows.push(...result.rows)
+      if (allColumns.length === 0) allColumns = result.columns
+      totalRowCount += result.rowCount
+    }
+
+    totalAffected += result.affectedRows
+  }
+
+  return {
+    rows: allRows.slice(0, 1000),
+    columns: allColumns,
+    rowCount: allRows.length,
+    affectedRows: totalAffected,
+    executionTime: Date.now() - start,
+    // Only report an error if ALL statements failed
+    error: executedCount === 0 ? (lastError || 'All statements failed') : undefined,
+  }
+}
+
+/**
+ * Execute a single SQL statement (no semicolons inside string literals).
+ * This is the original executeSql logic, extracted for reuse.
+ */
+async function executeSingleStatement(
+  entry: PoolEntry,
+  sql: string,
+  start: number,
+): Promise<ExecuteResult> {
   try {
     if (entry.dialect === 'postgres') {
       const pool = entry.pool as { query: (text: string) => Promise<{ rows: Record<string, unknown>[]; rowCount: number; command?: string }> }
@@ -467,19 +648,6 @@ export async function executeSql(
     const pool = entry.pool as { query: (sql: string, values?: unknown) => Promise<unknown> }
     const raw = await pool.query(sql)
 
-    // mysql2/promise returns:
-    //   - For SELECT: [rows[], fields[]]
-    //   - For INSERT/UPDATE/DELETE: [ResultSetHeader, fields[]]
-    //     where ResultSetHeader is an OBJECT (not an array) with
-    //     { fieldCount, affectedRows, insertId, info, serverStatus, warningStatus }
-    //
-    // BUGFIX (BUG-16): the previous code assumed `raw[0]` was always an
-    // array. For mutations it's the ResultSetHeader object, so:
-    //   - `Array.isArray(raw[0])` is false → `rows = raw` (the 2-element tuple)
-    //   - `Object.keys(rows[0])` returned the ResultSetHeader's keys
-    //   - `affectedRows` was read off the array (always undefined → 0)
-    // The studio then showed "INSERT OK — 0 row(s) affected" and rendered
-    // the ResultSetHeader as if it were a data row.
     const header = Array.isArray(raw) ? raw[0] : raw
     const isResultSetHeader =
       typeof header === 'object' && header !== null && !Array.isArray(header) && 'affectedRows' in header
@@ -489,12 +657,10 @@ export async function executeSql(
     let affectedRows: number
 
     if (isResultSetHeader) {
-      // INSERT / UPDATE / DELETE / DDL
       rows = []
       fields = []
       affectedRows = (header as { affectedRows?: number }).affectedRows || 0
     } else {
-      // SELECT
       rows = (Array.isArray(raw) && Array.isArray(raw[0]) ? raw[0] : raw) as Record<string, unknown>[]
       fields = (Array.isArray(raw) && Array.isArray(raw[1]) ? raw[1] : []) as Array<{ name: string }>
       affectedRows = 0
