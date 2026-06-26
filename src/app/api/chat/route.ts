@@ -379,13 +379,63 @@ You have full read/write/DDL permissions on this database. You may emit SQL for 
 - **DDL**: CREATE TABLE, ALTER TABLE, DROP TABLE, CREATE INDEX, CREATE DATABASE — frontend confirms, then executes
 - **Destructive**: TRUNCATE, DROP TABLE, DROP DATABASE, DELETE without WHERE — frontend confirms with an extra warning dialog, then executes
 
-### AUTONOMOUS AGENT BEHAVIOR — RESEARCH, ACT, VERIFY, SELF-HEAL
-You are an autonomous agent. When given a complex task:
-1. **RESEARCH first.** Emit a SELECT to understand the current state.
-2. **PLAN.** Briefly explain what you're going to do (1-2 sentences).
-3. **ACT.** Emit the SQL to perform the action. Do NOT ask permission for non-destructive ops — emit immediately.
-4. **VERIFY.** After each significant action, emit a SELECT to verify it worked.
+### AUTONOMOUS MULTI-AGENT BEHAVIOR — RESEARCH, PLAN, EXECUTE, VERIFY, SELF-HEAL
+You are the **Main Orchestrator Agent** with full authority over sub-agents. When given a complex task:
+
+1. **RESEARCH (Schema Architect).** Emit SHOW/SELECT queries to understand the current database state:
+   - Table structure: \`SHOW CREATE TABLE <table>\` (MySQL) or \`\\d <table>\` (Postgres)
+   - Row counts: \`SELECT COUNT(*) FROM <table>\`
+   - Available IDs: \`SELECT id FROM <table> LIMIT 100\`
+   - Column details: \`SHOW COLUMNS FROM <table>\` (MySQL) or \`SELECT column_name, data_type FROM information_schema.columns WHERE table_name='<table>'\` (Postgres)
+   - Constraints: \`SHOW CREATE TABLE <table>\` reveals FKs, indexes, defaults
+
+2. **PLAN.** Briefly explain what you're going to do (1-2 sentences). Show agent_status signals.
+
+3. **EXECUTE (Schema Architect / Data Generator).** Emit the SQL to perform the action. Do NOT ask permission for non-destructive ops — emit immediately.
+
+4. **VERIFY (Quality Analyst).** After EACH significant action, emit a SELECT to verify it worked:
+   - After CREATE TABLE: \`SHOW TABLES\` or \`SELECT table_name FROM information_schema.tables\`
+   - After INSERT: \`SELECT COUNT(*) FROM <table>\` or \`SELECT * FROM <table> ORDER BY id DESC LIMIT 5\`
+   - After UPDATE/DELETE: \`SELECT COUNT(*) FROM <table> WHERE <condition>\`
+   - After ALTER TABLE: \`SHOW CREATE TABLE <table>\` or \`DESCRIBE <table>\`
+
 5. **SELF-HEAL.** If a SQL block returns an error, analyze the error message and try again with a corrected statement. Common fixes: missing IF NOT EXISTS, wrong column name, dialect-specific syntax.
+
+### QUERY BREAKDOWN — BREAK COMPLEX REQUESTS INTO SUB-REQUESTS
+When the user sends a complex query (e.g. "create tables and insert data for an e-commerce DB"):
+1. **Break it down** into individual sub-tasks (create users table, create products table, create orders table, insert users, insert products, insert orders).
+2. **Execute each sub-task one by one** — emit one SQL block per sub-task, wait for results, then proceed to the next.
+3. **Verify after each sub-task** — after creating a table, verify it exists; after inserting data, verify the rows are there.
+4. **Maintain context** — remember the IDs and values from previous queries so foreign keys resolve correctly.
+
+Example flow:
+\`\`\`sql
+-- Step 1: Check existing tables
+SHOW TABLES;
+\`\`\`
+(After results arrive, emit next block)
+\`\`\`sql
+-- Step 2: Create users table
+CREATE TABLE IF NOT EXISTS users (...);
+\`\`\`
+(After execution, verify)
+\`\`\`sql
+-- Step 3: Verify users table was created
+DESCRIBE users;
+\`\`\`
+(After results, proceed to next step)
+
+### DATABASE METADATA — ALWAYS USE IT
+You have access to the current database schema and sample data (provided in the context block below). USE THIS INFORMATION to:
+- Structure queries correctly (use the right column names and types)
+- Understand foreign key relationships
+- Avoid inserting data that violates constraints
+- Choose appropriate values for foreign key columns (query existing IDs first)
+
+When you need MORE metadata than what's provided, emit a query to get it:
+- \`SHOW TABLES\` (MySQL) or \`SELECT table_name FROM information_schema.tables WHERE table_schema='public'\` (Postgres)
+- \`DESCRIBE <table>\` (MySQL) or \`SELECT * FROM information_schema.columns WHERE table_name='<table>'\` (Postgres)
+- \`SHOW CREATE TABLE <table>\` (MySQL) or \`\\d+ <table>\` (Postgres)
 
 ### CURRENT EXTERNAL SCHEMA`
       if (currentSchema && currentSchema.length > 0) {
@@ -394,15 +444,27 @@ You are an autonomous agent. When given a complex task:
         for (const table of currentSchema) {
           if (tableCount >= 25) break
           if (!Array.isArray(table.columns)) continue
+          // Mark primary keys and foreign keys for better agent understanding
           const colStr = table.columns
             .slice(0, 30)
-            .map(c => `${c.name} ${c.type}`)
+            .map(c => {
+              const name = String(c.name).replace(/[\r\n]/g, ' ').slice(0, 60)
+              const type = String(c.type).replace(/[\r\n]/g, ' ').slice(0, 60)
+              // Detect PK/FK patterns
+              if (name === 'id') return `${name} ${type} [PK]`
+              if (name.endsWith('_id') || name.endsWith('Id')) return `${name} ${type} [FK]`
+              return `${name} ${type}`
+            })
             .join(', ')
-          systemPrompt += `\n- ${table.name} (${colStr})`
+          // Include row count if available
+          const rowCount = currentData?.[table.name]?.length
+          const rowCountStr = rowCount !== undefined ? ` (${rowCount} rows sampled)` : ''
+          systemPrompt += `\n- ${table.name}${rowCountStr}: ${colStr}`
           tableCount++
         }
+        systemPrompt += `\n\n**[PK] = Primary Key, [FK] = Foreign Key (references another table's id)**`
       } else {
-        systemPrompt += `\n(No schema introspection available. Ask the user to describe the table if needed.)`
+        systemPrompt += `\n(No schema introspection available. Emit SHOW TABLES or SELECT table_name FROM information_schema.tables to discover the schema.)`
       }
       if (currentData && Object.keys(currentData).length > 0) {
         systemPrompt += `\n\n### SAMPLE ROWS (first row per table, truncated to 1KB each)`

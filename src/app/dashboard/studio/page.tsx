@@ -993,23 +993,22 @@ function StudioPageInner({
           const runSequentially = async () => {
             for (let idx = 0; idx < sqlBlocks.length; idx++) {
               const block = sqlBlocks[idx]
+              // For multi-statement SQL blocks, split by semicolons and check
+              // EACH statement's verb. The entire block is only read-only if
+              // ALL statements are read-only (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN).
               const stripped = stripSqlComments(block).trim()
-              const firstVerb = stripped.split(/\s+/)[0]?.toUpperCase() || ''
-              const isReadOnly =
-                firstVerb === 'SELECT' ||
-                firstVerb === 'WITH' ||
-                firstVerb === 'SHOW' ||
-                firstVerb === 'DESCRIBE' ||
-                firstVerb === 'EXPLAIN'
+              const statements = stripped.split(';').map(s => stripSqlComments(s).trim()).filter(Boolean)
+              const readOnlyVerbs = ['SELECT', 'WITH', 'SHOW', 'DESCRIBE', 'EXPLAIN', 'SET', 'USE']
+              const allReadOnly = statements.length > 0 && statements.every(stmt => {
+                const verb = stmt.split(/\s+/)[0]?.toUpperCase() || ''
+                return readOnlyVerbs.includes(verb)
+              })
 
-              if (isReadOnly && !isDestructiveSQL(block)) {
+              if (allReadOnly && !isDestructiveSQL(block)) {
                 // Auto-run reads immediately, no confirmation
                 await executeSqlBlockRef.current(assistantId, block, true)
               } else {
                 // For DDL/INSERT/UPDATE/DELETE: show a confirmation dialog.
-                // If there are multiple blocks, batch them so the user
-                // doesn't get N dialogs — instead they get one dialog per
-                // block but can quickly click through.
                 // We pass skipConfirm=false so executeSqlBlock shows the
                 // native confirm() dialog.
                 await executeSqlBlockRef.current(assistantId, block, false)
