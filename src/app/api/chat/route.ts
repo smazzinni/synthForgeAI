@@ -423,12 +423,12 @@ You are an autonomous agent. When given a complex task:
       })
     }
 
+    let clientCancelled = false
     const stream = new ReadableStream({
       async start(controller) {
         const decoder = new TextDecoder()
         let buffer = ''
         let closed = false
-        let clientCancelled = false
         // Accumulate content so we can sanitize signals before emitting to the
         // frontend. We buffer incrementally and emit sanitized chunks.
         let contentAccumulator = ''

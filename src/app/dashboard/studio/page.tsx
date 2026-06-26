@@ -365,13 +365,15 @@ function StudioPageInner({
           return
         }
 
-        if (result.connection.status === 'failed') {
-          toast.error(`Connection test failed: ${result.connection.error_message || 'unknown error'}`)
+        const conn = result.connection
+
+        if (conn.status === 'failed') {
+          toast.error(`Connection test failed: ${conn.error_message || 'unknown error'}`)
         }
 
-        setActiveConnectionId(result.connection.id)
-        setActiveConnectionName(result.connection.name)
-        setActiveConnectionDialect(result.connection.dialect)
+        setActiveConnectionId(conn.id)
+        setActiveConnectionName(conn.name)
+        setActiveConnectionDialect(conn.dialect)
 
         if (result.schema && result.schema.length > 0) {
           setGeneratedSchema(result.schema)
@@ -390,7 +392,7 @@ function StudioPageInner({
           if (hasRealHistory) return prev
           return prev.map(m => m.id === '1' ? {
             ...m,
-            content: `Connected to live ${result.connection.dialect} **"${result.connection.name}"**. I have direct access to this database — ask me anything and I'll run SQL against it.\n\n**Examples:**\n- "show me the first 10 rows of users"\n- "how many rows are in the orders table?"\n- "what tables are in this database?"\n- "add a status column to the orders table"\n\n**How it works:**\n- **SELECT** queries are auto-executed immediately — results appear inline below.\n- **INSERT / UPDATE / DELETE / DDL** operations show a confirmation dialog before executing.`,
+            content: `Connected to live ${conn.dialect} **"${conn.name}"**. I have direct access to this database — ask me anything and I'll run SQL against it.\n\n**Examples:**\n- "show me the first 10 rows of users"\n- "how many rows are in the orders table?"\n- "what tables are in this database?"\n- "add a status column to the orders table"\n\n**How it works:**\n- **SELECT** queries are auto-executed immediately — results appear inline below.\n- **INSERT / UPDATE / DELETE / DDL** operations show a confirmation dialog before executing.`,
           } : m)
         })
 
@@ -1121,7 +1123,7 @@ function StudioPageInner({
     setConversationId('')
     if (!isLiveDbMode) {
       setGeneratedSchema([])
-      setGeneratedData([])
+      setGeneratedData({})
       setDatabaseName('')
       setCurrentDatabaseId(undefined)
     }

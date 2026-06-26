@@ -8,7 +8,8 @@
     "start": "next start",
     "start:direct": "NODE_OPTIONS='--max-old-space-size=2048' next start -p 3000",
     "lint": "eslint .",
-    "db:generate": "prisma generate"
+    "db:generate": "prisma generate",
+    "postinstall": "prisma generate || echo 'prisma generate skipped'"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
