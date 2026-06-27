@@ -415,12 +415,19 @@ Rules:
 12. **Honor requested row counts** — if the user asks for 50 rows, generate 50 rows. Do NOT default to 10.
 13. **Retry limit: max 3 attempts** — if a SQL query fails, analyze the error, fix the query, and retry ONCE. If it fails again, STOP and report the error. Never retry the same broken query.
 
-### CRITICAL: "ADD MORE ROWS" MEANS APPEND, NOT REPLACE
-When the user says "add more rows", "insert more data", "add 50 more users", or any append-intent request:
+### CRITICAL: "ADD MORE ROWS" MEANS APPEND, NOT REPLACE — AND PROCEED IMMEDIATELY
+When the user says "add more rows", "add more data", "insert more data", "add 50 more users", or any append-intent request:
 - **NEVER emit DELETE FROM, TRUNCATE, or DROP TABLE** — these destroy existing data.
 - **ALWAYS generate INSERT statements with new, non-conflicting IDs** (use gen_random_uuid() or UUID() or auto-increment).
 - **If you need to check existing IDs**, emit a SELECT first: \`SELECT MAX(id) FROM <table>\` or \`SELECT id FROM <table> ORDER BY id DESC LIMIT 5\`.
 - **The new rows are APPENDED** to the existing data, not a replacement.
+- **PROCEED IMMEDIATELY — DO NOT ASK QUESTIONS.** When the user says "add more data in the DB" (or any vague append request) without specifying an amount, **DO NOT ask "how many rows?" or "which tables?"**. Instead:
+  1. Pick a **smart default of 10 new rows per table** (or 5 for large tables) and proceed.
+  2. Emit a SELECT to check existing max IDs / row counts FIRST (so you generate non-conflicting IDs and respect FKs).
+  3. Then emit INSERT statements for each table, appending to existing data.
+  4. Then emit a verification SELECT (e.g. \`SELECT COUNT(*) FROM <table>\`).
+  - The only exception: if the user EXPLICITLY asks a question or there is a genuine ambiguity that blocks ALL progress (e.g. "should I add data to a NEW table or an EXISTING one?" when no tables exist). Otherwise, act first, explain after.
+- **Work one table at a time** across multiple SQL blocks so the auto-execute + auto-continue feedback loop can verify each step: SELECT max(id) → INSERT → verify COUNT. The frontend auto-executes each block and auto-continues so you see the results and proceed to the next table.
 
 ### CRITICAL: REFERENTIAL INTEGRITY — PARENT BEFORE CHILD
 When inserting data into multiple related tables:
@@ -660,12 +667,17 @@ When you need MORE metadata than what's provided, emit a query to get it:
       })
     }
 
+    // BUGFIX: `clientCancelled` was declared inside `start()` so the
+    // `cancel()` method (a sibling) couldn't see it — throwing
+    // "clientCancelled is not defined" whenever the client aborted the
+    // stream (e.g. navigating away mid-response). Moved to a closure
+    // variable in the enclosing POST scope so both methods share it.
+    let clientCancelled = false
     const stream = new ReadableStream({
       async start(controller) {
         const decoder = new TextDecoder()
         let buffer = ''
         let closed = false
-        let clientCancelled = false
         // Accumulate content so we can sanitize signals before emitting to the
         // frontend. We buffer incrementally and emit sanitized chunks.
         let contentAccumulator = ''

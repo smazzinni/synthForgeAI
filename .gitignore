@@ -55,3 +55,9 @@ prompt
 server.log
 # Skills directory
 /skills/
+
+# Local sandbox artifacts (not part of the app)
+/.zscripts/
+/tool-results/
+/mini-services/
+/db/

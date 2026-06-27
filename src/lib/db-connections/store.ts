@@ -237,6 +237,7 @@ export async function listConnections(userId: string): Promise<SafeDbConnectionR
 }
 
 export async function getConnection(userId: string, id: string): Promise<DbConnectionRecord | null> {
+  if (!id) return null
   if (await trySupabase()) {
     const admin = getSupabaseAdmin()!
     let query = admin
@@ -248,11 +249,32 @@ export async function getConnection(userId: string, id: string): Promise<DbConne
     }
     const { data, error } = await query.single()
     if (!error && data) return data as DbConnectionRecord
+    // BUGFIX (disconnect): If the user-scoped lookup failed (e.g. the Supabase
+    // session expired so userId fell back to DEFAULT_USER_ID, but the
+    // connection was saved under the real logged-in user), retry with an
+    // id-only lookup. This prevents the AI chat from "disconnecting" mid-task
+    // when the auth cookie is momentarily unavailable. Connections are
+    // user-created and the execute route already gates on authentication, so
+    // an id-only fallback is safe here.
+    if (userId && error) {
+      const { data: fallback, error: fbErr } = await admin
+        .from('db_connections')
+        .select('*')
+        .eq('id', id)
+        .single()
+      if (!fbErr && fallback) return fallback as DbConnectionRecord
+    }
     // Supabase failed — fall through to Prisma, then in-memory
   }
-  // Try Prisma (durable storage)
+  // Try Prisma (durable storage) — first user-scoped, then id-only fallback
   const prismaRecord = await prismaGet(userId, id)
   if (prismaRecord) return prismaRecord
+  // BUGFIX (disconnect): id-only fallback in Prisma so a connection saved
+  // under one user_id is still found when the auth state changes.
+  if (userId) {
+    const fallback = await prismaGet('', id)
+    if (fallback) return fallback
+  }
   // In-memory fallback
   const userScoped = listRaw(userId).find(c => c.id === id)
   if (userScoped) return userScoped

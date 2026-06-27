@@ -53,7 +53,16 @@ export async function POST(request: NextRequest, { params }: Params) {
         const tableStats: Array<{ name: string; rowCount: number }> = []
         for (const table of schema.slice(0, 50)) {
           try {
-            const result = await executeSql(conn, `SELECT COUNT(*) AS cnt FROM "${table.name}"`)
+            // BUGFIX (MySQL introspect): Previously used Postgres-style double
+            // quotes (`FROM "table"`) which MySQL treats as a string literal
+            // by default (unless ANSI_QUOTES sql_mode is set), causing
+            // `SELECT COUNT(*) FROM "categories"` to fail with a syntax error.
+            // Now we quote identifiers correctly per dialect: backticks for
+            // MySQL, double quotes for Postgres.
+            const quotedName = conn.dialect === 'mysql'
+              ? `\`${table.name.replace(/`/g, '``')}\``
+              : `"${table.name.replace(/"/g, '""')}"`
+            const result = await executeSql(conn, `SELECT COUNT(*) AS cnt FROM ${quotedName}`)
             const cnt = result.rows[0]?.cnt ?? result.rows[0]?.count ?? 0
             tableStats.push({ name: table.name, rowCount: Number(cnt) || 0 })
           } catch {

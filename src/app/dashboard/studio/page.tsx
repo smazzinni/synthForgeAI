@@ -998,9 +998,14 @@ function StudioPageInner({
               content: displayText || (primarySqlBlock ? 'Here\'s the SQL:' : ''),
               sqlBlock: primarySqlBlock,
               sqlBlocks: sqlBlocks.length > 0 ? sqlBlocks : undefined,
-              // Explicitly null in live mode — option buttons shouldn't
-              // appear here even if the AI emits them by mistake.
-              interactiveOptions: null,
+              // BUGFIX (interactive options in live-DB mode): Previously
+              // hard-coded to `null`, which meant whenever the AI asked a
+              // question (e.g. "choose a size: small / medium / large") the
+              // choice buttons were silently discarded and the user had no
+              // way to answer — they could only re-type a free-form reply in
+              // the main chat box. Now we preserve the parsed options so the
+              // choices render AND a custom-answer input is shown below them.
+              interactiveOptions: lastInteractiveOptions,
             }
             : m
         ))
@@ -1075,10 +1080,19 @@ function StudioPageInner({
 
             // Auto-continue after read-only queries OR mutations so the AI
             // can see the results and proceed with the next step.
-            if ((hadReadOnlyQueries || hadMutations) && !isStreaming) {
+            // BUGFIX (auto-continue broken): Previously `!isStreaming` referenced
+            // a variable that did NOT exist in this scope (the only `isStreaming`
+            // is a local const inside a different useEffect). This threw a
+            // ReferenceError which was silently caught by the .catch() below,
+            // so the auto-continue NEVER fired — meaning the AI executed the
+            // first SQL block but never received the results, stalling the
+            // multi-step "introspect → insert → verify" loop. Fix: use
+            // `loadingRef.current` (the authoritative loading flag), which is
+            // false at this point because the stream already finished.
+            if ((hadReadOnlyQueries || hadMutations) && !loadingRef.current) {
               setTimeout(() => {
                 const lastMsg = messagesRef.current[messagesRef.current.length - 1]
-                if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isStreaming) {
+                if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isStreaming && !loadingRef.current) {
                   sendMessage('[Auto-continue: SQL executed successfully. Results are in conversation history. Proceed with the next step.]')
                 }
               }, 1500)
@@ -1725,7 +1739,14 @@ function StudioPageInner({
   const generateSchemaSQL = (): string => generateSchemaSQLHelper(generatedSchema, databaseName)
 
   // ─── Handle option button click ───
-  const handleOptionClick = (choice: OptionChoice) => {
+  // Collapses the (now answered) question so the bubble doesn't keep
+  // showing stale choice buttons after the user has picked one.
+  const handleOptionClick = (choice: OptionChoice, messageId?: string) => {
+    if (messageId) {
+      setMessages(prev => prev.map(m =>
+        m.id === messageId ? { ...m, interactiveOptions: null } : m
+      ))
+    }
     sendMessage(choice.value)
   }
 
@@ -2749,7 +2770,7 @@ function StudioPageInner({
                       {message.interactiveOptions.choices.map((choice) => (
                         <button
                           key={choice.value}
-                          onClick={() => handleOptionClick(choice)}
+                          onClick={() => handleOptionClick(choice, message.id)}
                           disabled={message.isStreaming}
                           className={`text-[10px] px-2.5 py-1 rounded-full border transition-colors ${
                             message.isStreaming ? 'opacity-50 cursor-not-allowed' : ''
@@ -2763,6 +2784,50 @@ function StudioPageInner({
                         </button>
                       ))}
                     </div>
+                    {/* Custom answer input — lets the user type their own
+                        answer instead of picking one of the preset choices.
+                        The answer is sent as a normal chat message so the AI
+                        can respond to any free-form input (e.g. "200 rows",
+                        "medium, US locale"). Disabled while the AI is
+                        streaming. Pressing Enter or clicking the send button
+                        submits the custom answer. */}
+                    {!message.isStreaming && (
+                      <form
+                        className="flex items-center gap-1 mt-1.5"
+                        onSubmit={(e) => {
+                          e.preventDefault()
+                          const el = e.currentTarget.elements.namedItem('custom-answer') as HTMLInputElement | null
+                          if (!el) return
+                          const val = el.value.trim()
+                          if (!val) return
+                          el.value = ''
+                          // Collapse the options once the user has answered so
+                          // the bubble doesn't keep showing the (now stale)
+                          // question + buttons.
+                          setMessages(prev => prev.map(m =>
+                            m.id === message.id ? { ...m, interactiveOptions: null } : m
+                          ))
+                          sendMessage(val)
+                        }}
+                      >
+                        <Input
+                          name="custom-answer"
+                          placeholder="Or type your own answer…"
+                          className="h-7 text-[11px] flex-1"
+                          aria-label="Custom answer"
+                        />
+                        <Button
+                          type="submit"
+                          size="sm"
+                          variant="secondary"
+                          className="h-7 px-2 text-[10px] gap-1 shrink-0"
+                          aria-label="Send custom answer"
+                        >
+                          <Send className="h-3 w-3" />
+                          Send
+                        </Button>
+                      </form>
+                    )}
                   </div>
                 )}
 

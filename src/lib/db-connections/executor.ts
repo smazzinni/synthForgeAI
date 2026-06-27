@@ -37,7 +37,14 @@ const globalForPool = globalThis as unknown as {
 }
 const poolCache: Map<string, PoolEntry> =
   globalForPool.__synthPoolCache ?? (globalForPool.__synthPoolCache = new Map())
-const POOL_TTL_MS = 10 * 60 * 1000
+// BUGFIX (disconnect): Increased from 10 → 30 minutes. During long AI chat
+// sessions (DeepSeek reasoning can take 30-60s per turn, and multi-step
+// agent loops run several turns), a 10-minute TTL could evict the pool
+// between queries — forcing a fresh TCP+auth+SSL handshake on the next
+// SQL execution, which added latency and occasionally failed if the
+// provider rate-limits new connections. 30 minutes keeps the pool warm
+// for the duration of a typical chat session.
+const POOL_TTL_MS = 30 * 60 * 1000
 
 /**
  * Evict (close + remove) a cached pool. Called by the connections PATCH
@@ -170,17 +177,30 @@ async function getPool(conn: DbConnectionRecord): Promise<PoolEntry> {
 
   if (conn.dialect === 'mysql') {
     const createPool = await getMysqlPool()
+    // BUGFIX (SSL): Previously `ssl: conn.ssl ? {} : undefined` — passing `{}`
+    // enables SSL but defaults to `rejectUnauthorized: true`, which rejects
+    // servers using self-signed certificates (the common case for shared
+    // hosting providers like freedb.tech, PlanetScale, etc.). This made the
+    // "Use SSL" toggle appear broken: every SSL connection failed with
+    // "self-signed certificate in certificate chain".
+    // Fix: explicitly set `rejectUnauthorized: false` so SSL is used for
+    // transport encryption but self-signed / provider certs are accepted.
+    // This mirrors the Postgres SSL behaviour (`rejectUnauthorized: false`)
+    // and the `sslmode=require` tradeoff that psql makes by default.
     const pool = createPool({
       host: conn.host,
       port: conn.port,
       user: conn.username,
       password: conn.password,
       database: conn.database,
-      ssl: conn.ssl ? {} : undefined,
+      ssl: conn.ssl ? { rejectUnauthorized: false } : undefined,
       waitForConnections: true,
       connectionLimit: 5,
       queueLimit: 0,
-      connectTimeout: 10000,
+      connectTimeout: 20000,
+      // Acquire timeout — how long to wait for a connection from the pool
+      // before giving up. AI-driven multi-statement flows can take a while.
+      acquireTimeout: 30000,
     })
     const entry: PoolEntry = {
       pool,
