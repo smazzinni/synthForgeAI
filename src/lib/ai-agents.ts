@@ -178,36 +178,51 @@ export function parseAgentStatus(content: string): AgentStatus | null {
 export function parseAllInteractiveOptions(content: string): InteractiveOptions[] {
   const results: InteractiveOptions[] = []
 
-  // Find all occurrences of {"type":"options" and extract each one
-  const markerStrict = '{"type":"options"'
-  const markerLoose = '{"type": "options"'
+  // Find all occurrences of {"type":"options" or {"options":{ and extract each one
+  // The AI sometimes emits {"type":"options",...} and sometimes {"options":{...}}
+  const markers = [
+    '{"type":"options"',
+    '{"type": "options"',
+    '{"options":',
+    '{"options": ',
+  ]
 
   let searchFrom = 0
   while (searchFrom < content.length) {
-    let idx = content.indexOf(markerStrict, searchFrom)
-    if (idx === -1) idx = content.indexOf(markerLoose, searchFrom)
-    if (idx === -1) break
+    // Find the earliest marker from the current position
+    let earliestIdx = -1
+    let earliestMarker = ''
+    for (const marker of markers) {
+      const idx = content.indexOf(marker, searchFrom)
+      if (idx !== -1 && (earliestIdx === -1 || idx < earliestIdx)) {
+        earliestIdx = idx
+        earliestMarker = marker
+      }
+    }
+    if (earliestIdx === -1) break
 
-    const jsonStr = extractJsonObject(content, idx)
+    const jsonStr = extractJsonObject(content, earliestIdx)
     if (jsonStr) {
       try {
         const parsed = JSON.parse(jsonStr)
-        if (parsed?.type === 'options' && Array.isArray(parsed.choices)) {
+        // Handle both {"type":"options",...} and {"options":{...}} formats
+        const opts = parsed?.type === 'options' ? parsed : (parsed?.options || null)
+        if (opts && Array.isArray(opts.choices)) {
           results.push({
-            question: String(parsed.question || ''),
-            choices: parsed.choices.map((c: { label?: string; value?: string }) => ({
+            question: String(opts.question || ''),
+            choices: opts.choices.map((c: { label?: string; value?: string }) => ({
               label: String(c.label || c.value || ''),
               value: String(c.value || c.label || ''),
             })),
-            multi: Boolean(parsed.multi),
+            multi: Boolean(opts.multi),
           })
         }
       } catch {
         // Not parseable, skip
       }
-      searchFrom = idx + jsonStr.length
+      searchFrom = earliestIdx + jsonStr.length
     } else {
-      searchFrom = idx + markerStrict.length
+      searchFrom = earliestIdx + earliestMarker.length
     }
   }
 

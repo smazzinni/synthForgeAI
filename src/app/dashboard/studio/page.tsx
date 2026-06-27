@@ -1037,6 +1037,7 @@ function StudioPageInner({
           // referencing users) resolve in order.
           const runSequentially = async () => {
             let hadReadOnlyQueries = false
+            let hadMutations = false
             for (let idx = 0; idx < sqlBlocks.length; idx++) {
               const block = sqlBlocks[idx]
               const stripped = stripSqlComments(block).trim()
@@ -1047,32 +1048,40 @@ function StudioPageInner({
                 return readOnlyVerbs.includes(verb)
               })
 
-              if (allReadOnly && !isDestructiveSQL(block)) {
+              // Check if this is a destructive operation (DROP TABLE, DELETE
+              // without WHERE, TRUNCATE) — these ALWAYS need confirmation.
+              // Non-destructive mutations (INSERT, CREATE TABLE, UPDATE with
+              // WHERE) are auto-executed in live-DB mode so the Data Generator
+              // can insert data without the user clicking "Run" on every block.
+              const isDestructive = isDestructiveSQL(block)
+
+              if (allReadOnly && !isDestructive) {
+                // Read-only queries: auto-execute, no confirmation
                 hadReadOnlyQueries = true
                 await executeSqlBlockRef.current(assistantId, block, true)
+              } else if (!isDestructive) {
+                // Non-destructive mutations (INSERT, CREATE TABLE, UPDATE with WHERE):
+                // Auto-execute WITHOUT confirmation — the AI is generating data and
+                // should be able to insert it directly. The user asked for data
+                // generation, so confirming every INSERT would be annoying.
+                hadMutations = true
+                await executeSqlBlockRef.current(assistantId, block, true) // skipConfirm=true
               } else {
+                // Destructive operations (DROP, TRUNCATE, DELETE without WHERE):
+                // ALWAYS require confirmation, even in auto-execute mode.
                 await executeSqlBlockRef.current(assistantId, block, false)
               }
             }
 
-            // BUGFIX (Root cause #2): If we auto-executed read-only queries
-            // (SELECT/SHOW/DESCRIBE), the AI was following a multi-step plan
-            // ("fetch data → analyze → generate INSERTs"). The results are now
-            // stored in message.sqlBlockResult / sqlBlockStates. Auto-continue
-            // by sending a follow-up message so the AI can see the results
-            // (they're wired into history now) and proceed with the next step.
-            if (hadReadOnlyQueries && !isStreaming) {
-              // Wait a bit for the UI to update with results, then auto-continue
+            // Auto-continue after read-only queries OR mutations so the AI
+            // can see the results and proceed with the next step.
+            if ((hadReadOnlyQueries || hadMutations) && !isStreaming) {
               setTimeout(() => {
-                // Only auto-continue if the last message was the assistant's
-                // (don't continue if the user typed something new)
                 const lastMsg = messagesRef.current[messagesRef.current.length - 1]
                 if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isStreaming) {
-                  // Send a minimal continuation prompt — the AI will see the
-                  // SQL results in the history and know to proceed
-                  sendMessage('[Auto-continue: SQL queries executed successfully. Results are available in the conversation history. Please proceed with the next step based on the query results.]')
+                  sendMessage('[Auto-continue: SQL executed successfully. Results are in conversation history. Proceed with the next step.]')
                 }
-              }, 1500) // 1.5s delay to let UI settle
+              }, 1500)
             }
           }
           runSequentially().catch(err => {
