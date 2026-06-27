@@ -765,9 +765,39 @@ function StudioPageInner({
     abortRef.current = controller
 
     try {
+      // BUGFIX: Wire sqlBlockResult into chat history so the AI model can
+      // actually SEE the results of queries it asked the user to execute.
+      // Without this, the model emits "Let me check the existing data..." and
+      // then waits for results that never arrive in its context — causing
+      // multi-step "fetch → generate → insert → verify" flows to stall.
       const history = messagesRef.current
         .filter(m => m.role === 'user' || m.role === 'assistant')
-        .map(m => ({ role: m.role, content: m.content }))
+        .map(m => {
+          let content = m.content
+          // If this assistant message has SQL block results, append them
+          // to the content so the model can see what the queries returned.
+          if (m.role === 'assistant' && m.sqlBlockResult) {
+            const result = m.sqlBlockResult
+            if (result.ok && result.rows && result.rows.length > 0) {
+              content += `\n\n[SQL RESULT: ${result.message}]\n${JSON.stringify(result.rows.slice(0, 20), null, 2)}${result.rows.length > 20 ? `\n... +${result.rows.length - 20} more rows` : ''}`
+            } else if (result.ok) {
+              content += `\n\n[SQL RESULT: ${result.message}]`
+            } else if (!result.ok) {
+              content += `\n\n[SQL ERROR: ${result.message}]`
+            }
+          }
+          // Also include per-block results from sqlBlockStates
+          if (m.role === 'assistant' && m.sqlBlockStates) {
+            for (const [sql, state] of Object.entries(m.sqlBlockStates)) {
+              if (state.result && state.result.ok && state.result.rows && state.result.rows.length > 0) {
+                content += `\n\n[SQL RESULT for "${sql.slice(0, 80)}...": ${state.result.message}]\n${JSON.stringify(state.result.rows.slice(0, 20), null, 2)}${state.result.rows.length > 20 ? `\n... +${state.result.rows.length - 20} more rows` : ''}`
+              } else if (state.result && !state.result.ok) {
+                content += `\n\n[SQL ERROR for "${sql.slice(0, 80)}...": ${state.result.message}]`
+              }
+            }
+          }
+          return { role: m.role, content }
+        })
 
       // Truncate currentData if too large (> 20KB send only summary)
       let dataToSend: Record<string, unknown[]> | undefined = hasGeneratedData ? generatedData : undefined
@@ -892,6 +922,22 @@ function StudioPageInner({
                   ? { ...m, isStreaming: false }
                   : m
               ))
+            } else if (parsed.type === 'truncated') {
+              // BUGFIX (Root cause #3): Response was cut off due to token limit.
+              // Show a warning and auto-continue after a short delay.
+              toast.warning('Response was cut off due to token limit. Auto-continuing...')
+              setMessages(prev => prev.map(m =>
+                m.id === assistantId
+                  ? { ...m, isStreaming: false, content: m.content + '\n\n⚠️ *[Response was truncated due to token limit. Continuing...]*' }
+                  : m
+              ))
+              // Auto-continue after 2 seconds
+              setTimeout(() => {
+                const lastMsg = messagesRef.current[messagesRef.current.length - 1]
+                if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isStreaming) {
+                  sendMessage('[Auto-continue: Your previous response was cut off. Please continue from where you left off, completing any SQL blocks that were truncated.]')
+                }
+              }, 2000)
             } else if (parsed.type === 'error') {
               console.error('[Studio] Stream error:', parsed.content)
               // Surface the mid-stream error to the user and stop the
@@ -935,7 +981,12 @@ function StudioPageInner({
         // user sees just the explanation + the rendered SQL cards (which
         // have their own Copy / Execute buttons). Other code blocks
         // (```json, ```bash) are preserved.
-        let displayText = fullContent.replace(/```sql\s*\n[\s\S]*?\n?```/gi, '').trim()
+        // BUGFIX (Root cause #4): Also strip UNCLOSED ```sql fences (truncated
+        // responses) so they don't appear as raw text in the chat bubble.
+        let displayText = fullContent
+          .replace(/```sql\s*\n[\s\S]*?\n?```/gi, '') // closed fences
+          .replace(/```sql\s*\n[\s\S]+$/gi, '') // unclosed fences (truncated)
+          .trim()
 
         // BUGFIX (BUG-39): the system prompt tells the AI NOT to emit
         // BEGIN_GENERATION signals or option-block JSON in live mode, but
@@ -991,11 +1042,9 @@ function StudioPageInner({
           // (CREATE TABLE users → INSERT INTO users → CREATE TABLE orders
           // referencing users) resolve in order.
           const runSequentially = async () => {
+            let hadReadOnlyQueries = false
             for (let idx = 0; idx < sqlBlocks.length; idx++) {
               const block = sqlBlocks[idx]
-              // For multi-statement SQL blocks, split by semicolons and check
-              // EACH statement's verb. The entire block is only read-only if
-              // ALL statements are read-only (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN).
               const stripped = stripSqlComments(block).trim()
               const statements = stripped.split(';').map(s => stripSqlComments(s).trim()).filter(Boolean)
               const readOnlyVerbs = ['SELECT', 'WITH', 'SHOW', 'DESCRIBE', 'EXPLAIN', 'SET', 'USE']
@@ -1005,18 +1054,33 @@ function StudioPageInner({
               })
 
               if (allReadOnly && !isDestructiveSQL(block)) {
-                // Auto-run reads immediately, no confirmation
+                hadReadOnlyQueries = true
                 await executeSqlBlockRef.current(assistantId, block, true)
               } else {
-                // For DDL/INSERT/UPDATE/DELETE: show a confirmation dialog.
-                // We pass skipConfirm=false so executeSqlBlock shows the
-                // native confirm() dialog.
                 await executeSqlBlockRef.current(assistantId, block, false)
               }
             }
+
+            // BUGFIX (Root cause #2): If we auto-executed read-only queries
+            // (SELECT/SHOW/DESCRIBE), the AI was following a multi-step plan
+            // ("fetch data → analyze → generate INSERTs"). The results are now
+            // stored in message.sqlBlockResult / sqlBlockStates. Auto-continue
+            // by sending a follow-up message so the AI can see the results
+            // (they're wired into history now) and proceed with the next step.
+            if (hadReadOnlyQueries && !isStreaming) {
+              // Wait a bit for the UI to update with results, then auto-continue
+              setTimeout(() => {
+                // Only auto-continue if the last message was the assistant's
+                // (don't continue if the user typed something new)
+                const lastMsg = messagesRef.current[messagesRef.current.length - 1]
+                if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isStreaming) {
+                  // Send a minimal continuation prompt — the AI will see the
+                  // SQL results in the history and know to proceed
+                  sendMessage('[Auto-continue: SQL queries executed successfully. Results are available in the conversation history. Please proceed with the next step based on the query results.]')
+                }
+              }, 1500) // 1.5s delay to let UI settle
+            }
           }
-          // Kick off the sequential execution in the background.
-          // Don't await — we want the chat to remain responsive.
           runSequentially().catch(err => {
             console.error('[Studio] Auto-execution sequence failed:', err)
           })

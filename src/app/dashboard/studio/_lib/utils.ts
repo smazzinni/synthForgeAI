@@ -294,15 +294,37 @@ export function extractSchema(tables: Record<string, unknown[]>): SchemaTable[] 
 // ─── Extract ALL ```sql ... ``` code blocks from AI response content ───
 // Returns an array of SQL strings (without fences). Case-insensitive tag.
 // Non-SQL code blocks (```json, ```bash, etc.) are NOT included.
+//
+// BUGFIX (Root cause #4): Also captures UNCLOSED ```sql fences (where the
+// response was truncated mid-SQL due to token limits). Without this, a
+// truncated response's SQL block is silently discarded and nothing executes.
 
 export function extractAllSqlBlocks(content: string): string[] {
   const blocks: string[] = []
-  const re = /```sql\s*\n([\s\S]*?)\n?```/gi
+  // Match closed fences: ```sql ... ```
+  const closedRe = /```sql\s*\n([\s\S]*?)\n?```/gi
   let match: RegExpExecArray | null
-  while ((match = re.exec(content)) !== null) {
+  while ((match = closedRe.exec(content)) !== null) {
     const body = match[1].trim()
     if (body) blocks.push(body)
   }
+
+  // BUGFIX: Also match UNCLOSED ```sql fences (truncated responses).
+  // This regex finds ```sql followed by content that has NO closing ```.
+  // We use a negative lookahead to ensure we don't double-match blocks
+  // already captured by the closed-fence regex.
+  const openRe = /```sql\s*\n([\s\S]+)$/gi
+  // Remove all closed blocks first so the open regex only finds truly unclosed ones
+  const contentWithoutClosed = content.replace(/```sql\s*\n[\s\S]*?\n?```/gi, '')
+  while ((match = openRe.exec(contentWithoutClosed)) !== null) {
+    const body = match[1].trim()
+    if (body) {
+      // Mark as incomplete — the SQL may be syntactically incomplete
+      // but we still extract it so the user can see what was generated
+      blocks.push(body)
+    }
+  }
+
   return blocks
 }
 

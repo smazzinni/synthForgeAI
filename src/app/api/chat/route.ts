@@ -5,7 +5,7 @@ const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'
 const DEEPSEEK_REASONING_MODEL = process.env.DEEPSEEK_REASONING_MODEL || DEEPSEEK_MODEL
-const DEEPSEEK_MAX_TOKENS = parseInt(process.env.DEEPSEEK_MAX_TOKENS || '16000', 10)
+const DEEPSEEK_MAX_TOKENS = parseInt(process.env.DEEPSEEK_MAX_TOKENS || '32000', 10)
 const DEEPSEEK_THINKING_ENABLED = process.env.DEEPSEEK_THINKING_ENABLED === 'true'
 const STREAM_THINKING_CONTENT = process.env.STREAM_THINKING_CONTENT === 'true'
 
@@ -432,10 +432,27 @@ When inserting data into multiple related tables:
 
 ### PERMISSIONS — YOU CAN PERFORM ANY OPERATION
 You have full read/write/DDL permissions on this database. You may emit SQL for ANY of these operations:
-- **Read**: SELECT, SHOW, DESCRIBE, EXPLAIN — auto-executed by the frontend, results shown inline
+- **Read**: SELECT, SHOW, DESCRIBE, EXPLAIN — auto-executed by the frontend, results shown inline AND sent back to you in the next turn as [SQL RESULT: ...]
 - **Write**: INSERT, UPDATE, DELETE — frontend shows a confirmation dialog, then executes
 - **DDL**: CREATE TABLE, ALTER TABLE, DROP TABLE, CREATE INDEX, CREATE DATABASE — frontend confirms, then executes
 - **Destructive**: TRUNCATE, DROP TABLE, DROP DATABASE, DELETE without WHERE — frontend confirms with an extra warning dialog, then executes
+
+### CRITICAL: QUERY RESULTS ARE AVAILABLE IN YOUR NEXT TURN
+When you emit a SELECT/SHOW/DESCRIBE query, the frontend AUTO-EXECUTES it and includes the results in the conversation history as:
+\`\`\`
+[SQL RESULT: Returned N row(s)]
+[{...row1...}, {...row2...}, ...]
+\`\`\`
+You WILL see these results in your next turn — you do NOT need to ask the user to "run the query and tell me the results." The system automatically:
+1. Executes your read-only SQL
+2. Includes the results in the next message's context
+3. Auto-continues so you can proceed based on the results
+
+This means your multi-step workflow (RESEARCH → PLAN → EXECUTE → VERIFY) works as a real feedback loop:
+- Step 1: Emit SELECT to check existing data → results come back automatically
+- Step 2: Based on results, emit INSERT/CREATE statements
+- Step 3: Emit verification SELECT → results come back automatically
+- Step 4: Confirm success or self-heal
 
 ### AUTONOMOUS MULTI-AGENT BEHAVIOR — RESEARCH, PLAN, EXECUTE, VERIFY, SELF-HEAL
 You are the **Main Orchestrator Agent** with full authority over sub-agents. When given a complex task:
@@ -757,6 +774,16 @@ When you need MORE metadata than what's provided, emit a query to get it:
                 if (choice.finish_reason) {
                   // Final flush
                   flushSafe()
+                  // BUGFIX (Root cause #3): If finish_reason is 'length', the
+                  // response was cut off mid-token due to max_tokens limit.
+                  // Send a special event so the frontend can warn the user
+                  // or auto-continue the generation.
+                  if (choice.finish_reason === 'length') {
+                    safeEnqueue(encoder.encode(`data: ${JSON.stringify({
+                      type: 'truncated',
+                      message: 'Response was cut off due to token limit. The SQL block may be incomplete.',
+                    })}\n\n`))
+                  }
                   safeEnqueue(encoder.encode(`data: ${JSON.stringify({
                     type: 'finish',
                     reason: choice.finish_reason,
