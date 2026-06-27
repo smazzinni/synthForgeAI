@@ -74,9 +74,28 @@ export async function POST(request: NextRequest, { params }: Params) {
       if (!sql || typeof sql !== 'string') {
         return NextResponse.json({ error: 'sql is required for execute/verify actions' }, { status: 400 })
       }
+      // BUGFIX (BUG-64): Gate destructive SQL behind requiresConfirmation,
+      // the same way /api/connections/execute does. Without this, the
+      // autonomous agent loop could run DROP TABLE / DELETE without
+      // confirmation on a real external database.
+      const { isDestructiveSQL, stripSqlComments } = await import('@/lib/ai-agents')
+      const strippedForCheck = stripSqlComments(sql.trim()).trim()
+      const firstWord = strippedForCheck.split(/\s+/)[0]?.toUpperCase() || ''
+      const isDestructive = isDestructiveSQL(strippedForCheck)
+      const destructivePatterns = ['DROP', 'TRUNCATE', 'DELETE']
+      const isDestructiveVerb = destructivePatterns.includes(firstWord)
+
+      if (isDestructive || isDestructiveVerb) {
+        return NextResponse.json({
+          error: 'This is a destructive operation. Confirm in the chat before executing.',
+          requiresConfirmation: true,
+          sql: sql.trim(),
+          destructive: true,
+        }, { status: 200 })
+      }
+
       // Execute the SQL. For 'verify' we expect a SELECT; for 'execute'
-      // we allow any statement. Either way, the result includes rows +
-      // affectedRows + error so the agent can decide what to do next.
+      // we allow any non-destructive statement.
       const result = await executeSql(conn, sql)
       return NextResponse.json(result, { status: result.error ? 400 : 200 })
     }

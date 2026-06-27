@@ -333,7 +333,52 @@ export async function POST(request: NextRequest) {
     }
 
     // ─── Data accumulation state ───
+    // BUGFIX (BUG-60): Seed allTableData with existing data from the database
+    // so that "add more rows" APPENDS to existing data instead of replacing it.
+    // Without this, the final write overwrites the stored data with only the
+    // rows generated in THIS request, causing data loss on every edit.
     const allTableData: Record<string, unknown[]> = {}
+    if (databaseId) {
+      try {
+        if (admin) {
+          const { data: existingDb } = await admin
+            .from('synthetic_databases')
+            .select('data_json')
+            .eq('id', databaseId)
+            .single()
+          const existingData = (existingDb?.data_json as Record<string, unknown[]>) || {}
+          if (existingData && typeof existingData === 'object') {
+            // Deep-clone existing data into allTableData so we don't mutate the original
+            for (const [table, rows] of Object.entries(existingData)) {
+              if (Array.isArray(rows)) {
+                allTableData[table] = [...rows]
+              }
+            }
+            console.log(`[Generate-Stream] Seeded allTableData with ${Object.keys(allTableData).length} existing table(s) (${Object.values(allTableData).reduce((s, r) => s + r.length, 0)} total rows)`)
+          }
+        } else {
+          // Prisma / in-memory fallback
+          const { getDatabasePrisma } = await import('@/lib/prisma-store')
+          const { getDatabaseInMemory: getInMemory } = await import('@/lib/in-memory-store')
+          let existing: { data_json?: Record<string, unknown[]> } | null = null
+          try {
+            existing = await getDatabasePrisma(userId, databaseId)
+          } catch {
+            existing = getInMemory(userId, databaseId)
+          }
+          if (existing?.data_json && typeof existing.data_json === 'object') {
+            for (const [table, rows] of Object.entries(existing.data_json)) {
+              if (Array.isArray(rows)) {
+                allTableData[table] = [...rows]
+              }
+            }
+            console.log(`[Generate-Stream] Seeded allTableData (Prisma/in-memory) with ${Object.keys(allTableData).length} existing table(s)`)
+          }
+        }
+      } catch (err) {
+        console.warn('[Generate-Stream] Failed to seed existing data (will start fresh):', err)
+      }
+    }
     let currentTable = ''
     let insertQueue: unknown[] = []
     let totalInserted = 0
@@ -341,6 +386,9 @@ export async function POST(request: NextRequest) {
     let lastFlushTime = Date.now()
     let malformedLines = 0
     let lastFinishReason = ''
+
+    // Track how many rows existed BEFORE this request (for accurate row_count)
+    const existingRowCount = Object.values(allTableData).reduce((sum, rows) => sum + rows.length, 0)
 
     const sendSSE = (event: SSEEvent): Uint8Array => {
       return encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
@@ -376,7 +424,7 @@ export async function POST(request: NextRequest) {
               .from('synthetic_databases')
               .update({
                 data_json: existingData,
-                row_count: totalInserted + records.length,
+                row_count: existingRowCount + totalInserted,
               })
               .eq('id', databaseId)
           } catch (err) {
@@ -384,6 +432,9 @@ export async function POST(request: NextRequest) {
           }
         } else {
           // Prisma-backed durable storage (with in-memory fallback)
+          // BUGFIX (BUG-60): allTableData already contains existing data
+          // (seeded at the start), so we persist it directly — no need to
+          // re-fetch and merge. The row_count includes existing + new rows.
           try {
             const merged: Record<string, unknown[]> = {}
             for (const [t, rows] of Object.entries(allTableData)) {
@@ -392,12 +443,12 @@ export async function POST(request: NextRequest) {
             try {
               updateDatabasePrisma(userId, databaseId, {
                 data_json: merged,
-                row_count: totalInserted + records.length,
+                row_count: existingRowCount + totalInserted,
               }).catch(() => {})
             } catch {
               updateDatabaseInMemory(userId, databaseId, {
                 data_json: merged,
-                row_count: totalInserted + records.length,
+                row_count: existingRowCount + totalInserted,
               })
             }
           } catch (err) {
@@ -859,6 +910,10 @@ export async function POST(request: NextRequest) {
           }
 
           // ─── Update database status ───
+          // BUGFIX (BUG-60): allTableData was seeded with existing data at the
+          // start, so this write now correctly MERGES new data with existing data.
+          // The row_count includes both existing and newly-generated rows.
+          const finalRowCount = existingRowCount + totalInserted
           if (databaseId) {
             if (admin) {
               try {
@@ -868,7 +923,7 @@ export async function POST(request: NextRequest) {
                     status: 'ready',
                     data_json: allTableData,
                     schema_json: body.schema,
-                    row_count: totalInserted,
+                    row_count: finalRowCount,
                     quality_score: 0.85,
                   })
                   .eq('id', databaseId)
@@ -884,7 +939,7 @@ export async function POST(request: NextRequest) {
                     status: 'ready',
                     data_json: allTableData,
                     schema_json: body.schema,
-                    row_count: totalInserted,
+                    row_count: finalRowCount,
                     quality_score: 0.85,
                   })
                 } catch {
@@ -892,7 +947,7 @@ export async function POST(request: NextRequest) {
                     status: 'ready',
                     data_json: allTableData,
                     schema_json: body.schema,
-                    row_count: totalInserted,
+                    row_count: finalRowCount,
                     quality_score: 0.85,
                   })
                 }

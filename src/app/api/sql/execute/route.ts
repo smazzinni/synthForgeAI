@@ -40,7 +40,11 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'SQL query is required' }, { status: 400 })
     }
 
-    const trimmedSql = sql.trim()
+    // BUGFIX (BUG-66): Strip trailing semicolons BEFORE any regex parsing.
+    // Without this, `WHERE active = true;` captures the semicolon in the
+    // value (`true;`), which never matches the stored boolean, causing
+    // silent false negatives (0 rows returned for valid data).
+    const trimmedSql = sql.trim().replace(/;\s*$/, '')
     if (trimmedSql.length === 0) {
       return NextResponse.json({ error: 'SQL query cannot be empty' }, { status: 400 })
     }
@@ -50,9 +54,6 @@ export async function POST(request: NextRequest) {
     }
 
     // Strip leading SQL line/block comments before classifying the statement.
-    // The AI is instructed to prefix destructive statements with explanatory
-    // `-- DESTRUCTIVE: ...` comments, so without stripping the firstWord
-    // check would always be `--` and reject every AI-generated query.
     const strippedForCheck = stripSqlComments(trimmedSql)
     const firstWord = strippedForCheck.split(/\s+/)[0]?.toUpperCase() || ''
     if (!ALLOWED_STATEMENTS.includes(firstWord)) {
@@ -338,89 +339,90 @@ function executeSelect(
 function applyWhere(rows: Record<string, unknown>[], where: string): Record<string, unknown>[] {
   // Strip trailing clauses the main regex didn't capture (ORDER BY / LIMIT)
   const cleaned = where.replace(/\s+ORDER\s+BY\s+.*$/is, '').replace(/\s+LIMIT\s+\d+.*$/is, '').trim()
-  const conditions = cleaned.split(/\s+AND\s+/i)
+
+  // BUGFIX (BUG-67): Support OR in addition to AND.
+  // Split on OR first (lower precedence), then AND within each OR group.
+  // A row matches if ANY OR group is fully satisfied (all AND conditions in it).
+  const orGroups = cleaned.split(/\s+OR\s+/i)
 
   return rows.filter(row => {
-    return conditions.every(cond => {
-      const trimmed = cond.trim()
+    return orGroups.some(orGroup => {
+      const conditions = orGroup.split(/\s+AND\s+/i)
+      return conditions.every(cond => {
+        const trimmed = cond.trim().replace(/;$/, '') // BUG-66: strip trailing semicolons
 
-      // IS NULL / IS NOT NULL
-      const isNullMatch = trimmed.match(/(\w+)\s+IS\s+NOT\s+NULL$/i)
-      if (isNullMatch) {
-        return row[isNullMatch[1]] !== null && row[isNullMatch[1]] !== undefined
-      }
-      const isNotNullMatch = trimmed.match(/(\w+)\s+IS\s+NULL$/i)
-      if (isNotNullMatch) {
-        return row[isNotNullMatch[1]] === null || row[isNotNullMatch[1]] === undefined
-      }
-
-      // IN (v1, v2, ...)
-      const inMatch = trimmed.match(/(\w+)\s+IN\s*\(([^)]+)\)/i)
-      if (inMatch) {
-        const col = inMatch[1]
-        const values = inMatch[2].split(',').map(v => parseScalar(v.trim()))
-        return values.some(v => row[col] === v || String(row[col]) === String(v))
-      }
-
-      // !=, <> (not equal)
-      const neMatch = trimmed.match(/(\w+)\s*(?:!=|<>)\s*'?([^']*)'?/)
-      if (neMatch) {
-        const col = neMatch[1]
-        const val = neMatch[2]
-        // BUGFIX (BUG-27): previously unrecognized operators fell through to
-        // `return true`, which meant `WHERE age != 18` matched ALL rows.
-        return String(row[col]) !== val
-      }
-
-      // >=, <= (must be checked BEFORE > and <)
-      const gteMatch = trimmed.match(/(\w+)\s*>=\s*'?([^']*)'?/)
-      if (gteMatch) {
-        const col = gteMatch[1]
-        const val = Number(gteMatch[2])
-        if (!Number.isNaN(val)) {
-          return typeof row[col] === 'number' && (row[col] as number) >= val
+        // IS NULL / IS NOT NULL
+        const isNullMatch = trimmed.match(/(\w+)\s+IS\s+NOT\s+NULL$/i)
+        if (isNullMatch) {
+          return row[isNullMatch[1]] !== null && row[isNullMatch[1]] !== undefined
         }
-        return String(row[col]) >= gteMatch[2]
-      }
-      const lteMatch = trimmed.match(/(\w+)\s*<=\s*'?([^']*)'?/)
-      if (lteMatch) {
-        const col = lteMatch[1]
-        const val = Number(lteMatch[2])
-        if (!Number.isNaN(val)) {
-          return typeof row[col] === 'number' && (row[col] as number) <= val
+        const isNotNullMatch = trimmed.match(/(\w+)\s+IS\s+NULL$/i)
+        if (isNotNullMatch) {
+          return row[isNotNullMatch[1]] === null || row[isNotNullMatch[1]] === undefined
         }
-        return String(row[col]) <= lteMatch[2]
-      }
 
-      const eqMatch = trimmed.match(/(\w+)\s*=\s*'?([^']*)'?/)
-      if (eqMatch) {
-        const col = eqMatch[1]
-        const val = eqMatch[2]
-        return String(row[col]) === val
-      }
-      const gtMatch = trimmed.match(/(\w+)\s*>\s*(\d+)/)
-      if (gtMatch) {
-        const col = gtMatch[1]
-        const val = parseFloat(gtMatch[2])
-        return typeof row[col] === 'number' && (row[col] as number) > val
-      }
-      const ltMatch = trimmed.match(/(\w+)\s*<\s*(\d+)/)
-      if (ltMatch) {
-        const col = ltMatch[1]
-        const val = parseFloat(ltMatch[2])
-        return typeof row[col] === 'number' && (row[col] as number) < val
-      }
-      const likeMatch = trimmed.match(/(\w+)\s+LIKE\s+'%([^']+)%'/i)
-      if (likeMatch) {
-        const col = likeMatch[1]
-        const pattern = likeMatch[2]
-        return String(row[col] || '').toLowerCase().includes(pattern.toLowerCase())
-      }
-      // BUGFIX (BUG-27): previously returned `true` for unrecognized
-      // operators, causing `WHERE !=`, `WHERE IN`, etc. to match all rows.
-      // Now we return `false` so the row is excluded — safer default that
-      // prevents accidental mass-DELETE/UPDATE.
-      return false
+        // IN (v1, v2, ...)
+        const inMatch = trimmed.match(/(\w+)\s+IN\s*\(([^)]+)\)/i)
+        if (inMatch) {
+          const col = inMatch[1]
+          const values = inMatch[2].split(',').map(v => parseScalar(v.trim()))
+          return values.some(v => row[col] === v || String(row[col]) === String(v))
+        }
+
+        // !=, <> (not equal)
+        const neMatch = trimmed.match(/(\w+)\s*(?:!=|<>)\s*'?([^']*)'?/)
+        if (neMatch) {
+          const col = neMatch[1]
+          const val = neMatch[2]
+          return String(row[col]) !== val
+        }
+
+        // >=, <= (must be checked BEFORE > and <)
+        const gteMatch = trimmed.match(/(\w+)\s*>=\s*'?([^']*)'?/)
+        if (gteMatch) {
+          const col = gteMatch[1]
+          const val = Number(gteMatch[2])
+          if (!Number.isNaN(val)) {
+            return typeof row[col] === 'number' && (row[col] as number) >= val
+          }
+          return String(row[col]) >= gteMatch[2]
+        }
+        const lteMatch = trimmed.match(/(\w+)\s*<=\s*'?([^']*)'?/)
+        if (lteMatch) {
+          const col = lteMatch[1]
+          const val = Number(lteMatch[2])
+          if (!Number.isNaN(val)) {
+            return typeof row[col] === 'number' && (row[col] as number) <= val
+          }
+          return String(row[col]) <= lteMatch[2]
+        }
+
+        const eqMatch = trimmed.match(/(\w+)\s*=\s*'?([^']*)'?/)
+        if (eqMatch) {
+          const col = eqMatch[1]
+          const val = eqMatch[2]
+          return String(row[col]) === val
+        }
+        const gtMatch = trimmed.match(/(\w+)\s*>\s*(\d+)/)
+        if (gtMatch) {
+          const col = gtMatch[1]
+          const val = parseFloat(gtMatch[2])
+          return typeof row[col] === 'number' && (row[col] as number) > val
+        }
+        const ltMatch = trimmed.match(/(\w+)\s*<\s*(\d+)/)
+        if (ltMatch) {
+          const col = ltMatch[1]
+          const val = parseFloat(ltMatch[2])
+          return typeof row[col] === 'number' && (row[col] as number) < val
+        }
+        const likeMatch = trimmed.match(/(\w+)\s+LIKE\s+'%([^']+)%'/i)
+        if (likeMatch) {
+          const col = likeMatch[1]
+          const pattern = likeMatch[2]
+          return String(row[col] || '').toLowerCase().includes(pattern.toLowerCase())
+        }
+        return false
+      })
     })
   })
 }

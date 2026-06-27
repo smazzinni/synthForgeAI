@@ -663,20 +663,19 @@ When you need MORE metadata than what's provided, emit a query to get it:
 
         // Emit sanitized content delta. We only emit text that is "safe" —
         // i.e. not part of an in-progress code fence that might be a signal.
+        // BUGFIX (BUG-70): The old code used lastIndexOf('```') which always
+        // finds the LAST fence, making closingFence always -1 by construction.
+        // This caused text after a closed ```sql...``` block to be stuck and
+        // never streamed. The fix uses fence PARITY (odd count = open fence).
         const flushSafe = () => {
           if (contentAccumulator.length <= lastEmittedLen) return
-          // Find the last incomplete code fence boundary — anything after it
-          // is "in progress" and shouldn't be emitted yet (it might be a
-          // signal we need to unwrap).
           const pending = contentAccumulator.slice(lastEmittedLen)
-          // Look for an opening ``` that hasn't been closed
-          const lastOpenFence = pending.lastIndexOf('```')
-          if (lastOpenFence !== -1) {
-            // Check if there's a closing ``` after it
-            const afterOpen = pending.slice(lastOpenFence + 3)
-            const closingFence = afterOpen.indexOf('```')
-            if (closingFence === -1) {
-              // The fence is still open — emit only up to the fence start
+          // Count ``` delimiters — odd means a fence is still open
+          const fenceCount = (pending.match(/```/g) || []).length
+          if (fenceCount % 2 === 1) {
+            // Fence is still open — find the last ``` and emit only up to it
+            const lastOpenFence = pending.lastIndexOf('```')
+            if (lastOpenFence !== -1) {
               const safe = pending.slice(0, lastOpenFence)
               if (safe) {
                 safeEnqueue(encoder.encode(`data: ${JSON.stringify({
@@ -688,7 +687,7 @@ When you need MORE metadata than what's provided, emit a query to get it:
               return
             }
           }
-          // No open fence — emit everything
+          // No open fence (even count including 0) — emit everything
           safeEnqueue(encoder.encode(`data: ${JSON.stringify({
             type: 'content',
             content: pending,
@@ -714,18 +713,19 @@ When you need MORE metadata than what's provided, emit a query to get it:
               if (data === '[DONE]') {
                 // Flush any remaining content, then send done
                 flushSafe()
-                // Also do a final sanitize pass on the full content and
-                // emit a correction if needed (rare — only if signals were
-                // wrapped in code fences)
+                // BUGFIX (BUG-70): Unconditionally flush any remaining unsent
+                // content on [DONE]. The old code only flushed if
+                // sanitizeAISignals() changed the text, which meant normal
+                // prose after a closed code block was silently lost.
                 const sanitized = sanitizeAISignals(contentAccumulator)
-                if (sanitized !== contentAccumulator && sanitized.length > lastEmittedLen) {
-                  // Emit the delta of the sanitized version
+                if (sanitized.length > lastEmittedLen) {
                   const delta = sanitized.slice(lastEmittedLen)
                   if (delta) {
                     safeEnqueue(encoder.encode(`data: ${JSON.stringify({
                       type: 'content',
                       content: delta,
                     })}\n\n`))
+                    lastEmittedLen = sanitized.length
                   }
                 }
                 safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`))
