@@ -108,14 +108,19 @@ export function MessageBubble({
         )}
 
         {/* ─── SQL block(s) (live DB mode) ─── */}
+        {/* CRITICAL FIX: Each SQL block uses ONLY sqlBlockStates (keyed by SQL
+            string) for its executing/result state. The legacy sqlBlockExecuting/
+            sqlBlockResult fields are NO LONGER used for rendering — they caused
+            all blocks to share the same result. Now each block is completely
+            independent. */}
         {message.role === 'assistant' && message.sqlBlock && (
           <>
             {/* Render the primary SQL block (with execute button + result) */}
             <SqlBlockCard
               sql={message.sqlBlock}
               dialect={activeConnectionDialect}
-              executing={message.sqlBlockStates?.[message.sqlBlock]?.executing ?? message.sqlBlockExecuting}
-              result={message.sqlBlockStates?.[message.sqlBlock]?.result ?? message.sqlBlockResult}
+              executing={message.sqlBlockStates?.[message.sqlBlock]?.executing ?? false}
+              result={message.sqlBlockStates?.[message.sqlBlock]?.result ?? null}
               onCopy={() => onCopy(message.sqlBlock!)}
               onOpenInEditor={() => onOpenInEditor(message.sqlBlock!)}
               onExecute={() => onExecuteSqlBlock(message.id, message.sqlBlock!)}
@@ -130,8 +135,8 @@ export function MessageBubble({
                     key={idx}
                     sql={extraSql}
                     dialect={activeConnectionDialect}
-                    executing={message.sqlBlockStates?.[extraSql]?.executing}
-                    result={message.sqlBlockStates?.[extraSql]?.result}
+                    executing={message.sqlBlockStates?.[extraSql]?.executing ?? false}
+                    result={message.sqlBlockStates?.[extraSql]?.result ?? null}
                     onCopy={() => onCopy(extraSql)}
                     onOpenInEditor={() => onOpenInEditor(extraSql)}
                     onExecute={() => onExecuteSqlBlock(message.id, extraSql)}

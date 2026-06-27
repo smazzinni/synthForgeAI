@@ -770,29 +770,23 @@ function StudioPageInner({
       // Without this, the model emits "Let me check the existing data..." and
       // then waits for results that never arrive in its context — causing
       // multi-step "fetch → generate → insert → verify" flows to stall.
+      // FIX: Use sqlBlockStates (per-block state) instead of the legacy
+      // sqlBlockResult field, so ALL blocks' results are included.
       const history = messagesRef.current
         .filter(m => m.role === 'user' || m.role === 'assistant')
         .map(m => {
           let content = m.content
-          // If this assistant message has SQL block results, append them
-          // to the content so the model can see what the queries returned.
-          if (m.role === 'assistant' && m.sqlBlockResult) {
-            const result = m.sqlBlockResult
-            if (result.ok && result.rows && result.rows.length > 0) {
-              content += `\n\n[SQL RESULT: ${result.message}]\n${JSON.stringify(result.rows.slice(0, 20), null, 2)}${result.rows.length > 20 ? `\n... +${result.rows.length - 20} more rows` : ''}`
-            } else if (result.ok) {
-              content += `\n\n[SQL RESULT: ${result.message}]`
-            } else if (!result.ok) {
-              content += `\n\n[SQL ERROR: ${result.message}]`
-            }
-          }
-          // Also include per-block results from sqlBlockStates
+          // Include per-block results from sqlBlockStates (the authoritative source)
           if (m.role === 'assistant' && m.sqlBlockStates) {
             for (const [sql, state] of Object.entries(m.sqlBlockStates)) {
-              if (state.result && state.result.ok && state.result.rows && state.result.rows.length > 0) {
-                content += `\n\n[SQL RESULT for "${sql.slice(0, 80)}...": ${state.result.message}]\n${JSON.stringify(state.result.rows.slice(0, 20), null, 2)}${state.result.rows.length > 20 ? `\n... +${state.result.rows.length - 20} more rows` : ''}`
-              } else if (state.result && !state.result.ok) {
-                content += `\n\n[SQL ERROR for "${sql.slice(0, 80)}...": ${state.result.message}]`
+              if (state.result) {
+                if (state.result.ok && state.result.rows && state.result.rows.length > 0) {
+                  content += `\n\n[SQL RESULT for "${sql.slice(0, 80)}...": ${state.result.message}]\n${JSON.stringify(state.result.rows.slice(0, 20), null, 2)}${state.result.rows.length > 20 ? `\n... +${state.result.rows.length - 20} more rows` : ''}`
+                } else if (state.result.ok) {
+                  content += `\n\n[SQL RESULT for "${sql.slice(0, 80)}...": ${state.result.message}]`
+                } else if (!state.result.ok) {
+                  content += `\n\n[SQL ERROR for "${sql.slice(0, 80)}...": ${state.result.message}]`
+                }
               }
             }
           }
@@ -1484,12 +1478,11 @@ function StudioPageInner({
   // ─── Execute a SQL block returned by the AI (live DB mode) ───
   // Called from the chat message UI when the user clicks "Execute".
   // If the statement is destructive, ask for confirmation first.
+  // CRITICAL FIX: Each SQL block now has COMPLETELY INDEPENDENT state via
+  // sqlBlockStates (keyed by the SQL string). We NO LONGER update the legacy
+  // sqlBlockExecuting/sqlBlockResult fields, which were shared across ALL
+  // blocks in the same message and caused every button to show the same result.
   const executeSqlBlock = async (messageId: string, sql: string, skipConfirm = false) => {
-    // NOTE: The ref is kept in sync via the useEffect below (not inside the
-    // function body) so it is populated BEFORE the first auto-execution call
-    // from `sendMessage`. The previous in-body assignment was a no-op on the
-    // first AI response, silently breaking auto-execution of SELECT queries.
-
     if (!activeConnectionId) {
       toast.error('No active DB connection')
       return
@@ -1503,11 +1496,20 @@ function StudioPageInner({
       if (!ok) return
     }
 
-    setMessages(prev => prev.map(m =>
-      m.id === messageId
-        ? { ...m, sqlBlockExecuting: true, sqlBlockResult: null }
-        : m
-    ))
+    // Helper to update ONLY this specific SQL block's state in sqlBlockStates.
+    // This is the KEY FIX: we do NOT touch sqlBlockExecuting/sqlBlockResult
+    // (the legacy shared fields) — only sqlBlockStates[sql].
+    const updateBlockState = (executing: boolean, result: SqlBlockResult | null) => {
+      setMessages(prev => prev.map(m => {
+        if (m.id !== messageId) return m
+        const states = { ...(m.sqlBlockStates || {}) }
+        states[sql] = { executing, result }
+        return { ...m, sqlBlockStates: states }
+      }))
+    }
+
+    // Set executing state for THIS specific block only
+    updateBlockState(true, null)
 
     try {
       const result = await apiPost<{
@@ -1524,15 +1526,9 @@ function StudioPageInner({
       }, { timeout: 60000 })
 
       if (result.error) {
-        setMessages(prev => prev.map(m =>
-          m.id === messageId
-            ? { ...m, sqlBlockExecuting: false, sqlBlockResult: { ok: false, message: result.error!, rowCount: 0, affectedRows: 0 } }
-            : m
-        ))
+        const errResult: SqlBlockResult = { ok: false, message: result.error!, rowCount: 0, affectedRows: 0 }
+        updateBlockState(false, errResult)
         toast.error(result.error)
-        // BUGFIX (BUG-46): if the connection itself was deleted or became
-        // invalid, clean up the studio's live-mode state so the user
-        // doesn't keep retrying against a dead connection.
         if (/connection.*not found|not have access/i.test(result.error)) {
           setActiveConnectionId(undefined)
           setActiveConnectionName(undefined)
@@ -1542,37 +1538,30 @@ function StudioPageInner({
         return
       }
 
-      // BUGFIX (BUG-37): strip leading SQL comments before computing the
-      // verb, so SQL prefixed with `-- DESTRUCTIVE: ...` is classified
-      // correctly. Otherwise `verb = '--'` and `isMutation = false`,
-      // causing the post-mutation schema refresh to be skipped and the
-      // toast to say "Returned 0 row(s)" instead of "INSERT OK — N rows".
       const stripped = stripSqlComments(sql).trim()
-      const verb = stripped.split(/\s+/)[0]?.toUpperCase() || ''
-      const isMutation = ['INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE'].includes(verb)
+      const allStatements = stripped.split(';').map(s => stripSqlComments(s).trim()).filter(Boolean)
+      const mutationVerbs = ['INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'USE']
+      const firstMutationVerb = allStatements
+        .map(s => s.split(/\s+/)[0]?.toUpperCase() || '')
+        .find(v => mutationVerbs.includes(v)) || ''
+      const verb = firstMutationVerb || allStatements[0]?.split(/\s+/)[0]?.toUpperCase() || ''
+      const isMutation = mutationVerbs.includes(verb)
       const affected = result.affectedRows ?? result.rowCount ?? (result.rows?.length || 0)
 
-      setMessages(prev => prev.map(m =>
-        m.id === messageId
-          ? {
-            ...m,
-            sqlBlockExecuting: false,
-            sqlBlockResult: {
-              ok: true,
-              message: isMutation ? `${verb} OK — ${affected} row(s) affected` : `Returned ${result.rowCount || result.rows?.length || 0} row(s)`,
-              rowCount: result.rowCount || result.rows?.length || 0,
-              affectedRows: affected,
-              rows: result.rows?.slice(0, 50),
-              columns: result.columns,
-            },
-          }
-          : m
-      ))
+      const okResult: SqlBlockResult = {
+        ok: true,
+        message: isMutation ? `${verb} OK — ${affected} row(s) affected` : `Returned ${result.rowCount || result.rows?.length || 0} row(s)`,
+        rowCount: result.rowCount || result.rows?.length || 0,
+        affectedRows: affected,
+        rows: result.rows?.slice(0, 50),
+        columns: result.columns,
+      }
+
+      // Update ONLY this block's state
+      updateBlockState(false, okResult)
 
       if (isMutation) {
         toast.success(`${verb} OK — ${affected} row(s) affected`)
-        // Refresh the schema + data from the external DB so the data tab
-        // reflects the change immediately.
         try {
           const refresh = await apiGet<{
             schema?: SchemaTable[]
@@ -1581,20 +1570,12 @@ function StudioPageInner({
           if (refresh.schema) setGeneratedSchema(refresh.schema)
           if (refresh.data) setGeneratedData(refresh.data)
         } catch (err) {
-          // BUGFIX (BUG-45): surface the refresh failure to the user
-          // instead of silently swallowing it. The Data tab will be stale
-          // until they reload the page.
           console.warn('[Studio] Failed to refresh external DB after mutation:', err)
           toast.warning('Mutation succeeded, but the schema/data refresh failed. Reload the page to see the latest state.')
         }
       } else {
-        // For SELECT queries: only show a toast + switch to SQL tab when
-        // the USER manually clicked "Run on live DB". For auto-executed
-        // reads (skipConfirm=true), the results are already shown inline
-        // in the chat card — no toast needed (less noise).
         if (!skipConfirm) {
           toast.success(`Returned ${result.rowCount || result.rows?.length || 0} row(s)`)
-          // Also surface the rows in the SQL tab results area
           if (result.rows && result.rows.length > 0) {
             setSqlResults({
               rows: result.rows,
@@ -1607,11 +1588,8 @@ function StudioPageInner({
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Execution failed'
-      setMessages(prev => prev.map(m =>
-        m.id === messageId
-          ? { ...m, sqlBlockExecuting: false, sqlBlockResult: { ok: false, message: msg, rowCount: 0, affectedRows: 0 } }
-          : m
-      ))
+      const errResult: SqlBlockResult = { ok: false, message: msg, rowCount: 0, affectedRows: 0 }
+      updateBlockState(false, errResult)
       toast.error(msg)
     }
   }
