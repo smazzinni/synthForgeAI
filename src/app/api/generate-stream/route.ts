@@ -551,7 +551,9 @@ export async function DELETE(request: NextRequest) {
     ? getJob(auth.userId, jobId)
     : databaseId ? getActiveJobForDatabase(auth.userId, databaseId) : null
   if (!job) return json({ error: 'No running generation found' }, 404)
-  if (job.status !== 'running') return json({ error: `Generation already ${job.status}` }, 409)
+  if (job.status !== 'running' || job.cancelRequested) {
+    return json({ error: job.cancelRequested ? 'Generation is already stopping' : `Generation already ${job.status}` }, 409)
+  }
   cancelJob(job)
   return json({ success: true })
 }

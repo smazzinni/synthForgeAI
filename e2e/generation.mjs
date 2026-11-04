@@ -66,8 +66,10 @@ check('invalid JSON → 400', (await api('POST', '/api/generate-stream', '{nope'
 check('empty schema → 400', (await api('POST', '/api/generate-stream', { schema: [] })).status === 400)
 check('table without name → 400', (await api('POST', '/api/generate-stream', { schema: [{ columns: [] }] })).status === 400)
 check('31 tables → 400', (await api('POST', '/api/generate-stream', { schema: Array.from({ length: 31 }, (_, i) => ({ name: 't' + i, columns: [] })) })).status === 400)
-check('300k rows → 400', (await api('POST', '/api/generate-stream', { schema, rowCounts: { users: 100000, orders: 100000, x: 100000 }, databaseName: 'x' }).then(async r => r.status === 200 ? 400 : r.status)) === 400 ||
-  (await api('POST', '/api/generate-stream', { schema: [...schema, { name: 'x', columns: [{ name: 'id', type: 'text' }] }], rowCounts: { users: 100000, orders: 100000, x: 100000 } })).status === 400)
+check('300k rows → 400', (await api('POST', '/api/generate-stream', {
+  schema: [...schema, { name: 'x', columns: [{ name: 'id', type: 'text' }] }],
+  rowCounts: { users: 100000, orders: 100000, x: 100000 },
+})).status === 400)
 check('unknown databaseId → 404', (await api('POST', '/api/generate-stream', { schema, databaseId: 'nope' })).status === 404)
 
 // ─── messy AI output is repaired ───
