@@ -45,6 +45,7 @@ import {
   X,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import { downloadExport, type ExportFormat } from '../export-download'
 import { apiGet, apiDelete, invalidateCache } from '@/lib/api-client'
 
 interface DatabaseItem {
@@ -62,7 +63,6 @@ type StatusFilter = 'all' | 'ready' | 'generating' | 'failed'
 type TypeFilter = 'all' | 'postgresql' | 'mysql'
 type SortBy = 'name-asc' | 'name-desc' | 'newest' | 'oldest' | 'most-rows' | 'highest-quality'
 type ViewMode = 'grid' | 'list'
-type ExportFormat = 'json' | 'csv' | 'sql'
 
 const STATUS_FILTERS: { value: StatusFilter; label: string }[] = [
   { value: 'all', label: 'All' },
@@ -348,24 +348,7 @@ export default function MyDatabasesPage() {
   const handleExport = async (db: DatabaseItem, format: ExportFormat) => {
     setExportingId(db.id)
     try {
-      const resp = await fetch('/api/export', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ databaseId: db.id, format }),
-      })
-      if (!resp.ok) throw new Error('Export failed')
-      const blob = await resp.blob()
-      const url = URL.createObjectURL(blob)
-      const a = window.document.createElement('a')
-      a.href = url
-      a.download = `${db.name}.${format}`
-      window.document.body.appendChild(a)
-      a.click()
-      window.document.body.removeChild(a)
-      URL.revokeObjectURL(url)
-      toast.success(`Exported "${db.name}" as ${format.toUpperCase()}`)
-    } catch {
-      toast.error(`Failed to export "${db.name}"`)
+      await downloadExport({ databaseId: db.id }, format, db.name)
     } finally {
       setExportingId(null)
     }
@@ -379,22 +362,7 @@ export default function MyDatabasesPage() {
     const dbsToExport = databases.filter(db => selectedIds.has(db.id))
     for (const db of dbsToExport) {
       try {
-        const resp = await fetch('/api/export', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ databaseId: db.id, format }),
-        })
-        if (!resp.ok) throw new Error('Export failed')
-        const blob = await resp.blob()
-        const url = URL.createObjectURL(blob)
-        const a = window.document.createElement('a')
-        a.href = url
-        a.download = `${db.name}.${format}`
-        window.document.body.appendChild(a)
-        a.click()
-        window.document.body.removeChild(a)
-        URL.revokeObjectURL(url)
-        successCount++
+        if (await downloadExport({ databaseId: db.id }, format, db.name, { silent: true })) successCount++
         // Small delay between downloads to avoid browser blocking
         await new Promise(r => setTimeout(r, 300))
       } catch {
@@ -640,6 +608,10 @@ export default function MyDatabasesPage() {
                       <FileCode className="mr-2 h-4 w-4 text-rose-600" />
                       Export as SQL
                     </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => handleBulkExport('xlsx')}>
+                      <FileCode className="mr-2 h-4 w-4 text-rose-600" />
+                      Export as Excel
+                    </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
                 <Button
@@ -825,6 +797,10 @@ export default function MyDatabasesPage() {
                               <FileCode className="mr-2 h-4 w-4 text-rose-600" />
                               Export as SQL
                             </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => handleExport(db, 'xlsx')}>
+                              <FileCode className="mr-2 h-4 w-4 text-rose-600" />
+                              Export as Excel
+                            </DropdownMenuItem>
                           </DropdownMenuContent>
                         </DropdownMenu>
                         <Button
@@ -963,6 +939,10 @@ export default function MyDatabasesPage() {
                                     <DropdownMenuItem onClick={() => handleExport(db, 'sql')}>
                                       <FileCode className="mr-2 h-4 w-4 text-rose-600" />
                                       Export as SQL
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem onClick={() => handleExport(db, 'xlsx')}>
+                                      <FileCode className="mr-2 h-4 w-4 text-rose-600" />
+                                      Export as Excel
                                     </DropdownMenuItem>
                                     <DropdownMenuSeparator />
                                     <DropdownMenuItem

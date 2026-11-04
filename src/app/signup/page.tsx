@@ -2,17 +2,15 @@
 
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
-import { useRouter } from 'next/navigation'
-import { useAuth } from '@/hooks/use-auth'
+import { useAuth, safeNext } from '@/hooks/use-auth'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
-import { Zap, Loader2, AlertCircle, CheckCircle2, Eye, EyeOff } from 'lucide-react'
+import { Zap, Loader2, AlertCircle, Eye, EyeOff } from 'lucide-react'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 
 export default function SignUpPage() {
-  const router = useRouter()
   const { signUp, user, loading: authLoading } = useAuth()
   const [fullName, setFullName] = useState('')
   const [email, setEmail] = useState('')
@@ -20,12 +18,11 @@ export default function SignUpPage() {
   const [showPassword, setShowPassword] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [success, setSuccess] = useState(false)
 
   // If user is already authenticated, redirect to dashboard
   useEffect(() => {
     if (!authLoading && user) {
-      window.location.href = '/dashboard'
+      window.location.href = safeNext(new URLSearchParams(window.location.search).get('next'))
     }
   }, [user, authLoading])
 
@@ -34,28 +31,19 @@ export default function SignUpPage() {
     setLoading(true)
     setError(null)
 
-    if (password.length < 6) {
-      setError('Password must be at least 6 characters')
+    if (password.length < 8) {
+      setError('Password must be at least 8 characters')
       setLoading(false)
       return
     }
 
     try {
-      const { error } = await signUp(email, password, fullName) as { error: Error | null }
+      const { error } = await signUp(email, password, fullName)
       if (error) {
-        const message = error.message || String(error)
-        if (message.includes('already registered')) {
-          setError('An account with this email already exists. Please sign in instead.')
-        } else if (message.includes('Password should be')) {
-          setError('Password does not meet the security requirements.')
-        } else {
-          setError(message)
-        }
-        setLoading(false)
-      } else {
-        setSuccess(true)
+        setError(error.message)
         setLoading(false)
       }
+      // On success the user state updates and the effect above redirects.
     } catch {
       setError('An unexpected error occurred. Please try again.')
       setLoading(false)
@@ -76,31 +64,6 @@ export default function SignUpPage() {
     return (
       <div className="min-h-screen flex items-center justify-center">
         <Loader2 className="h-8 w-8 animate-spin text-amber-600" />
-      </div>
-    )
-  }
-
-  if (success) {
-    return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-br from-amber-50 via-background to-red-50 dark:from-amber-950/20 dark:via-background dark:to-red-950/20 p-4">
-        <Link href="/" className="flex items-center gap-2 mb-8">
-          <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center">
-            <Zap className="h-5 w-5 text-white" />
-          </div>
-          <span className="text-2xl font-bold">SynthForge<span className="text-amber-600">AI</span></span>
-        </Link>
-        <Card className="w-full max-w-md">
-          <CardContent className="pt-6 text-center">
-            <CheckCircle2 className="h-12 w-12 text-emerald-500 mx-auto mb-4" />
-            <h2 className="text-xl font-semibold mb-2">Check your email</h2>
-            <p className="text-muted-foreground mb-4">
-              We&apos;ve sent you a confirmation link. Please check your email to verify your account.
-            </p>
-            <Button asChild variant="outline">
-              <Link href="/login">Back to Sign In</Link>
-            </Button>
-          </CardContent>
-        </Card>
       </div>
     )
   }
@@ -128,14 +91,13 @@ export default function SignUpPage() {
               </Alert>
             )}
             <div className="space-y-2">
-              <Label htmlFor="fullName">Full Name</Label>
+              <Label htmlFor="fullName">Full Name (optional)</Label>
               <Input
                 id="fullName"
                 type="text"
                 placeholder="John Doe"
                 value={fullName}
                 onChange={(e) => setFullName(e.target.value)}
-                required
                 disabled={loading}
               />
             </div>
@@ -158,12 +120,12 @@ export default function SignUpPage() {
                 <Input
                   id="password"
                   type={showPassword ? 'text' : 'password'}
-                  placeholder="At least 6 characters"
+                  placeholder="At least 8 characters"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   required
                   disabled={loading}
-                  minLength={6}
+                  minLength={8}
                   autoComplete="new-password"
                   className="pr-10"
                 />
@@ -182,13 +144,13 @@ export default function SignUpPage() {
                 <div className="flex items-center gap-2 mt-1.5">
                   <div className="flex-1 flex gap-1">
                     {[0, 1, 2].map((i) => {
-                      const strength = password.length >= 10 ? 3 : password.length >= 8 ? 2 : password.length >= 6 ? 1 : 0
+                      const strength = password.length >= 12 ? 3 : password.length >= 10 ? 2 : password.length >= 8 ? 1 : 0
                       const colors = ['bg-muted', 'bg-red-500', 'bg-amber-500', 'bg-emerald-500']
                       return <div key={i} className={`h-1 flex-1 rounded-full transition-colors ${i < strength ? colors[strength] : 'bg-muted'}`} />
                     })}
                   </div>
                   <span className="text-[10px] text-muted-foreground tabular-nums">
-                    {password.length < 6 ? 'Too short' : password.length >= 10 ? 'Strong' : password.length >= 8 ? 'Good' : 'Weak'}
+                    {password.length < 8 ? 'Too short' : password.length >= 10 ? 'Strong' : password.length >= 8 ? 'Good' : 'Weak'}
                   </span>
                 </div>
               )}

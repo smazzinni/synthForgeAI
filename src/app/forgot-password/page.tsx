@@ -1,7 +1,9 @@
 'use client'
 
-import { useState } from 'react'
+import { Suspense, useState } from 'react'
 import Link from 'next/link'
+import { useSearchParams } from 'next/navigation'
+import { toast } from 'sonner'
 import { useAuth } from '@/hooks/use-auth'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -11,11 +13,39 @@ import { Zap, Loader2, AlertCircle, ArrowLeft, CheckCircle2, Shield, Lock, Mail 
 import { Alert, AlertDescription } from '@/components/ui/alert'
 
 export default function ForgotPasswordPage() {
-  const { resetPassword } = useAuth()
+  return (
+    <Suspense fallback={<div className="min-h-screen flex items-center justify-center"><Loader2 className="h-8 w-8 animate-spin text-amber-600" /></div>}>
+      <ForgotPasswordForm />
+    </Suspense>
+  )
+}
+
+function ForgotPasswordForm() {
+  const { resetPassword, updatePassword } = useAuth()
+  const token = useSearchParams().get('token')
+  const [newPassword, setNewPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [devUrl, setDevUrl] = useState<string | null>(null)
   const [email, setEmail] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState(false)
+
+  const handleReset = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (newPassword.length < 8) return setError('Password must be at least 8 characters.')
+    if (newPassword !== confirm) return setError('Passwords do not match.')
+    setLoading(true)
+    setError(null)
+    const { error } = await updatePassword(token!, newPassword)
+    if (error) {
+      setError(error.message)
+      setLoading(false)
+      return
+    }
+    toast.success('Password updated. Please sign in.')
+    window.location.href = '/login'
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -31,10 +61,11 @@ export default function ForgotPasswordPage() {
     setError(null)
 
     try {
-      const { error } = await resetPassword(email)
+      const { error, devResetUrl } = await resetPassword(email)
       if (error) {
-        setError(error instanceof Error ? error.message : 'Could not send reset email. Please try again.')
+        setError(error.message)
       } else {
+        setDevUrl(devResetUrl ?? null)
         setSuccess(true)
       }
     } catch {
@@ -128,15 +159,41 @@ export default function ForgotPasswordPage() {
             <div className="mx-auto mb-4 h-14 w-14 rounded-full bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center">
               <Lock className="h-7 w-7 text-white" />
             </div>
-            <CardTitle className="text-2xl">Reset your password</CardTitle>
+            <CardTitle className="text-2xl">{token ? 'Choose a new password' : 'Reset your password'}</CardTitle>
             <CardDescription>
-              {success
+              {token
+                ? 'Choose a new password for your account'
+                : success
                 ? 'Check your email for the reset link'
                 : 'Enter your email and we\'ll send you a reset link'}
             </CardDescription>
           </CardHeader>
           <CardContent>
-            {success ? (
+            {token ? (
+              <form onSubmit={handleReset} className="space-y-4">
+                {error && (
+                  <Alert variant="destructive">
+                    <AlertCircle className="h-4 w-4" />
+                    <AlertDescription>{error}</AlertDescription>
+                  </Alert>
+                )}
+                <div className="space-y-2">
+                  <Label htmlFor="new-password">New password</Label>
+                  <Input id="new-password" type="password" autoComplete="new-password" minLength={8} required
+                    placeholder="At least 8 characters" value={newPassword} disabled={loading}
+                    onChange={(e) => setNewPassword(e.target.value)} className="h-11" />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="confirm-password">Confirm password</Label>
+                  <Input id="confirm-password" type="password" autoComplete="new-password" minLength={8} required
+                    value={confirm} disabled={loading} onChange={(e) => setConfirm(e.target.value)} className="h-11" />
+                </div>
+                <Button type="submit" disabled={loading}
+                  className="w-full h-11 bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white">
+                  {loading ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Updating...</> : 'Update password'}
+                </Button>
+              </form>
+            ) : success ? (
               <div className="text-center space-y-4">
                 <CheckCircle2 className="h-12 w-12 text-emerald-500 mx-auto" />
                 <p className="text-muted-foreground">
@@ -145,6 +202,12 @@ export default function ForgotPasswordPage() {
                 <div className="bg-amber-50 dark:bg-amber-950/30 rounded-lg p-3 text-sm text-amber-800 dark:text-amber-200">
                   The reset link will expire in 24 hours. Check your spam folder if you don&apos;t see it.
                 </div>
+                {devUrl && (
+                  <p className="text-sm">
+                    Development mode:{' '}
+                    <a href={devUrl} className="text-amber-600 underline break-all">open reset link</a>
+                  </p>
+                )}
                 <Button asChild variant="outline" className="w-full">
                   <Link href="/login">
                     <ArrowLeft className="mr-2 h-4 w-4" />

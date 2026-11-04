@@ -1,13 +1,13 @@
 /**
  * In-memory fallback store for synthetic databases & conversations.
  *
- * Used when Supabase is NOT configured (local dev / demo mode). Mirrors the
- * pattern in `db-connections/store.ts`: try Supabase first, fall back to a
+ * Fallback used when Prisma is unavailable (local dev / demo mode). Mirrors the
+ * pattern in `db-connections/store.ts`: try Prisma first, fall back to a
  * per-process in-memory Map keyed by user id.
  *
  * The store is intentionally simple — it keeps the app fully functional for
  * a demo session (data survives across requests within the same server
- * process). For production, configure Supabase env vars and the in-memory
+ * process). For production, configure DATABASE_URL and the in-memory
  * fallback is bypassed automatically.
  */
 

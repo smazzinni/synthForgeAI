@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
-import { getSupabaseAdmin } from '@/lib/supabase/admin'
 import { db } from '@/lib/db'
+import { isAuthRequired } from '@/lib/server/auth'
 
 // ─── Health check ───
 // Public endpoint for uptime monitors / load balancers. It reports only
@@ -15,16 +15,7 @@ async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return Promise.race([p, new Promise<T>((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))])
 }
 
-async function checkStorage(): Promise<{ backend: 'supabase' | 'prisma'; status: Check }> {
-  const admin = getSupabaseAdmin()
-  if (admin) {
-    try {
-      const { error } = await withTimeout(Promise.resolve(admin.from('synthetic_databases').select('id').limit(1)), 3000)
-      return { backend: 'supabase', status: error ? 'error' : 'ok' }
-    } catch {
-      return { backend: 'supabase', status: 'error' }
-    }
-  }
+async function checkStorage(): Promise<{ backend: 'prisma'; status: Check }> {
   try {
     await withTimeout(db.$queryRawUnsafe('SELECT 1'), 3000)
     return { backend: 'prisma', status: 'ok' }
@@ -36,13 +27,15 @@ async function checkStorage(): Promise<{ backend: 'supabase' | 'prisma'; status:
 export async function GET() {
   const storage = await checkStorage()
   const ai: Check = process.env.DEEPSEEK_API_KEY ? 'ok' : 'not_configured'
-  const auth: Check = process.env.NEXT_PUBLIC_AUTH_ENABLED === 'true'
-    ? (process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? 'ok' : 'error')
-    : 'not_configured'
+  const auth: Check = isAuthRequired() ? 'ok' : 'not_configured'
 
-  const status = storage.status === 'error' || auth === 'error'
+  const encryption: 'ok' | 'missing' | 'not_configured' = process.env.CONNECTION_ENCRYPTION_KEY
+    ? 'ok'
+    : process.env.NODE_ENV === 'production' ? 'missing' : 'not_configured'
+
+  const status = storage.status === 'error'
     ? 'unhealthy'
-    : ai !== 'ok' ? 'degraded' : 'healthy'
+    : ai !== 'ok' || encryption === 'missing' ? 'degraded' : 'healthy'
 
   return NextResponse.json(
     {
@@ -50,7 +43,7 @@ export async function GET() {
       timestamp: new Date().toISOString(),
       version: process.env.npm_package_version || process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) || 'dev',
       uptime: Math.round(process.uptime()),
-      checks: { storage: storage.status, storageBackend: storage.backend, ai, auth },
+      checks: { storage: storage.status, storageBackend: storage.backend, ai, auth, encryption },
     },
     { status: status === 'unhealthy' ? 503 : 200, headers: { 'Cache-Control': 'no-store' } },
   )

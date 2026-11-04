@@ -22,6 +22,9 @@ export interface SyntheticSqlResult {
   dataAfter: Record<string, unknown[]>
   schemaAfter: TableSchema[]
   error?: string
+  /** rows matched before the MAX_ROWS cap */
+  totalRows?: number
+  truncated?: boolean
   /** true when the engine could not parse the SQL at all (caller may fall back) */
   parseError?: boolean
 }
@@ -202,6 +205,8 @@ export function runSyntheticSql(
     return {
       rows: rows.slice(0, MAX_ROWS),
       columns: rows.length > 0 ? Object.keys(rows[0]) : [],
+      totalRows: rows.length,
+      truncated: rows.length > MAX_ROWS,
       affectedRows: affected,
       mutated,
       dataAfter: mutated ? dataAfter : data,

@@ -432,7 +432,21 @@ export async function fetchExternalSchema(conn: DbConnectionRecord): Promise<Sch
        ORDER BY t.table_name, c.ordinal_position`,
       [schemaName],
     )
-    return groupRowsByTable(rows)
+    const tables = groupRowsByTable(rows)
+    try {
+      const fk = await pool.query(
+        `SELECT kcu.table_name, kcu.column_name, ccu.table_name AS ref_table, ccu.column_name AS ref_column
+           FROM information_schema.table_constraints tc
+           JOIN information_schema.key_column_usage kcu
+             ON kcu.constraint_name = tc.constraint_name AND kcu.table_schema = tc.table_schema
+           JOIN information_schema.constraint_column_usage ccu
+             ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+          WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = $1`,
+        [schemaName],
+      )
+      annotateForeignKeys(tables, fk.rows)
+    } catch { /* FK metadata is optional */ }
+    return tables
   }
 
   // MySQL
@@ -454,7 +468,29 @@ export async function fetchExternalSchema(conn: DbConnectionRecord): Promise<Sch
   const rows = Array.isArray(resultRows) && Array.isArray(resultRows[0]) && !resultRows[0]?.table_name
     ? (resultRows[0] as Record<string, unknown>[])
     : resultRows
-  return groupRowsByTable(rows)
+  const tables = groupRowsByTable(rows)
+  try {
+    const fkRaw = (await pool.query(
+      `SELECT TABLE_NAME AS table_name, COLUMN_NAME AS column_name,
+              REFERENCED_TABLE_NAME AS ref_table, REFERENCED_COLUMN_NAME AS ref_column
+         FROM information_schema.KEY_COLUMN_USAGE
+        WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL`,
+      [conn.database],
+    )) as unknown as Record<string, unknown>[]
+    const fkRows = Array.isArray(fkRaw) && Array.isArray(fkRaw[0]) ? (fkRaw[0] as Record<string, unknown>[]) : fkRaw
+    annotateForeignKeys(tables, fkRows)
+  } catch { /* FK metadata is optional */ }
+  return tables
+}
+
+/** Mark each column with its real foreign key ('table.column') or null. */
+function annotateForeignKeys(tables: SchemaTable[], fkRows: Record<string, unknown>[]): void {
+  const map = new Map<string, string>()
+  for (const r of fkRows) {
+    const t = String(r.table_name ?? r.TABLE_NAME), c = String(r.column_name ?? r.COLUMN_NAME)
+    map.set(`${t}.${c}`, `${String(r.ref_table ?? r.REF_TABLE)}.${String(r.ref_column ?? r.REF_COLUMN)}`)
+  }
+  for (const t of tables) for (const c of t.columns) c.references = map.get(`${t.name}.${c.name}`) ?? null
 }
 
 function groupRowsByTable(rows: Record<string, unknown>[]): SchemaTable[] {
@@ -499,7 +535,8 @@ export async function fetchSampleRows(conn: DbConnectionRecord, tableName: strin
   if (entry.dialect === 'postgres') {
     // Postgres uses double quotes for identifiers. Escape any embedded
     // double quotes by doubling them.
-    const quoted = `"${tableName.replace(/"/g, '""')}"`
+    const schemaName = conn.schema || 'public'
+    const quoted = `"${schemaName.replace(/"/g, '""')}"."${tableName.replace(/"/g, '""')}"`
     const pool = entry.pool as { query: (text: string, values?: unknown[]) => Promise<{ rows: Record<string, unknown>[] }> }
     const { rows } = await pool.query(`SELECT * FROM ${quoted} LIMIT $1`, [limit])
     const columns = rows.length > 0 ? Object.keys(rows[0]) : []
@@ -739,4 +776,65 @@ export async function executeSqlOnExternalConnection(userId: string, connectionI
     }
   }
   return executeSql(conn, sql)
+}
+
+/**
+ * One page of a live table, with the exact total row count — used by the
+ * studio's Data tab so large tables are browsed server-side instead of being
+ * loaded into the browser.
+ */
+export async function fetchTablePage(
+  conn: DbConnectionRecord,
+  tableName: string,
+  opts: { offset?: number; limit?: number; sort?: string; dir?: 'asc' | 'desc' } = {},
+): Promise<{ rows: Record<string, unknown>[]; columns: string[]; total: number; offset: number; limit: number }> {
+  const offset = Math.max(0, Math.floor(opts.offset ?? 0))
+  const limit = Math.min(1000, Math.max(1, Math.floor(opts.limit ?? 100)))
+  const dir = opts.dir === 'desc' ? 'DESC' : 'ASC'
+  const entry = await getPool(conn)
+
+  if (entry.dialect === 'postgres') {
+    const q = (id: string) => `"${id.replace(/"/g, '""')}"`
+    const target = `${q(conn.schema || 'public')}.${q(tableName)}`
+    const order = opts.sort ? ` ORDER BY ${q(opts.sort)} ${dir} NULLS LAST` : ''
+    const pool = entry.pool as { query: (text: string, values?: unknown[]) => Promise<{ rows: Record<string, unknown>[]; fields?: Array<{ name: string }> }> }
+    const [page, count] = await Promise.all([
+      pool.query(`SELECT * FROM ${target}${order} LIMIT $1 OFFSET $2`, [limit, offset]),
+      pool.query(`SELECT COUNT(*)::bigint AS n FROM ${target}`),
+    ])
+    return {
+      rows: page.rows,
+      columns: page.fields?.map(f => f.name) ?? (page.rows[0] ? Object.keys(page.rows[0]) : []),
+      total: Number(count.rows[0]?.n ?? 0),
+      offset,
+      limit,
+    }
+  }
+
+  const q = (id: string) => '`' + id.replace(/`/g, '``') + '`'
+  const order = opts.sort ? ` ORDER BY ${q(opts.sort)} ${dir}` : ''
+  const pool = entry.pool as { query: (sql: string, values?: unknown[]) => Promise<unknown> }
+  const [pageRaw, countRaw] = await Promise.all([
+    pool.query(`SELECT * FROM ${q(tableName)}${order} LIMIT ? OFFSET ?`, [limit, offset]),
+    pool.query(`SELECT COUNT(*) AS n FROM ${q(tableName)}`),
+  ])
+  const rows = (Array.isArray(pageRaw) ? pageRaw[0] : pageRaw) as Record<string, unknown>[]
+  const fields = (Array.isArray(pageRaw) ? pageRaw[1] : []) as Array<{ name: string }>
+  const countRows = (Array.isArray(countRaw) ? countRaw[0] : countRaw) as Array<{ n: number | string }>
+  return {
+    rows,
+    columns: fields?.length ? fields.map(f => f.name) : (rows[0] ? Object.keys(rows[0]) : []),
+    total: Number(countRows[0]?.n ?? 0),
+    offset,
+    limit,
+  }
+}
+
+/** Exact row counts for up to `max` tables (−1 when a count fails). */
+export async function fetchTableCounts(conn: DbConnectionRecord, tables: string[], max = 100): Promise<Record<string, number>> {
+  const out: Record<string, number> = {}
+  await Promise.all(tables.slice(0, max).map(async t => {
+    try { out[t] = (await fetchTablePage(conn, t, { limit: 1 })).total } catch { out[t] = -1 }
+  }))
+  return out
 }

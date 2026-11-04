@@ -14,8 +14,8 @@ export default function DashboardLayout({
 }: {
   children: React.ReactNode
 }) {
-  const { user, loading } = useAuth()
-  const authEnabled = process.env.NEXT_PUBLIC_AUTH_ENABLED === 'true'
+  const { user, loading, authRequired } = useAuth()
+  const authEnabled = authRequired
   const redirectRef = useRef(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [mobileOpen, setMobileOpen] = useState<string | null>(null)
@@ -26,11 +26,11 @@ export default function DashboardLayout({
   useEffect(() => {
     if (authEnabled && !loading && !user && !redirectRef.current) {
       redirectRef.current = true
-      window.location.replace('/login')
+      window.location.replace(`/login?next=${encodeURIComponent(window.location.pathname + window.location.search)}`)
     }
   }, [authEnabled, loading, user])
 
-  if (loading && authEnabled) {
+  if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
         <div className="flex flex-col items-center gap-3">

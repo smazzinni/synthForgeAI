@@ -99,11 +99,11 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
+import { downloadExport, type ExportFormat } from '../export-download'
 import { useIsMobile } from '@/hooks/use-mobile'
 import { apiPost, apiPatch, apiDelete, apiGet, invalidateCache } from '@/lib/api-client'
 import {
   parseAgentStatus,
-  parseInteractiveOptions,
   parseAllInteractiveOptions,
   parseBeginGeneration,
   cleanDisplayText,
@@ -124,7 +124,6 @@ import {
   parseAIResponse,
   extractSchema,
   extractAllSqlBlocks,
-  extractSqlBlock,
   generateSchemaSQL as generateSchemaSQLHelper,
   computeERLayout as computeERLayoutHelper,
   getDataColumnKind,
@@ -144,6 +143,13 @@ import { SqlBlockCard, type SqlBlockResult } from './_components/sql-block-card'
 const CONVERSATION_STORAGE_KEY = 'synthforge_conversations'
 const MAX_CONVERSATIONS = 50
 const MAX_AUTO_TURNS = 5
+const CANCELLED_MSG = 'Cancelled — not executed'
+const CANCELLED_RESULT: SqlBlockResult = { ok: false, message: CANCELLED_MSG, rowCount: 0, affectedRows: 0 }
+// Full SQL for history labels: trimmed, whitespace collapsed, capped at 2000 chars.
+const sqlLabel = (sql: string) => {
+  const t = sql.trim().replace(/\s+/g, ' ')
+  return t.length > 2000 ? t.slice(0, 2000) + '…' : t
+}
 const ACTIVE_GENERATION_KEY = 'synthforge:activeGeneration'
 
 function clearActiveGeneration() {
@@ -300,6 +306,16 @@ function StudioPageInner({
   const [saving, setSaving] = useState(false)
   const [activeTab, setActiveTab] = useState('data')
   const [selectedTable, setSelectedTable] = useState<string>('')
+  const [tableCounts, setTableCounts] = useState<Record<string, number>>({})
+  // Server-side paging state for tables larger than what is held in memory.
+  const [pagedRows, setPagedRows] = useState<unknown[]>([])
+  const [pagedColumns, setPagedColumns] = useState<string[]>([])
+  const [pagedTotal, setPagedTotal] = useState(0)
+  const [pagedLoading, setPagedLoading] = useState(false)
+  const [pageOffset, setPageOffset] = useState(0)
+  const [pageSize, setPageSize] = useState(100)
+  const [pageSort, setPageSort] = useState<{ col: string; dir: 'asc' | 'desc' } | null>(null)
+  const [debouncedSearch, setDebouncedSearch] = useState('')
   const [visibleRows, setVisibleRows] = useState(20)
   const [initialQuerySent, setInitialQuerySent] = useState(false)
   const [conversationId, setConversationId] = useState(initialConversationId || '')
@@ -320,7 +336,7 @@ function StudioPageInner({
 
   // SQL workspace state
   const [sqlEditor, setSqlEditor] = useState('')
-  const [sqlResults, setSqlResults] = useState<{ rows: Record<string, unknown>[]; columns: string[]; executionTime: number } | null>(null)
+  const [sqlResults, setSqlResults] = useState<{ rows: Record<string, unknown>[]; columns: string[]; executionTime: number; truncated?: boolean; totalRows?: number } | null>(null)
   const [sqlExecuting, setSqlExecuting] = useState(false)
   // Persist query history + saved queries to localStorage so they survive
   // page reloads. Previously these were in-memory only, so users lost their
@@ -477,6 +493,8 @@ function StudioPageInner({
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const pendingTimeoutsRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set())
   const autoTurnsRef = useRef(0)
+  // The single pending automatic follow-up (truncated-continue / SQL-continue).
+  const autoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const chatEndRef = useRef<HTMLDivElement>(null)
   const chatContainerRef = useRef<HTMLDivElement>(null)
@@ -488,7 +506,7 @@ function StudioPageInner({
   // above `executeSqlBlock`) needs to call it for auto-execution of SELECT
   // queries in live-DB mode, but `const` declarations aren't hoisted. The
   // ref lets `sendMessage` reach the latest version without a TDZ error.
-  const executeSqlBlockRef = useRef<(messageId: string, sql: string, skipConfirm?: boolean) => void>(() => {})
+  const executeSqlBlockRef = useRef<(messageId: string, sql: string, skipConfirm?: boolean) => Promise<SqlBlockResult | undefined>>(async () => undefined)
 
   // Keep messagesRef in sync
   useEffect(() => {
@@ -524,6 +542,7 @@ function StudioPageInner({
           }
           schema?: SchemaTable[]
           data?: Record<string, unknown[]>
+          counts?: Record<string, number>
           error?: string
         }>(`/api/connections/${connId}?include=introspect`, { cacheTtl: 0, force: true, timeout: 30000 })
 
@@ -550,6 +569,7 @@ function StudioPageInner({
         if (result.data && Object.keys(result.data).length > 0) {
           setGeneratedData(result.data)
         }
+        if (result.counts) setTableCounts(result.counts)
         setDatabaseName(result.connection.name)
 
         // Replace the generic welcome message with a live-DB welcome so the
@@ -609,8 +629,8 @@ function StudioPageInner({
       }
       inFlight = true
       try {
-        const res = await apiGet<{ database?: { data_json: Record<string, unknown[]>; schema_json: SchemaTable[]; row_count?: number; status: string } }>(
-          `/api/databases?id=${databaseId}`, { cacheTtl: 0, force: true, timeout: 15000 })
+        const res = await apiGet<{ database?: { data_json: Record<string, unknown[]>; schema_json: SchemaTable[]; row_count?: number; status: string; table_counts?: Record<string, number> } }>(
+          `/api/databases?id=${databaseId}&preview=200`, { cacheTtl: 0, force: true, timeout: 15000 })
         const db = res.database
         if (!db) return
         if (db.status === 'generating') {
@@ -623,6 +643,7 @@ function StudioPageInner({
         generationJobIdRef.current = null
         clearActiveGeneration()
         if (db.data_json && Object.keys(db.data_json).length > 0) setGeneratedData(db.data_json)
+        if (db.table_counts) setTableCounts(db.table_counts)
         if (Array.isArray(db.schema_json) && db.schema_json.length > 0) setGeneratedSchema(db.schema_json)
         setGenerationProgress(prev => ({
           ...prev,
@@ -651,13 +672,14 @@ function StudioPageInner({
       if (!urlDbId) setCurrentDatabaseId(saved.databaseId)
       pollGeneration(saved.databaseId)
     } catch { /* ignore */ }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, [])
 
   // Detach from in-flight requests on unmount (the server keeps generating).
   useEffect(() => {
     const timeouts = pendingTimeoutsRef.current
     return () => {
+      if (autoTimerRef.current) clearTimeout(autoTimerRef.current)
       abortRef.current?.abort()
       generationAbortRef.current?.abort()
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
@@ -681,8 +703,9 @@ function StudioPageInner({
             data_json: Record<string, unknown[]>
             row_count: number
             status: string
+            table_counts?: Record<string, number>
           }
-        }>(`/api/databases?id=${dbId}`, { cacheTtl: 0, force: true, timeout: 15000 })
+        }>(`/api/databases?id=${dbId}&preview=200`, { cacheTtl: 0, force: true, timeout: 15000 })
 
         if (cancelled || !result.database) return
 
@@ -697,6 +720,7 @@ function StudioPageInner({
         if (result.database.data_json && Object.keys(result.database.data_json).length > 0) {
           setGeneratedData(result.database.data_json)
         }
+        if (result.database.table_counts) setTableCounts(result.database.table_counts)
 
         // Also load the conversation history for this database
         try {
@@ -814,11 +838,31 @@ function StudioPageInner({
   const sendMessage = useCallback(async (messageText?: string, isAuto = false) => {
     const textToSend = messageText || input
     if (!textToSend.trim() || loadingRef.current) return
+    if (autoTimerRef.current) {
+      clearTimeout(autoTimerRef.current)
+      autoTimerRef.current = null
+    }
     if (isAuto === true) autoTurnsRef.current += 1
     else autoTurnsRef.current = 0
 
     if (abortRef.current) {
       abortRef.current.abort()
+    }
+
+    // At most ONE pending automatic follow-up; scheduling replaces the old one.
+    const scheduleAutoFollowUp = (text: string, delay: number) => {
+      if (autoTimerRef.current) clearTimeout(autoTimerRef.current)
+      autoTimerRef.current = setTimeout(() => {
+        autoTimerRef.current = null
+        const lastMsg = messagesRef.current[messagesRef.current.length - 1]
+        if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isStreaming && !loadingRef.current) {
+          if (autoTurnsRef.current >= MAX_AUTO_TURNS) {
+            toast.info('Paused automatic follow-ups — send a message to continue.')
+            return
+          }
+          sendMessage(text, true)
+        }
+      }, delay)
     }
 
     const userMessage: Message = {
@@ -868,12 +912,15 @@ function StudioPageInner({
           if (m.role === 'assistant' && m.sqlBlockStates) {
             for (const [sql, state] of Object.entries(m.sqlBlockStates)) {
               if (state.result) {
-                if (state.result.ok && state.result.rows && state.result.rows.length > 0) {
-                  content += `\n\n[SQL RESULT for "${sql.slice(0, 80)}...": ${state.result.message}]\n${JSON.stringify(state.result.rows.slice(0, 20), null, 2)}${state.result.rows.length > 20 ? `\n... +${state.result.rows.length - 20} more rows` : ''}`
+                const label = sqlLabel(sql)
+                if (!state.result.ok && state.result.message === CANCELLED_MSG) {
+                  content += `\n\n[SQL CANCELLED for "${label}": user declined]`
+                } else if (state.result.ok && state.result.rows && state.result.rows.length > 0) {
+                  content += `\n\n[SQL RESULT for "${label}": ${state.result.message}]\n${JSON.stringify(state.result.rows.slice(0, 20), null, 2)}${state.result.rows.length > 20 ? `\n... +${state.result.rows.length - 20} more rows` : ''}`
                 } else if (state.result.ok) {
-                  content += `\n\n[SQL RESULT for "${sql.slice(0, 80)}...": ${state.result.message}]`
-                } else if (!state.result.ok) {
-                  content += `\n\n[SQL ERROR for "${sql.slice(0, 80)}...": ${state.result.message}]`
+                  content += `\n\n[SQL RESULT for "${label}": ${state.result.message}]`
+                } else {
+                  content += `\n\n[SQL ERROR for "${label}": ${state.result.message}]`
                 }
               }
             }
@@ -914,6 +961,7 @@ function StudioPageInner({
             connectionDialect: activeConnectionDialect,
           } : {}),
           currentSchema: generatedSchema,
+          tableCounts,
           currentData: dataToSend,
           history,
         }),
@@ -1033,18 +1081,7 @@ function StudioPageInner({
                   : m
               ))
               // Auto-continue after 2 seconds (capped)
-              const t = setTimeout(() => {
-                pendingTimeoutsRef.current.delete(t)
-                const lastMsg = messagesRef.current[messagesRef.current.length - 1]
-                if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isStreaming) {
-                  if (autoTurnsRef.current >= MAX_AUTO_TURNS) {
-                    toast.info('Paused automatic follow-ups — send a message to continue.')
-                    return
-                  }
-                  sendMessage('[Auto-continue: Your previous response was cut off. Please continue from where you left off, completing any SQL blocks that were truncated.]', true)
-                }
-              }, 2000)
-              pendingTimeoutsRef.current.add(t)
+              scheduleAutoFollowUp('[Auto-continue: Your previous response was cut off. Please continue from where you left off, completing any SQL blocks that were truncated.]', 2000)
             } else if (parsed.type === 'error') {
               console.error('[Studio] Stream error:', parsed.content)
               // Surface the mid-stream error to the user and stop the
@@ -1155,8 +1192,7 @@ function StudioPageInner({
           // (CREATE TABLE users → INSERT INTO users → CREATE TABLE orders
           // referencing users) resolve in order.
           const runSequentially = async () => {
-            let hadReadOnlyQueries = false
-            let hadMutations = false
+            const outcomes: Array<SqlBlockResult | undefined> = []
             for (let idx = 0; idx < sqlBlocks.length; idx++) {
               const block = sqlBlocks[idx]
               const stripped = stripSqlComments(block).trim()
@@ -1176,47 +1212,28 @@ function StudioPageInner({
 
               if (allReadOnly && !isDestructive) {
                 // Read-only queries: auto-execute, no confirmation
-                hadReadOnlyQueries = true
-                await executeSqlBlockRef.current(assistantId, block, true)
+                outcomes.push(await executeSqlBlockRef.current(assistantId, block, true))
               } else if (!isDestructive) {
                 // Non-destructive mutations (INSERT, CREATE TABLE, UPDATE with WHERE):
                 // Auto-execute WITHOUT confirmation — the AI is generating data and
                 // should be able to insert it directly. The user asked for data
                 // generation, so confirming every INSERT would be annoying.
-                hadMutations = true
-                await executeSqlBlockRef.current(assistantId, block, true) // skipConfirm=true
+                outcomes.push(await executeSqlBlockRef.current(assistantId, block, true))
               } else {
                 // Destructive operations (DROP, TRUNCATE, DELETE without WHERE):
                 // ALWAYS require confirmation, even in auto-execute mode.
-                await executeSqlBlockRef.current(assistantId, block, false)
+                outcomes.push(await executeSqlBlockRef.current(assistantId, block, false))
               }
             }
 
-            // Auto-continue after read-only queries OR mutations so the AI
-            // can see the results and proceed with the next step.
-            // BUGFIX (auto-continue broken): Previously `!isStreaming` referenced
-            // a variable that did NOT exist in this scope (the only `isStreaming`
-            // is a local const inside a different useEffect). This threw a
-            // ReferenceError which was silently caught by the .catch() below,
-            // so the auto-continue NEVER fired — meaning the AI executed the
-            // first SQL block but never received the results, stalling the
-            // multi-step "introspect → insert → verify" loop. Fix: use
-            // `loadingRef.current` (the authoritative loading flag), which is
-            // false at this point because the stream already finished.
-            if ((hadReadOnlyQueries || hadMutations) && !loadingRef.current) {
-              const t = setTimeout(() => {
-                pendingTimeoutsRef.current.delete(t)
-                const lastMsg = messagesRef.current[messagesRef.current.length - 1]
-                if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isStreaming && !loadingRef.current) {
-                  if (autoTurnsRef.current >= MAX_AUTO_TURNS) {
-                    toast.info('Paused automatic follow-ups — send a message to continue.')
-                    return
-                  }
-                  sendMessage('[Auto-continue: SQL executed successfully. Results are in conversation history. Proceed with the next step.]', true)
-                }
-              }, 1500)
-              pendingTimeoutsRef.current.add(t)
-            }
+            // Auto-continue from the REAL outcomes of this reply's blocks.
+            const isCancelled = (o?: SqlBlockResult) => !!o && !o.ok && o.message === CANCELLED_MSG
+            if (outcomes.length === 0 || outcomes.every(isCancelled) || loadingRef.current) return
+            const failed = outcomes.some(o => !o || !o.ok)
+            const msg = failed
+              ? `[Auto-continue] Results of the SQL you just emitted:\n${outcomes.map((o, i) => `${i + 1}. ${isCancelled(o) ? 'CANCELLED — user declined' : o?.ok ? `OK — ${o.message}` : `ERROR — ${o?.message ?? 'not executed'}`}`).join('\n')}\nFix the failed statement (retry once) or continue with the next step.`
+              : `[Auto-continue] All ${outcomes.length} statement(s) succeeded. Proceed with the next step, or reply "Done" with a short summary if the task is complete.`
+            scheduleAutoFollowUp(msg, 1500)
           }
           runSequentially().catch(err => {
             console.error('[Studio] Auto-execution sequence failed:', err)
@@ -1479,6 +1496,7 @@ function StudioPageInner({
     )
     setGeneratedSchema(conv.schema || [])
     setGeneratedData(conv.data || {})
+    setTableCounts({})
     setDatabaseName(conv.databaseName || '')
     setCurrentDatabaseId(conv.databaseId || undefined)
     // Reset the backend conversation id — the loaded chat is a fresh backend
@@ -1520,6 +1538,7 @@ function StudioPageInner({
     if (!isLiveDbMode) {
       setGeneratedSchema([])
       setGeneratedData({})
+      setTableCounts({})
       setDatabaseName('')
       setCurrentDatabaseId(undefined)
     }
@@ -1594,6 +1613,10 @@ function StudioPageInner({
       toast.error('Nothing to export — no database generated yet')
       return
     }
+    if (currentDatabaseId) {
+      void downloadExport({ databaseId: currentDatabaseId }, 'sql', databaseName || 'database')
+      return
+    }
     exportAsSQL(generatedSchema, generatedData, `${databaseName || 'database'}.sql`)
     toast.success('Database exported as SQL dump')
   }
@@ -1640,20 +1663,16 @@ function StudioPageInner({
   // sqlBlockStates (keyed by the SQL string). We NO LONGER update the legacy
   // sqlBlockExecuting/sqlBlockResult fields, which were shared across ALL
   // blocks in the same message and caused every button to show the same result.
-  const executeSqlBlock = async (messageId: string, sql: string, skipConfirm = false) => {
+  const executeSqlBlock = async (messageId: string, sql: string, skipConfirm = false): Promise<SqlBlockResult | undefined> => {
     if (!activeConnectionId) {
       toast.error('No active DB connection')
-      return
+      return { ok: false, message: 'No active DB connection', rowCount: 0, affectedRows: 0 }
     }
     if (!sql.trim()) return
 
-    if (!skipConfirm && isDestructiveSQL(sql)) {
-      const ok = window.confirm(
-        `⚠️  This SQL will modify or destroy data on your LIVE database "${activeConnectionName}":\n\n${sql.slice(0, 200)}${sql.length > 200 ? '...' : ''}\n\nAre you sure you want to execute this?`,
-      )
-      if (!ok) return
-    }
-
+    const askConfirm = () => window.confirm(
+      `⚠️  This SQL will modify or destroy data on your LIVE database "${activeConnectionName}":\n\n${sql.slice(0, 200)}${sql.length > 200 ? '...' : ''}\n\nAre you sure you want to execute this?`,
+    )
     // Helper to update ONLY this specific SQL block's state in sqlBlockStates.
     // This is the KEY FIX: we do NOT touch sqlBlockExecuting/sqlBlockResult
     // (the legacy shared fields) — only sqlBlockStates[sql].
@@ -1666,22 +1685,46 @@ function StudioPageInner({
       }))
     }
 
+    // Once the user has confirmed (or the caller pre-confirmed), tell the
+    // server to skip its own dangerous-statement check.
+    let confirmed = skipConfirm
+    if (!confirmed && isDestructiveSQL(sql)) {
+      if (!askConfirm()) {
+        updateBlockState(false, CANCELLED_RESULT)
+        return CANCELLED_RESULT
+      }
+      confirmed = true
+    }
+
     // Set executing state for THIS specific block only
     updateBlockState(true, null)
 
     try {
-      const result = await apiPost<{
+      type BlockExecResponse = {
+        truncated?: boolean
         rows?: Record<string, unknown>[]
         columns?: string[]
         error?: string
         executionTime?: number
         rowCount?: number
         affectedRows?: number
-      }>('/api/connections/execute', {
+        requiresConfirmation?: boolean
+      }
+      const run = (skipDangerousCheck: boolean) => apiPost<BlockExecResponse>('/api/connections/execute', {
         connectionId: activeConnectionId,
         sql,
-        skipDangerousCheck: skipConfirm,
+        skipDangerousCheck,
       }, { timeout: 60000 })
+      let result = await run(confirmed)
+
+      if (result.requiresConfirmation) {
+        if (!askConfirm()) {
+          updateBlockState(false, CANCELLED_RESULT)
+          return CANCELLED_RESULT
+        }
+        confirmed = true
+        result = await run(true)
+      }
 
       if (result.error) {
         const errResult: SqlBlockResult = { ok: false, message: result.error!, rowCount: 0, affectedRows: 0 }
@@ -1693,7 +1736,7 @@ function StudioPageInner({
           setActiveConnectionDialect(undefined)
           router.push('/dashboard/connections')
         }
-        return
+        return errResult
       }
 
       const stripped = stripSqlComments(sql).trim()
@@ -1713,6 +1756,7 @@ function StudioPageInner({
         affectedRows: affected,
         rows: result.rows?.slice(0, 50),
         columns: result.columns,
+        truncated: result.truncated,
       }
 
       // Update ONLY this block's state
@@ -1724,9 +1768,11 @@ function StudioPageInner({
           const refresh = await apiGet<{
             schema?: SchemaTable[]
             data?: Record<string, unknown[]>
+            counts?: Record<string, number>
           }>(`/api/connections/${activeConnectionId}?include=introspect`, { cacheTtl: 0, force: true, timeout: 30000 })
           if (refresh.schema) setGeneratedSchema(refresh.schema)
           if (refresh.data) setGeneratedData(refresh.data)
+          if (refresh.counts) setTableCounts(refresh.counts)
         } catch (err) {
           console.warn('[Studio] Failed to refresh external DB after mutation:', err)
           toast.warning('Mutation succeeded, but the schema/data refresh failed. Reload the page to see the latest state.')
@@ -1739,16 +1785,20 @@ function StudioPageInner({
               rows: result.rows,
               columns: result.columns || [],
               executionTime: result.executionTime || 0,
+              truncated: result.truncated,
+              totalRows: result.rowCount,
             })
             setActiveTab('sql')
           }
         }
       }
+      return okResult
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Execution failed'
       const errResult: SqlBlockResult = { ok: false, message: msg, rowCount: 0, affectedRows: 0 }
       updateBlockState(false, errResult)
       toast.error(msg)
+      return errResult
     }
   }
 
@@ -1761,6 +1811,16 @@ function StudioPageInner({
   useEffect(() => {
     executeSqlBlockRef.current = executeSqlBlock
   }, [executeSqlBlock, activeConnectionId, activeConnectionName, activeConnectionDialect])
+
+  // ─── Export live connection (whole DB or one table) ───
+  const exportLive = (format: ExportFormat, tableName?: string) => {
+    if (!activeConnectionId) return
+    return downloadExport(
+      { connectionId: activeConnectionId, ...(tableName ? { tableName } : {}) },
+      format,
+      tableName || activeConnectionName || 'database',
+    )
+  }
 
   // ─── SQL Execution ───
   const executeSQL = async (sql: string, skipConfirm = false) => {
@@ -1798,6 +1858,7 @@ function StudioPageInner({
         columns?: string[]
         error?: string
         executionTime?: number
+        truncated?: boolean
         rowCount?: number
         affectedRows?: number
         refreshedData?: Record<string, unknown[]>
@@ -1831,6 +1892,8 @@ function StudioPageInner({
           rows: result.rows,
           columns: result.columns || [],
           executionTime: result.executionTime || 0,
+          truncated: result.truncated,
+          totalRows: result.rowCount,
         })
 
         // If the SQL mutated data (INSERT / UPDATE / DELETE / etc.) the
@@ -1839,6 +1902,15 @@ function StudioPageInner({
         // backend instead of showing stale rows.
         if (result.refreshedData) {
           setGeneratedData(result.refreshedData)
+          setTableCounts({})
+          if (currentDatabaseId) {
+            apiGet<{ database?: { data_json: Record<string, unknown[]>; table_counts?: Record<string, number> } }>(
+              `/api/databases?id=${currentDatabaseId}&preview=200`, { cacheTtl: 0, force: true, timeout: 30000 })
+              .then(d => {
+                if (d.database?.data_json) setGeneratedData(d.database.data_json)
+                if (d.database?.table_counts) setTableCounts(d.database.table_counts)
+              }).catch(() => { /* keep refreshedData */ })
+          }
         }
         if (result.refreshedSchema) {
           setGeneratedSchema(result.refreshedSchema)
@@ -2075,10 +2147,11 @@ function StudioPageInner({
               const dbId = liveDatabaseId || generationProgress.databaseId
               if (dbId) {
                 try {
-                  const dbResult = await apiGet<{ database?: { data_json: Record<string, unknown[]>; schema_json: SchemaTable[] } }>(`/api/databases?id=${dbId}`, { cacheTtl: 0, force: true })
+                  const dbResult = await apiGet<{ database?: { data_json: Record<string, unknown[]>; schema_json: SchemaTable[]; table_counts?: Record<string, number> } }>(`/api/databases?id=${dbId}&preview=200`, { cacheTtl: 0, force: true })
                   if (dbResult.database?.data_json && Object.keys(dbResult.database.data_json).length > 0) {
                     setGeneratedData(dbResult.database.data_json)
                   }
+                  if (dbResult.database?.table_counts) setTableCounts(dbResult.database.table_counts)
                   if (dbResult.database?.schema_json && Array.isArray(dbResult.database.schema_json) && dbResult.database.schema_json.length > 0) {
                     setGeneratedSchema(dbResult.database.schema_json as SchemaTable[])
                   }
@@ -2345,8 +2418,8 @@ function StudioPageInner({
         typeBreakdown.set(normalized, (typeBreakdown.get(normalized) || 0) + 1)
       }
     }
-    for (const rows of Object.values(generatedData)) {
-      rowCount += Array.isArray(rows) ? rows.length : 0
+    for (const [name, rows] of Object.entries(generatedData)) {
+      rowCount += Math.max(tableCounts[name] ?? 0, Array.isArray(rows) ? rows.length : 0)
     }
     return { tableCount, columnCount, rowCount, typeBreakdown }
   })()
@@ -2366,7 +2439,8 @@ function StudioPageInner({
     const rowCounts: Record<string, number> = {}
     for (const table of generatedSchema) {
       const rows = generatedData[table.name]
-      rowCounts[table.name] = Array.isArray(rows) && rows.length > 0 ? rows.length : 10
+      const n = Math.max(tableCounts[table.name] ?? 0, Array.isArray(rows) ? rows.length : 0)
+      rowCounts[table.name] = n > 0 ? n : 10
     }
 
     const signal: BeginGenerationSignal = {
@@ -2380,6 +2454,7 @@ function StudioPageInner({
     // Clear existing data so the new generation starts clean. The schema is
     // preserved (it's the same schema the user is regenerating from).
     setGeneratedData({})
+    setTableCounts({})
 
     // Add a chat message so the user sees the regeneration happening in-line
     // with the rest of their conversation history.
@@ -2398,6 +2473,13 @@ function StudioPageInner({
 
     await startStreamingGeneration(signal, assistantId)
   }
+
+  const dropTableCount = (t: string) => setTableCounts(prev => {
+    if (!(t in prev)) return prev
+    const next = { ...prev }
+    delete next[t]
+    return next
+  })
 
   const handleAddTable = () => {
     if (!newTableName.trim()) return
@@ -2435,6 +2517,7 @@ function StudioPageInner({
         ? { ...t, columns: [...t.columns, { name: newColumnName.trim(), type: newColumnType }] }
         : t
     ))
+    dropTableCount(selectedTable)
     setGeneratedData(prev => ({
       ...prev,
       [selectedTable]: (prev[selectedTable] || []).map((row: unknown) => {
@@ -2457,6 +2540,7 @@ function StudioPageInner({
         emptyRow[col.name] = col.name === 'id' ? crypto.randomUUID() : null
       }
     }
+    dropTableCount(selectedTable)
     setGeneratedData(prev => ({
       ...prev,
       [selectedTable]: [...(prev[selectedTable] || []), emptyRow],
@@ -2478,6 +2562,7 @@ function StudioPageInner({
 
   const handleDeleteSelectedRows = () => {
     if (!selectedTable || selectedRows.size === 0) return
+    dropTableCount(selectedTable)
     setGeneratedData(prev => ({
       ...prev,
       [selectedTable]: (prev[selectedTable] || []).filter((_: unknown, i: number) => !selectedRows.has(i)),
@@ -2487,8 +2572,48 @@ function StudioPageInner({
   }
 
   // ─── Current table data for display ───
-  const currentTableData = selectedTable ? generatedData[selectedTable] || [] : []
-  const currentTableColumns = currentTableData.length > 0 ? Object.keys(currentTableData[0] as Record<string, unknown>) : []
+  const memoryRows = selectedTable ? generatedData[selectedTable] || [] : []
+  const knownTotal = selectedTable ? tableCounts[selectedTable] : undefined
+  const isPaged = !!selectedTable && knownTotal !== undefined && knownTotal > memoryRows.length &&
+    (isLiveDbMode ? !!activeConnectionId : !!currentDatabaseId)
+  const currentTableData = isPaged ? pagedRows : memoryRows
+  const displayTotal = isPaged ? pagedTotal || (knownTotal ?? 0) : (knownTotal !== undefined && knownTotal > memoryRows.length ? knownTotal : memoryRows.length)
+  const rowCountFor = (t: string) => Math.max(tableCounts[t] ?? 0, Array.isArray(generatedData[t]) ? generatedData[t].length : 0)
+
+  // Debounce the filter box for server-side filtering (synthetic only).
+  useEffect(() => {
+    const h = setTimeout(() => setDebouncedSearch(dataSearchQuery.trim()), 300)
+    return () => clearTimeout(h)
+  }, [dataSearchQuery])
+  // Reset paging when the table changes.
+  useEffect(() => {
+    setPageOffset(0)
+    setPageSort(null)
+    setPagedRows([])
+  }, [selectedTable, currentDatabaseId, activeConnectionId])
+  // Fetch the current server-side page.
+  useEffect(() => {
+    if (!isPaged || !selectedTable) return
+    let cancelled = false
+    const qs = new URLSearchParams({ table: selectedTable, offset: String(pageOffset), limit: String(pageSize) })
+    if (pageSort) { qs.set('sort', pageSort.col); qs.set('dir', pageSort.dir) }
+    if (!isLiveDbMode && debouncedSearch) qs.set('q', debouncedSearch)
+    const url = isLiveDbMode
+      ? `/api/connections/${activeConnectionId}/rows?${qs}`
+      : `/api/databases/${currentDatabaseId}/rows?${qs}`
+    setPagedLoading(true)
+    apiGet<{ rows?: unknown[]; columns?: string[]; total?: number }>(url, { cacheTtl: 0, force: true, timeout: 30000 })
+      .then(res => {
+        if (cancelled) return
+        setPagedRows(res.rows || [])
+        setPagedColumns(res.columns || [])
+        setPagedTotal(res.total ?? 0)
+      })
+      .catch(err => { if (!cancelled) toast.error(err instanceof Error ? err.message : 'Failed to load rows') })
+      .finally(() => { if (!cancelled) setPagedLoading(false) })
+    return () => { cancelled = true }
+  }, [isPaged, selectedTable, pageOffset, pageSize, pageSort, debouncedSearch, isLiveDbMode, activeConnectionId, currentDatabaseId])
+  const currentTableColumns = isPaged && pagedColumns.length > 0 ? pagedColumns : currentTableData.length > 0 ? Object.keys(currentTableData[0] as Record<string, unknown>) : []
   // Schema for the currently selected table. Lets us show column types and
   // render the table header even when the table has no rows yet.
   const currentTableSchema = selectedTable ? generatedSchema.find(t => t.name === selectedTable) : undefined
@@ -2504,7 +2629,7 @@ function StudioPageInner({
   // filtered set is what gets sliced by visibleRows so "Load more" still works.
   const filteredTableData = (() => {
     const q = dataSearchQuery.trim().toLowerCase()
-    if (!q) return currentTableData
+    if (!q || isPaged) return currentTableData
     return currentTableData.filter((row) => {
       const r = row as Record<string, unknown>
       return Object.values(r).some(v => {
@@ -2513,8 +2638,8 @@ function StudioPageInner({
       })
     })
   })()
-  const displayedRows = filteredTableData.slice(0, visibleRows)
-  const hasMoreRows = filteredTableData.length > visibleRows
+  const displayedRows = isPaged ? filteredTableData : filteredTableData.slice(0, visibleRows)
+  const hasMoreRows = !isPaged && filteredTableData.length > visibleRows
 
   // ─── ER Diagram Layout ───
   // Delegates to the extracted helper in ./_lib/utils.
@@ -3216,10 +3341,33 @@ function StudioPageInner({
             )}
           </div>
           <div className="flex items-center gap-1.5">
+            {isLiveDbMode && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="outline" size="sm" className="h-6 text-[10px] gap-1">
+                    <Download className="h-2.5 w-2.5" />
+                    Export
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  {(['sql', 'csv', 'json', 'xlsx'] as ExportFormat[]).map(f => (
+                    <DropdownMenuItem key={f} onClick={() => exportLive(f)}>
+                      {{ sql: 'SQL dump (.sql)', csv: 'CSV (.csv)', json: 'JSON (.json)', xlsx: 'Excel (.xls)' }[f]}
+                    </DropdownMenuItem>
+                  ))}
+                  {selectedTable && <DropdownMenuSeparator />}
+                  {selectedTable && (['sql', 'csv', 'json', 'xlsx'] as ExportFormat[]).map(f => (
+                    <DropdownMenuItem key={`t-${f}`} onClick={() => exportLive(f, selectedTable)}>
+                      Export &quot;{selectedTable}&quot; as {f === 'xlsx' ? 'Excel' : f.toUpperCase()}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
             {hasGeneratedData && (
               <>
-                {/* Export Dropdown */}
-                <DropdownMenu>
+                {/* Export Dropdown (synthetic data; live DBs use the server-side export above) */}
+                {!isLiveDbMode && <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button variant="outline" size="sm" className="h-6 text-[10px] gap-1">
                       <Download className="h-2.5 w-2.5" />
@@ -3227,11 +3375,15 @@ function StudioPageInner({
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
-                    <DropdownMenuItem onClick={() => exportAsSQL(generatedSchema, generatedData, `${databaseName || 'database'}.sql`)}>
+                    <DropdownMenuItem onClick={() => exportCurrentDatabase()}>
                       <FileText className="mr-2 h-3 w-3" />
                       SQL Dump (.sql)
                     </DropdownMenuItem>
                     <DropdownMenuItem onClick={() => {
+                      if (currentDatabaseId) {
+                        void downloadExport({ databaseId: currentDatabaseId, ...(selectedTable ? { tableName: selectedTable } : {}) }, 'csv', selectedTable || databaseName || 'database')
+                        return
+                      }
                       if (selectedTable && currentTableData.length > 0) {
                         exportAsCSV(currentTableData as Record<string, unknown>[], `${databaseName}_${selectedTable}.csv`)
                       } else {
@@ -3248,12 +3400,15 @@ function StudioPageInner({
                       <FileSpreadsheet className="mr-2 h-3 w-3" />
                       CSV (.csv)
                     </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => exportAsJSON(generatedData, `${databaseName || 'database'}.json`)}>
+                    <DropdownMenuItem onClick={() => {
+                      if (currentDatabaseId) void downloadExport({ databaseId: currentDatabaseId }, 'json', databaseName || 'database')
+                      else exportAsJSON(generatedData, `${databaseName || 'database'}.json`)
+                    }}>
                       <FileJson className="mr-2 h-3 w-3" />
                       JSON (.json)
                     </DropdownMenuItem>
                   </DropdownMenuContent>
-                </DropdownMenu>
+                </DropdownMenu>}
 
                 <Button
                   variant="outline"
@@ -3392,7 +3547,7 @@ function StudioPageInner({
                                 dark:[&::-webkit-scrollbar-thumb]:bg-amber-700/50">
                   {generatedSchema.map((table) => {
                     const rows = generatedData[table.name]
-                    const rowCount = Array.isArray(rows) ? rows.length : 0
+                    const rowCount = Math.max(tableCounts[table.name] ?? 0, Array.isArray(rows) ? rows.length : 0)
                     const isActive = selectedTable === table.name
                     return (
                       <button
@@ -3409,7 +3564,7 @@ function StudioPageInner({
                             ? 'bg-amber-100 dark:bg-amber-900/40 text-amber-900 dark:text-amber-200'
                             : 'hover:bg-amber-50 dark:hover:bg-amber-950/30 text-foreground/80'
                         }`}
-                        title={`${table.name} — ${table.columns.length} columns, ${rowCount} rows`}
+                        title={`${table.name} — ${table.columns.length} columns, ${rowCount.toLocaleString()} rows`}
                       >
                         <Table2 className={`h-2.5 w-2.5 shrink-0 ${isActive ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground'}`} />
                         <span className="font-mono font-medium truncate flex-1 text-left">{table.name}</span>
@@ -3418,7 +3573,7 @@ function StudioPageInner({
                           {table.columns.length}
                         </Badge>
                         <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 min-w-[20px] text-center shrink-0 border-amber-300/60 dark:border-amber-700/50 text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30">
-                          {rowCount}
+                          {rowCount.toLocaleString()}
                         </Badge>
                       </button>
                     )
@@ -3471,9 +3626,11 @@ function StudioPageInner({
                               const refresh = await apiGet<{
                                 schema?: SchemaTable[]
                                 data?: Record<string, unknown[]>
+                                counts?: Record<string, number>
                               }>(`/api/connections/${activeConnectionId}?include=introspect`, { cacheTtl: 0, force: true, timeout: 30000 })
                               if (refresh.schema) setGeneratedSchema(refresh.schema)
                               if (refresh.data) setGeneratedData(refresh.data)
+                              if (refresh.counts) setTableCounts(refresh.counts)
                               setSelectedTable('')
                               toast.success(`Loaded ${refresh.schema?.length || 0} tables from live DB`)
                             } catch (err) {
@@ -3498,7 +3655,7 @@ function StudioPageInner({
                   </div>
                   <div className="flex-1 overflow-y-auto p-1 space-y-0.5 max-h-96">
                     {Object.entries(generatedData).map(([tableName, rows]) => {
-                      const rowCount = Array.isArray(rows) ? rows.length : 0
+                      const rowCount = Math.max(tableCounts[tableName] ?? 0, Array.isArray(rows) ? rows.length : 0)
                       const isActive = selectedTable === tableName
                       return (
                         <button
@@ -3509,7 +3666,7 @@ function StudioPageInner({
                               ? 'bg-accent text-accent-foreground'
                               : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
                           }`}
-                          title={`${tableName} — ${rowCount} row${rowCount === 1 ? '' : 's'}`}
+                          title={`${tableName} — ${rowCount.toLocaleString()} row${rowCount === 1 ? '' : 's'}`}
                         >
                           <Table2 className={`h-2.5 w-2.5 shrink-0 ${isActive ? 'text-amber-600 dark:text-amber-400' : ''}`} />
                           <span className="truncate">{tableName}</span>
@@ -3523,7 +3680,7 @@ function StudioPageInner({
                                 : 'border-amber-300/60 dark:border-amber-700/40 bg-amber-50 dark:bg-amber-950/20 text-amber-700 dark:text-amber-400 group-hover:bg-amber-100 dark:group-hover:bg-amber-900/40'
                             }`}
                           >
-                            {rowCount}
+                            {rowCount.toLocaleString()}
                           </Badge>
                         </button>
                       )
@@ -3582,12 +3739,12 @@ function StudioPageInner({
                           <div className="flex flex-col min-w-0 leading-tight">
                             <span className="text-xs font-semibold truncate">{selectedTable}</span>
                             <Badge variant="outline" className="text-[9px] px-1 py-0 h-3.5 w-fit">
-                              {currentTableData.length} row{currentTableData.length === 1 ? '' : 's'}
+                              {displayTotal.toLocaleString()} row{displayTotal === 1 ? '' : 's'}
                             </Badge>
                           </div>
                         </div>
                         <div className="flex items-center gap-0.5 shrink-0">
-                          <Button variant="ghost" size="sm" className="h-5 text-[9px] gap-0.5 px-1" onClick={handleAddRow} title="Add Row">
+                          <Button variant="ghost" size="sm" className="h-5 text-[9px] gap-0.5 px-1" onClick={handleAddRow} disabled={isPaged} title={isPaged ? 'Use the SQL tab or AI chat to edit large tables' : 'Add Row'}>
                             <Plus className="h-2.5 w-2.5" />Row
                           </Button>
                           <Button variant="ghost" size="sm" className="h-5 text-[9px] gap-0.5 px-1" onClick={() => setAddColumnDialogOpen(true)} title="Add Column">
@@ -3598,7 +3755,7 @@ function StudioPageInner({
                               <Trash2 className="h-2.5 w-2.5" />Del
                             </Button>
                           )}
-                          <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => copyToClipboard(JSON.stringify(currentTableData, null, 2))} title="Copy as JSON">
+                          <Button variant="ghost" size="sm" className="h-5 w-5 p-0" onClick={() => copyToClipboard(JSON.stringify(currentTableData, null, 2))} title={isPaged ? 'Copy current page as JSON' : 'Copy as JSON'}>
                             <Copy className="h-2.5 w-2.5" />
                           </Button>
                           <DropdownMenu>
@@ -3608,15 +3765,25 @@ function StudioPageInner({
                               </Button>
                             </DropdownMenuTrigger>
                             <DropdownMenuContent align="end" className="text-xs">
-                              <DropdownMenuItem onClick={() => exportAsJSON(currentTableData, `${selectedTable}.json`)}>
+                              <DropdownMenuItem onClick={() => {
+                                if (!isLiveDbMode && currentDatabaseId) void downloadExport({ databaseId: currentDatabaseId, tableName: selectedTable }, 'json', selectedTable)
+                                else if (isLiveDbMode) void exportLive('json', selectedTable)
+                                else exportAsJSON(currentTableData, `${selectedTable}.json`)
+                              }}>
                                 <FileJson className="mr-2 h-3 w-3" />
                                 JSON (.json)
                               </DropdownMenuItem>
-                              <DropdownMenuItem onClick={() => exportAsCSV(currentTableData as Record<string, unknown>[], `${selectedTable}.csv`)}>
+                              <DropdownMenuItem onClick={() => {
+                                if (!isLiveDbMode && currentDatabaseId) void downloadExport({ databaseId: currentDatabaseId, tableName: selectedTable }, 'csv', selectedTable)
+                                else if (isLiveDbMode) void exportLive('csv', selectedTable)
+                                else exportAsCSV(currentTableData as Record<string, unknown>[], `${selectedTable}.csv`)
+                              }}>
                                 <FileSpreadsheet className="mr-2 h-3 w-3" />
                                 CSV (.csv)
                               </DropdownMenuItem>
                               <DropdownMenuItem onClick={() => {
+                                if (!isLiveDbMode && currentDatabaseId) { void downloadExport({ databaseId: currentDatabaseId, tableName: selectedTable }, 'sql', selectedTable); return }
+                                if (isLiveDbMode) { void exportLive('sql', selectedTable); return }
                                 const singleSchema = generatedSchema.find(s => s.name === selectedTable)
                                 const singleData = selectedTable ? { [selectedTable]: generatedData[selectedTable] || [] } : {}
                                 exportAsSQL(singleSchema ? [singleSchema] : [], singleData, `${selectedTable}.sql`)
@@ -3626,9 +3793,9 @@ function StudioPageInner({
                               </DropdownMenuItem>
                             </DropdownMenuContent>
                           </DropdownMenu>
-                          <span className="hidden sm:inline-flex items-center gap-1 text-[9px] text-muted-foreground/80 border border-border rounded px-1.5 py-0.5 bg-muted/30 ml-1" title="Double-click any cell to edit it in place">
+                          <span className="hidden sm:inline-flex items-center gap-1 text-[9px] text-muted-foreground/80 border border-border rounded px-1.5 py-0.5 bg-muted/30 ml-1" title={isPaged ? 'Use the SQL tab or AI chat to edit large tables' : 'Double-click any cell to edit it in place'}>
                             <MousePointerClick className="h-2.5 w-2.5" />
-                            Double-click a cell to edit
+                            {isPaged ? 'Large table: read-only' : 'Double-click a cell to edit'}
                           </span>
                         </div>
                       </div>
@@ -3648,7 +3815,7 @@ function StudioPageInner({
                               <span className="font-semibold text-foreground">{currentTableSchema?.columns.length || headerColumns.length}</span> cols
                             </span>
                             <span className="text-[9px] text-muted-foreground">
-                              <span className="font-semibold text-foreground">{currentTableData.length.toLocaleString()}</span> rows
+                              <span className="font-semibold text-foreground">{displayTotal.toLocaleString()}</span> rows
                             </span>
                             {currentTableSchema && currentTableSchema.columns.length > 0 && (
                               <>
@@ -3685,7 +3852,9 @@ function StudioPageInner({
                           <Search className="absolute left-1.5 top-1/2 -translate-y-1/2 h-2.5 w-2.5 text-muted-foreground pointer-events-none" />
                           <Input
                             value={dataSearchQuery}
-                            onChange={(e) => { setDataSearchQuery(e.target.value); setVisibleRows(20) }}
+                            onChange={(e) => { setDataSearchQuery(e.target.value); setVisibleRows(20); setPageOffset(0) }}
+                            disabled={isPaged && isLiveDbMode}
+                            title={isPaged && isLiveDbMode ? 'Filtering is not available for paged live tables; use the SQL tab' : undefined}
                             placeholder="Filter rows…"
                             className="h-5 text-[10px] pl-6 pr-5"
                           />
@@ -3727,8 +3896,10 @@ function StudioPageInner({
                                 return (
                                   <th
                                     key={col}
+                                    onClick={isPaged ? () => { setPageOffset(0); setPageSort(prev => prev?.col === col ? { col, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { col, dir: 'asc' }) } : undefined}
                                     className={cn(
                                       'text-left align-top py-1.5 px-2 font-medium whitespace-nowrap border-r last:border-r-0 min-w-[104px]',
+                                      isPaged && 'cursor-pointer select-none hover:bg-muted/70',
                                       kind === 'pk' && 'bg-primary/10 border-b-2 border-b-primary',
                                       kind === 'fk' && 'bg-sky-500/10 dark:bg-sky-950/35 border-b-2 border-b-sky-500/55',
                                       kind === 'regular' && 'bg-muted/40 border-b border-border',
@@ -3747,6 +3918,7 @@ function StudioPageInner({
                                           </Badge>
                                         )}
                                         <span className="text-[11px] font-semibold text-foreground">{humanizeColumnName(col)}</span>
+                                        {isPaged && pageSort?.col === col && <span className="text-[10px] text-primary">{pageSort.dir === 'asc' ? '▲' : '▼'}</span>}
                                       </div>
                                       <div className="flex items-center gap-1">
                                         <span className="font-mono text-[9px] text-muted-foreground">{col}</span>
@@ -3802,7 +3974,7 @@ function StudioPageInner({
                                     />
                                   </td>
                                   <td className="py-1 px-2 text-muted-foreground font-mono text-[9px] border-r bg-muted/20">
-                                    {i + 1}
+                                    {(isPaged ? pageOffset : 0) + i + 1}
                                   </td>
                                   {currentTableColumns.map((colName) => {
                                     const val = (row as Record<string, unknown>)[colName]
@@ -3815,7 +3987,7 @@ function StudioPageInner({
                                           kind === 'pk' && 'bg-primary/[0.07]',
                                           kind === 'fk' && 'bg-sky-500/[0.08] dark:bg-sky-950/25',
                                         )}
-                                        onDoubleClick={() => {
+                                        onDoubleClick={isPaged ? undefined : () => {
                                           setEditingCell({ row: i, col: colName })
                                           setEditingCellValue(val === null ? '' : String(val))
                                         }}
@@ -3861,11 +4033,18 @@ function StudioPageInner({
                           "Load more" button on the right. */}
                       <div className="px-2.5 py-1.5 border-t bg-muted/30 shrink-0 flex items-center justify-between gap-2">
                         <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground min-w-0">
+                          {isPaged ? (
+                            <span className="shrink-0" data-testid="paged-range">
+                              Rows {pagedTotal === 0 ? 0 : (pageOffset + 1).toLocaleString()}–{Math.min(pageOffset + pageSize, pagedTotal).toLocaleString()} of {pagedTotal.toLocaleString()}
+                              {pagedLoading && <span className="ml-1 italic">loading…</span>}
+                            </span>
+                          ) : (
                           <span className="shrink-0">
                             Rows: <span className="font-semibold text-foreground">{displayedRows.length.toLocaleString()}</span>
                             {' '}of{' '}
                             <span className="font-semibold text-foreground">{filteredTableData.length.toLocaleString()}</span>
                           </span>
+                          )}
                           {dataSearchQuery && currentTableData.length !== filteredTableData.length && (
                             <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 gap-0.5 border-amber-300/60 dark:border-amber-700/40 text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30 shrink-0">
                               <Search className="h-2 w-2" />
@@ -3873,6 +4052,22 @@ function StudioPageInner({
                             </Badge>
                           )}
                         </div>
+                        {isPaged && (
+                          <div className="flex items-center gap-1 shrink-0">
+                            <select
+                              className="h-5 text-[10px] border rounded bg-background px-1"
+                              value={pageSize}
+                              onChange={(e) => { setPageSize(Number(e.target.value)); setPageOffset(0) }}
+                              aria-label="Rows per page"
+                            >
+                              {[50, 100, 250, 500].map(n => <option key={n} value={n}>{n} / page</option>)}
+                            </select>
+                            <Button variant="outline" size="sm" className="h-5 text-[10px] px-2" disabled={pageOffset === 0 || pagedLoading}
+                              onClick={() => setPageOffset(o => Math.max(0, o - pageSize))}>Prev</Button>
+                            <Button variant="outline" size="sm" className="h-5 text-[10px] px-2" disabled={pageOffset + pageSize >= pagedTotal || pagedLoading}
+                              onClick={() => setPageOffset(o => o + pageSize)}>Next</Button>
+                          </div>
+                        )}
                         {hasMoreRows && (
                           <Button
                             variant="ghost"
@@ -4067,6 +4262,11 @@ function StudioPageInner({
                       <span className="text-[10px] font-medium text-muted-foreground">
                         Results ({sqlResults.rows.length} rows · {sqlResults.executionTime}ms)
                       </span>
+                      {sqlResults.truncated && (
+                        <span className="text-[10px] text-amber-700 dark:text-amber-400 mx-2 truncate">
+                          Showing first 1,000 of {(sqlResults.totalRows ?? sqlResults.rows.length).toLocaleString()} rows — add LIMIT/WHERE or export for the full result.
+                        </span>
+                      )}
                       <div className="flex items-center gap-1">
                         <Button
                           variant="ghost"
@@ -4142,7 +4342,7 @@ function StudioPageInner({
                               <Table2 className="h-2.5 w-2.5 text-amber-600" />
                               <span className="text-[10px] font-semibold">{table.name}</span>
                               <Badge variant="outline" className="text-[7px] ml-auto px-0.5 py-0">
-                                {tableData?.length || 0} rows
+                                {rowCountFor(table.name).toLocaleString()} rows
                               </Badge>
                               <button
                                 onClick={() => {
@@ -4461,7 +4661,7 @@ function StudioPageInner({
                               fill="#6b7280"
                               fontSize={8}
                             >
-                              {node.rows} rows
+                              {rowCountFor(node.name).toLocaleString()} rows
                             </text>
                             {/* Columns */}
                             {node.schema.columns.slice(0, 8).map((col, ci) => (

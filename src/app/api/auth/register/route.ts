@@ -1,70 +1,40 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { db } from '@/lib/db'
+import { hashPassword, passwordProblem } from '@/lib/server/password'
+import { createSession, sessionCookie } from '@/lib/server/session'
+import { EMAIL_RE, clientIp, limited, normaliseEmail, publicUser, readJsonBody } from '@/lib/server/auth-http'
+import { isCrossSiteWrite } from '@/lib/server/auth'
 
-// Rate limiter for registration
-const registerRateLimiter = new Map<string, { count: number; resetAt: number }>()
-const REGISTER_RATE_LIMIT = 3
-const REGISTER_RATE_WINDOW = 60000
-
-function getClientId(request: NextRequest): string {
-  const forwarded = request.headers.get('x-forwarded-for')
-  return forwarded ? forwarded.split(',')[0] : 'unknown'
-}
-
+// POST { email, password, name? } → 201 { user } + session cookie
 export async function POST(request: NextRequest) {
-  // Rate limit check
-  const clientId = getClientId(request)
-  const now = Date.now()
-  const entry = registerRateLimiter.get(clientId)
+  if (isCrossSiteWrite(request)) return NextResponse.json({ error: 'Cross-site request blocked' }, { status: 403 })
+  const tooMany = limited([[`register:ip:${clientIp(request)}`, 10, 60 * 60 * 1000]])
+  if (tooMany) return tooMany
 
-  if (entry && now <= entry.resetAt && entry.count >= REGISTER_RATE_LIMIT) {
-    return NextResponse.json(
-      { error: 'Too many registration attempts. Please wait a moment.' },
-      { status: 429 }
-    )
-  }
-
-  if (!entry || now > entry.resetAt) {
-    registerRateLimiter.set(clientId, { count: 1, resetAt: now + REGISTER_RATE_WINDOW })
-  } else {
-    entry.count++
-  }
+  const body = await readJsonBody(request)
+  if (!body) return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+  const email = normaliseEmail(body.email)
+  const name = typeof body.name === 'string' ? body.name.trim().slice(0, 100) || null : null
+  if (!EMAIL_RE.test(email) || email.length > 254) return NextResponse.json({ error: 'Please enter a valid email address' }, { status: 400 })
+  const problem = passwordProblem(body.password)
+  if (problem) return NextResponse.json({ error: problem }, { status: 400 })
 
   try {
-    const body = await request.json()
-    const { email, password, full_name } = body
-
-    if (!email || !password) {
-      return NextResponse.json({ error: 'Email and password are required' }, { status: 400 })
-    }
-
-    if (password.length < 6) {
-      return NextResponse.json({ error: 'Password must be at least 6 characters' }, { status: 400 })
-    }
-
-    const { getSupabaseAdmin } = await import('@/lib/supabase/admin')
-    const admin = getSupabaseAdmin()
-
-    if (!admin) {
-      return NextResponse.json({ error: 'Auth service not configured' }, { status: 503 })
-    }
-
-    const { data, error } = await admin.auth.admin.createUser({
-      email,
-      password,
-      email_confirm: true,
-      user_metadata: { full_name: full_name || '' },
+    const existing = await db.user.findUnique({ where: { email } })
+    if (existing) return NextResponse.json({ error: 'An account with this email already exists. Sign in instead.' }, { status: 409 })
+    const user = await db.user.create({
+      data: { email, name, passwordHash: await hashPassword(body.password as string), lastLoginAt: new Date() },
     })
-
-    if (error) {
-      return NextResponse.json({ error: error.message }, { status: 400 })
-    }
-
-    return NextResponse.json({
-      user: data.user,
-      message: 'User created successfully',
-    })
+    const { token, expiresAt } = await createSession(user.id, request)
+    const res = NextResponse.json({ user: publicUser(user) }, { status: 201 })
+    res.cookies.set(sessionCookie(token, expiresAt))
+    return res
   } catch (err) {
-    console.error('[Auth Register] Error:', err)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    // Unique violation from a concurrent registration
+    if ((err as { code?: string }).code === 'P2002') {
+      return NextResponse.json({ error: 'An account with this email already exists. Sign in instead.' }, { status: 409 })
+    }
+    console.error('[auth/register] failed:', err)
+    return NextResponse.json({ error: 'Could not create the account. Please try again.' }, { status: 500 })
   }
 }

@@ -1,51 +1,41 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { createClient } from '@supabase/supabase-js'
-import { rateLimit } from '@/lib/server/rate-limit'
+import { db } from '@/lib/db'
+import { dummyPasswordHash, verifyPassword } from '@/lib/server/password'
+import { createSession, sessionCookie } from '@/lib/server/session'
+import { clientIp, limited, normaliseEmail, publicUser, readJsonBody } from '@/lib/server/auth-http'
+import { isCrossSiteWrite } from '@/lib/server/auth'
 
-// Programmatic login (the web app signs in client-side via the Supabase
-// browser client). The password IS verified here via signInWithPassword, and
-// the response never reveals whether an email is registered.
-
+// POST { email, password } → { user } + session cookie (token also returned
+// for API clients that use `Authorization: Bearer`). Never reveals whether
+// an email is registered.
 export async function POST(request: NextRequest) {
-  let email = ''
-  let password = ''
+  if (isCrossSiteWrite(request)) return NextResponse.json({ error: 'Cross-site request blocked' }, { status: 403 })
+  const body = await readJsonBody(request)
+  if (!body) return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+  const email = normaliseEmail(body.email)
+  const password = typeof body.password === 'string' ? body.password : ''
+  if (!email || !password) return NextResponse.json({ error: 'Email and password are required' }, { status: 400 })
+
+  const tooMany = limited([
+    [`login:email:${email}`, 5, 60_000],
+    [`login:ip:${clientIp(request)}`, 30, 60_000],
+  ])
+  if (tooMany) return tooMany
+
   try {
-    const body = await request.json()
-    email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : ''
-    password = typeof body?.password === 'string' ? body.password : ''
-  } catch {
-    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
-  }
-  if (!email || !password) {
-    return NextResponse.json({ error: 'Email and password are required' }, { status: 400 })
-  }
+    const user = await db.user.findUnique({ where: { email } })
+    const ok = user?.passwordHash
+      ? await verifyPassword(password, user.passwordHash)
+      : (await verifyPassword(password, await dummyPasswordHash()), false)
+    if (!user || !ok) return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 })
 
-  const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown'
-  const byEmail = rateLimit(`login:email:${email}`, 5, 60_000)
-  const byIp = rateLimit(`login:ip:${ip}`, 20, 60_000)
-  if (!byEmail.ok || !byIp.ok) {
-    return NextResponse.json({ error: 'Too many login attempts. Please wait a moment.' }, { status: 429 })
+    const { token, expiresAt } = await createSession(user.id, request)
+    db.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } }).catch(() => {})
+    const res = NextResponse.json({ user: publicUser(user), token, expiresAt: expiresAt.toISOString() })
+    res.cookies.set(sessionCookie(token, expiresAt))
+    return res
+  } catch (err) {
+    console.error('[auth/login] failed:', err)
+    return NextResponse.json({ error: 'Sign-in is temporarily unavailable. Please try again.' }, { status: 500 })
   }
-
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL
-  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY
-  if (!url || !anonKey) {
-    return NextResponse.json({ error: 'Auth service not configured' }, { status: 503 })
-  }
-
-  const supabase = createClient(url, anonKey, { auth: { persistSession: false, autoRefreshToken: false } })
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password })
-  if (error || !data.session || !data.user) {
-    return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 })
-  }
-
-  return NextResponse.json({
-    user: { id: data.user.id, email: data.user.email, name: data.user.user_metadata?.full_name ?? null },
-    authenticated: true,
-    session: {
-      access_token: data.session.access_token,
-      refresh_token: data.session.refresh_token,
-      expires_at: data.session.expires_at,
-    },
-  })
 }

@@ -48,7 +48,8 @@ const toolLinks = [
 export function DashboardSidebar({ onNavigate }: { onNavigate?: () => void } = {}) {
   const pathname = usePathname()
   const { theme, setTheme } = useTheme()
-  const { user, signOut } = useAuth()
+  const { user, signOut, authRequired } = useAuth()
+  const demo = !authRequired && !user
 
   const handleSignOut = async () => {
     await signOut()
@@ -130,12 +131,12 @@ export function DashboardSidebar({ onNavigate }: { onNavigate?: () => void } = {
           </div>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-1.5">
-              <p className="text-sm font-medium truncate">{user?.user_metadata?.full_name || user?.email?.split('@')[0] || 'User'}</p>
+              <p className="text-sm font-medium truncate">{demo ? 'Demo mode' : user?.name || user?.email?.split('@')[0] || 'User'}</p>
               <Badge variant="secondary" className="text-[10px] px-1.5 py-0 h-4 bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400 border-0">
                 Free Plan
               </Badge>
             </div>
-            <p className="text-xs text-muted-foreground truncate">{user?.email || 'Local Mode'}</p>
+            <p className="text-xs text-muted-foreground truncate">{demo ? 'No sign-in required' : user?.email}</p>
           </div>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -154,11 +155,15 @@ export function DashboardSidebar({ onNavigate }: { onNavigate?: () => void } = {
                   Settings
                 </Link>
               </DropdownMenuItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={handleSignOut}>
-                <LogOut className="mr-2 h-4 w-4" />
-                Sign Out
-              </DropdownMenuItem>
+              {!demo && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={handleSignOut}>
+                    <LogOut className="mr-2 h-4 w-4" />
+                    Sign out
+                  </DropdownMenuItem>
+                </>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
         </div>

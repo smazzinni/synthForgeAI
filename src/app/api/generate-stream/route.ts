@@ -16,6 +16,9 @@ import {
   streamJob,
   type GenerationJob,
 } from '@/lib/server/generation-jobs'
+import { expandDataset } from '@/lib/server/data-expander'
+import { applyPrivacy, privacyMaskingEnabled } from '@/lib/server/data-privacy'
+import { dependencyOrder, relationshipsFor, repairDataset, type IntegrityReport } from '@/lib/server/data-integrity'
 
 // ─── Streaming Database Generation API ───
 // POST   starts a generation job and streams its progress (SSE).
@@ -29,7 +32,7 @@ import {
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
-export const maxDuration = 800
+export const maxDuration = 300 // Vercel plan ceiling; Railway/Docker have no limit
 
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'
@@ -37,9 +40,11 @@ const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'
 const DEEPSEEK_MAX_TOKENS = Number.parseInt(process.env.DEEPSEEK_MAX_TOKENS || '', 10) || 32000
 
 const MAX_TABLES = 30
-const MAX_ROWS_PER_TABLE = 5000
-const MAX_TOTAL_ROWS = 20000
-const PERSIST_INTERVAL_MS = 2500     // write progress to storage at most this often
+const MAX_ROWS_PER_TABLE = 100_000
+const MAX_TOTAL_ROWS = 250_000
+/** Rows per table the AI writes itself; the rest are synthesised locally from them. */
+const SEED_ROWS_PER_TABLE = Number.parseInt(process.env.GENERATION_SEED_ROWS || '', 10) || 200
+const PERSIST_INTERVAL_MS = 2500     // write progress to storage at most this often (scaled up for big datasets)
 const PROGRESS_INTERVAL_MS = 300     // emit progress events at most this often
 const UPSTREAM_IDLE_TIMEOUT_MS = 120_000
 const MAX_CONTINUATION_ROUNDS = 3
@@ -116,6 +121,9 @@ function buildGenerationPrompt(req: GenerationRequest): string {
   }).join('\n\n')
   const totalRows = Object.values(req.rowCounts).reduce((sum, n) => sum + n, 0)
   const tableOrder = req.schema.map(s => s.name).join(' → ')
+  const rel = relationshipsFor(req.schema, {})
+  const relLines = Object.entries(rel).flatMap(([child, cols]) =>
+    Object.entries(cols).map(([col, parent]) => `- ${child}.${col} → ${parent}.id (every value MUST be an id you already output for ${parent})`))
 
   return `You are a data generation engine. Generate realistic synthetic data for the following database schema.
 
@@ -125,6 +133,7 @@ SCHEMA (${req.schema.length} tables):
 ${tableDescriptions}
 
 ${req.instructions ? `ADDITIONAL INSTRUCTIONS:\n${req.instructions}\n` : ''}
+${relLines.length ? `RELATIONSHIPS (foreign keys):\n${relLines.join('\n')}\n- Child timestamps (created_at, order dates…) must be AFTER the parent row's created_at.\n- Spread children across many different parents with a realistic, uneven distribution.\n` : ''}
 CRITICAL REQUIREMENTS:
 1. Generate data for ALL ${req.schema.length} tables, in this order: ${tableOrder}
 2. After one table's records, IMMEDIATELY output the next ###TABLE:name### marker.
@@ -246,15 +255,25 @@ async function streamCompletion(
 }
 
 // ─── The worker ───
-async function runGeneration(job: GenerationJob, req: GenerationRequest, seed: Record<string, unknown[]>): Promise<void> {
+async function runGeneration(job: GenerationJob, fullReq: GenerationRequest, seed: Record<string, unknown[]>): Promise<void> {
   const startTime = Date.now()
+  // Phase 1 asks the AI for at most SEED_ROWS_PER_TABLE rows per table;
+  // phase 2 scales each table up to the requested count locally.
+  const finalCounts = fullReq.rowCounts
+  const req: GenerationRequest = {
+    ...fullReq,
+    // Parents first, so children can reference ids that already exist.
+    schema: dependencyOrder(fullReq.schema),
+    rowCounts: Object.fromEntries(Object.entries(finalCounts).map(([t, n]) => [t, Math.min(n, SEED_ROWS_PER_TABLE)])),
+  }
   const allTableData: Record<string, unknown[]> = {}
   for (const [t, rows] of Object.entries(seed)) if (Array.isArray(rows)) allTableData[t] = [...rows]
   const existingRowCount = countRows(allTableData)
   const baseline: Record<string, number> = Object.fromEntries(req.schema.map(t => [t.name, allTableData[t.name]?.length || 0]))
   const stillTrying = new Set(req.schema.map(t => t.name))
   const knownTables = new Set(req.schema.map(t => t.name))
-  const totalTarget = Object.values(req.rowCounts).reduce((s, n) => s + n, 0)
+  const columnsByTable = new Map(req.schema.map(t => [t.name, t.columns.map(c => c.name)]))
+  const totalTarget = Object.values(finalCounts).reduce((s, n) => s + n, 0)
 
   let currentTable = ''
   let generatedThisRun = 0
@@ -265,13 +284,14 @@ async function runGeneration(job: GenerationJob, req: GenerationRequest, seed: R
 
   const generatedFor = (t: string) => (allTableData[t]?.length || 0) - (baseline[t] || 0)
 
+  let qualityScore: number | null = null
   const persist = (final = false) => {
     const snapshot = { ...allTableData }
     persistChain = persistChain.then(() =>
       updateDatabase(job.userId, job.databaseId, {
         data_json: snapshot,
         row_count: countRows(snapshot),
-        ...(final ? { status: 'ready', schema_json: req.schema, quality_score: 0.85 } : {}),
+        ...(final ? { status: 'ready', schema_json: req.schema, quality_score: qualityScore } : {}),
       }).catch(err => console.warn('[generate] persist failed:', err instanceof Error ? err.message : err)),
     )
     return persistChain
@@ -289,7 +309,9 @@ async function runGeneration(job: GenerationJob, req: GenerationRequest, seed: R
       targetRows: currentTable ? req.rowCounts[currentTable] || 0 : totalTarget,
       message,
     })
-    if (now - lastPersist >= PERSIST_INTERVAL_MS) {
+    // Persisting rewrites the whole dataset, so slow down for big ones.
+    const interval = PERSIST_INTERVAL_MS * Math.max(1, Math.ceil(generatedThisRun / 20_000))
+    if (now - lastPersist >= interval) {
       lastPersist = now
       void persist()
     }
@@ -315,11 +337,22 @@ async function runGeneration(job: GenerationJob, req: GenerationRequest, seed: R
       return
     }
     if (!currentTable) return
+    // Rows for tables that aren't in the schema are dropped (model drift).
+    if (!knownTables.has(currentTable)) return
     // Ignore surplus rows beyond what was requested for this table.
     if (generatedFor(currentTable) >= (req.rowCounts[currentTable] ?? Infinity)) return
     try {
-      const record = JSON.parse(line)
-      if (record && typeof record === 'object' && !Array.isArray(record)) {
+      const parsed = JSON.parse(line)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        // Keep exactly the table's declared columns; a row sharing none of
+        // them belongs to another table (model drift) and is dropped.
+        const cols = columnsByTable.get(currentTable) || []
+        let record: Record<string, unknown> = parsed
+        if (cols.length > 0) {
+          const overlap = cols.filter(c => c in parsed).length
+          if (overlap < Math.min(2, cols.length)) { malformed++; return }
+          record = Object.fromEntries(cols.map(c => [c, parsed[c] ?? null]))
+        }
         ;(allTableData[currentTable] ||= []).push(record)
         generatedThisRun++
         progress()
@@ -381,6 +414,55 @@ async function runGeneration(job: GenerationJob, req: GenerationRequest, seed: R
         : (err instanceof Error ? err.message : 'Generation failed'))
       return
     }
+  }
+
+  // ─── Quality Analyst: repair relational integrity of the AI sample ───
+  const describeFixes = (r: IntegrityReport) => {
+    const fixed = r.issues.filter(i => i.kind !== 'unknown_table').reduce((n, i) => n + i.count, 0)
+    return fixed === 0 ? 'no integrity problems found' : `fixed ${fixed} integrity problem${fixed === 1 ? '' : 's'} (${[...new Set(r.issues.map(i => i.kind.replace(/_/g, ' ')))].join(', ')})`
+  }
+  if (!job.cancelRequested && generatedThisRun > 0) {
+    const { data: repaired, report } = repairDataset(req.schema, allTableData as Record<string, Record<string, unknown>[]>)
+    for (const t of req.schema) allTableData[t.name] = repaired[t.name] || []
+    qualityScore = report.score
+    emit(job, { type: 'progress', table: '', message: `Quality Analyst: ${describeFixes(report)}`, totalInserted: generatedThisRun, targetRows: totalTarget })
+  }
+
+  // ─── Phase 2: scale up to the requested row counts ───
+  const needsExpansion = !job.cancelRequested && req.schema.some(t => generatedFor(t.name) > 0 && generatedFor(t.name) < finalCounts[t.name])
+  if (needsExpansion) {
+    const bigTarget = Object.values(finalCounts).reduce((s, n) => s + n, 0)
+    emit(job, { type: 'progress', table: '', message: `Scaling up to ${bigTarget.toLocaleString()} rows from the AI-generated sample…`, totalInserted: generatedThisRun, targetRows: totalTarget })
+    const newRows: Record<string, unknown[]> = {}
+    for (const t of req.schema) newRows[t.name] = (allTableData[t.name] || []).slice(baseline[t.name] || 0)
+    const expanded = expandDataset(
+      req.schema,
+      newRows as Record<string, Record<string, unknown>[]>,
+      Object.fromEntries(req.schema.map(t => [t.name, newRows[t.name].length > 0 ? finalCounts[t.name] : 0])),
+      { seed: startTime },
+    )
+    for (const t of req.schema) {
+      const before = generatedFor(t.name)
+      const existing = (allTableData[t.name] || []).slice(0, baseline[t.name] || 0)
+      allTableData[t.name] = [...existing, ...(expanded[t.name] || [])]
+      generatedThisRun += generatedFor(t.name) - before
+      emit(job, { type: 'table_complete', table: t.name, totalRows: allTableData[t.name].length })
+    }
+    // Final integrity pass over the full dataset (cheap, linear).
+    const { data: repaired, report } = repairDataset(req.schema, allTableData as Record<string, Record<string, unknown>[]>)
+    for (const t of req.schema) allTableData[t.name] = repaired[t.name] || []
+    if (report.issues.some(i => i.kind !== 'unknown_table')) {
+      emit(job, { type: 'progress', table: '', message: `Quality Analyst: ${describeFixes(report)}`, totalInserted: generatedThisRun, targetRows: totalTarget })
+    }
+    emit(job, { type: 'progress', table: '', message: 'Saving…', totalInserted: generatedThisRun, targetRows: totalTarget })
+  }
+
+  // ─── Privacy Officer: no values that could belong to real people ───
+  if (!job.cancelRequested && generatedThisRun > 0 && privacyMaskingEnabled()) {
+    const { data: masked, report: pr } = applyPrivacy(allTableData as Record<string, Record<string, unknown>[]>)
+    for (const t of req.schema) allTableData[t.name] = masked[t.name] || []
+    const parts = [pr.emails && `${pr.emails} real-provider email${pr.emails === 1 ? '' : 's'}`, pr.ssns && `${pr.ssns} SSN${pr.ssns === 1 ? '' : 's'}`, pr.cards && `${pr.cards} card number${pr.cards === 1 ? '' : 's'}`].filter(Boolean)
+    emit(job, { type: 'progress', table: '', message: parts.length ? `Privacy Officer: anonymised ${parts.join(', ')}` : 'Privacy Officer: no personal data patterns found', totalInserted: generatedThisRun, targetRows: totalTarget })
   }
 
   await persist(true)
@@ -478,6 +560,9 @@ export async function DELETE(request: NextRequest) {
     ? getJob(auth.userId, jobId)
     : databaseId ? getActiveJobForDatabase(auth.userId, databaseId) : null
   if (!job) return json({ error: 'No running generation found' }, 404)
+  if (job.status !== 'running' || job.cancelRequested) {
+    return json({ error: job.cancelRequested ? 'Generation is already stopping' : `Generation already ${job.status}` }, 409)
+  }
   cancelJob(job)
   return json({ success: true })
 }

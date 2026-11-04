@@ -41,6 +41,7 @@ import {
   Eye,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import { downloadExport, type ExportFormat } from '../../export-download'
 import { apiGet, apiDelete, invalidateCache } from '@/lib/api-client'
 
 interface SchemaColumn {
@@ -61,10 +62,10 @@ interface DatabaseDetail {
   quality_score: number | null
   schema_json?: SchemaTable[]
   data_json?: Record<string, unknown[]>
+  table_counts?: Record<string, number>
   created_at?: string
 }
 
-type ExportFormat = 'json' | 'csv' | 'sql'
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -327,7 +328,7 @@ export default function DatabaseDetailPage() {
     async function load() {
       try {
         const result = await apiGet<{ database: DatabaseDetail | null }>(
-          `/api/databases?id=${id}`,
+          `/api/databases?id=${id}&preview=200`,
           { cacheTtl: 5000, timeout: 10000 }
         )
         if (cancelled) return
@@ -369,7 +370,7 @@ export default function DatabaseDetailPage() {
     return db.schema_json
       .map((t) => ({
         name: t.name,
-        count: Array.isArray(db.data_json?.[t.name]) ? db.data_json[t.name].length : 0,
+        count: db.table_counts?.[t.name] ?? (Array.isArray(db.data_json?.[t.name]) ? db.data_json[t.name].length : 0),
       }))
       .sort((a, b) => b.count - a.count)
   }, [db])
@@ -393,20 +394,30 @@ export default function DatabaseDetailPage() {
       .sort((a, b) => b.count - a.count)
   }, [db])
 
-  // ─── Data preview: first 3 rows of first table ───
+  // ─── Server-side paged data viewer ───
+  const [viewTable, setViewTable] = useState('')
+  const [pageOffset, setPageOffset] = useState(0)
+  const [pageSize, setPageSize] = useState(100)
+  const [pageSort, setPageSort] = useState<{ col: string; dir: 'asc' | 'desc' } | null>(null)
+  const [pageData, setPageData] = useState<{ rows: Record<string, unknown>[]; total: number } | null>(null)
+  const [pageLoading, setPageLoading] = useState(false)
+  const activeTable = viewTable || db?.schema_json?.[0]?.name || ''
+  useEffect(() => {
+    if (!db?.id || !activeTable) return
+    let cancelled = false
+    const qs = new URLSearchParams({ table: activeTable, offset: String(pageOffset), limit: String(pageSize) })
+    if (pageSort) { qs.set('sort', pageSort.col); qs.set('dir', pageSort.dir) }
+    setPageLoading(true)
+    apiGet<{ rows: Record<string, unknown>[]; total: number }>(`/api/databases/${db.id}/rows?${qs}`, { cacheTtl: 0, force: true, timeout: 30000 })
+      .then((res) => { if (!cancelled) setPageData({ rows: res.rows || [], total: res.total ?? 0 }) })
+      .catch((err) => console.error('[DatabaseDetail] Error loading rows:', err))
+      .finally(() => { if (!cancelled) setPageLoading(false) })
+    return () => { cancelled = true }
+  }, [db?.id, activeTable, pageOffset, pageSize, pageSort])
   const dataPreview = useMemo(() => {
-    if (!db || !Array.isArray(db.schema_json) || !db.data_json) return null
-    if (db.schema_json.length === 0) return null
-    const firstTable = db.schema_json[0]
-    const rows = db.data_json[firstTable.name]
-    if (!Array.isArray(rows) || rows.length === 0) return null
-    return {
-      tableName: firstTable.name,
-      columns: firstTable.columns || [],
-      rows: rows.slice(0, 3),
-      totalRows: rows.length,
-    }
-  }, [db])
+    const t = db?.schema_json?.find((x) => x.name === activeTable)
+    return t ? { tableName: t.name, columns: t.columns || [] } : null
+  }, [db, activeTable])
 
   // ─── Quality metrics (mock breakdown) ───
   const qualityMetrics = useMemo(
@@ -452,24 +463,7 @@ export default function DatabaseDetailPage() {
     if (!db) return
     setExporting(true)
     try {
-      const resp = await fetch('/api/export', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ databaseId: db.id, format }),
-      })
-      if (!resp.ok) throw new Error('Export failed')
-      const blob = await resp.blob()
-      const url = URL.createObjectURL(blob)
-      const a = window.document.createElement('a')
-      a.href = url
-      a.download = `${db.name}.${format}`
-      window.document.body.appendChild(a)
-      a.click()
-      window.document.body.removeChild(a)
-      URL.revokeObjectURL(url)
-      toast.success(`Exported "${db.name}" as ${format.toUpperCase()}`)
-    } catch {
-      toast.error(`Failed to export "${db.name}"`)
+      await downloadExport({ databaseId: db.id }, format, db.name)
     } finally {
       setExporting(false)
     }
@@ -616,6 +610,10 @@ export default function DatabaseDetailPage() {
                   <FileCode className="mr-2 h-4 w-4 text-rose-600" />
                   Export as SQL
                 </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => handleExport('xlsx')}>
+                  <FileCode className="mr-2 h-4 w-4 text-rose-600" />
+                  Export as Excel
+                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
             <Button
@@ -691,7 +689,7 @@ export default function DatabaseDetailPage() {
               </CardHeader>
               <CardContent className="flex flex-col gap-3">
                 {db.schema_json!.map((table) => {
-                  const rowCount = db.data_json?.[table.name]?.length ?? 0
+                  const rowCount = db.table_counts?.[table.name] ?? db.data_json?.[table.name]?.length ?? 0
                   const colCount = table.columns?.length ?? 0
                   return (
                     <Card
@@ -772,7 +770,7 @@ export default function DatabaseDetailPage() {
 
             {/* Data Preview */}
             {dataPreview && (
-              <Card>
+              <Card className="min-w-0">
                 <CardHeader className="pb-3">
                   <div className="flex items-center gap-2">
                     <Eye className="h-5 w-5 text-amber-600" />
@@ -784,16 +782,42 @@ export default function DatabaseDetailPage() {
                 </CardHeader>
                 <CardContent>
                   <p className="text-xs text-muted-foreground mb-3">
-                    Showing first {Math.min(3, dataPreview.rows.length)} of {dataPreview.totalRows.toLocaleString()} rows
+                    Rows {pageData && pageData.total > 0 ? (pageOffset + 1).toLocaleString() : 0}–{Math.min(pageOffset + pageSize, pageData?.total ?? 0).toLocaleString()} of {(pageData?.total ?? 0).toLocaleString()}
+                    {pageLoading && <span className="ml-1 italic">loading…</span>}
                   </p>
+                  <div className="flex items-center gap-2 mb-3 flex-wrap">
+                    <select
+                      className="h-8 text-xs border rounded bg-background px-2"
+                      value={activeTable}
+                      onChange={(e) => { setViewTable(e.target.value); setPageOffset(0); setPageSort(null) }}
+                      aria-label="Table"
+                    >
+                      {db.schema_json!.map((t) => <option key={t.name} value={t.name}>{t.name}</option>)}
+                    </select>
+                    <select
+                      className="h-8 text-xs border rounded bg-background px-2"
+                      value={pageSize}
+                      onChange={(e) => { setPageSize(Number(e.target.value)); setPageOffset(0) }}
+                      aria-label="Rows per page"
+                    >
+                      {[50, 100, 250, 500].map((n) => <option key={n} value={n}>{n} / page</option>)}
+                    </select>
+                    <Button variant="outline" size="sm" disabled={pageOffset === 0 || pageLoading} onClick={() => setPageOffset((o) => Math.max(0, o - pageSize))}>Prev</Button>
+                    <Button variant="outline" size="sm" disabled={pageOffset + pageSize >= (pageData?.total ?? 0) || pageLoading} onClick={() => setPageOffset((o) => o + pageSize)}>Next</Button>
+                  </div>
                   <div className="rounded-lg border overflow-x-auto">
                     <table className="w-full text-sm">
                       <thead className="bg-muted/60 border-b">
                         <tr>
                           {dataPreview.columns.map((col) => (
-                            <th key={col.name} className="text-left py-2 px-3 font-medium text-xs whitespace-nowrap">
+                            <th
+                              key={col.name}
+                              className="text-left py-2 px-3 font-medium text-xs whitespace-nowrap cursor-pointer select-none"
+                              onClick={() => { setPageOffset(0); setPageSort((prev) => prev?.col === col.name ? { col: col.name, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { col: col.name, dir: 'asc' }) }}
+                            >
                               <div className="flex items-center gap-1.5">
                                 <span className="text-foreground">{col.name}</span>
+                                {pageSort?.col === col.name && <span className="text-primary">{pageSort.dir === 'asc' ? '▲' : '▼'}</span>}
                                 <span className="text-[10px] font-mono text-muted-foreground">{col.type}</span>
                               </div>
                             </th>
@@ -801,7 +825,7 @@ export default function DatabaseDetailPage() {
                         </tr>
                       </thead>
                       <tbody>
-                        {dataPreview.rows.map((row, idx) => (
+                        {(pageData?.rows ?? []).map((row, idx) => (
                           <tr key={idx} className="border-b last:border-0 hover:bg-muted/30">
                             {dataPreview.columns.map((col) => {
                               const val = (row as Record<string, unknown>)?.[col.name]

@@ -18,9 +18,6 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 # NEXT_PUBLIC_* values are inlined at build time — Railway passes service
 # variables as build args automatically.
-ARG NEXT_PUBLIC_SUPABASE_URL
-ARG NEXT_PUBLIC_SUPABASE_ANON_KEY
-ARG NEXT_PUBLIC_AUTH_ENABLED
 ARG NEXT_PUBLIC_APP_URL
 RUN npx prisma generate && npm run build \
  && node -p "require('./node_modules/prisma/package.json').version" > /tmp/prisma-version

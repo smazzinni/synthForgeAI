@@ -18,6 +18,7 @@ export interface SqlBlockResult {
   ok: boolean
   message: string
   rowCount?: number
+  truncated?: boolean
   affectedRows?: number
   rows?: Record<string, unknown>[]
   columns?: string[]
@@ -51,7 +52,7 @@ export interface Message {
 
 export interface SchemaTable {
   name: string
-  columns: { name: string; type: string }[]
+  columns: { name: string; type: string; is_nullable?: boolean; is_primary?: boolean; references?: string | null }[]
 }
 
 export interface StudioPageProps {

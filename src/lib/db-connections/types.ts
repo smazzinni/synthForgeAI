@@ -3,7 +3,7 @@
  *
  * A DbConnection represents a user-supplied external database that
  * SynthForge AI connects to LIVE (as opposed to the synthetic databases
- * stored in the app's own Supabase).
+ * stored in the app database).
  */
 
 export type DbDialect = 'postgres' | 'mysql'
@@ -51,7 +51,8 @@ export function toSafeRecord(rec: DbConnectionRecord): SafeDbConnectionRecord {
 
 export interface SchemaTable {
   name: string
-  columns: Array<{ name: string; type: string; is_nullable?: boolean; is_primary?: boolean }>
+  /** references: 'table.column' for a real foreign key, null when the catalog says it isn't one */
+  columns: Array<{ name: string; type: string; is_nullable?: boolean; is_primary?: boolean; references?: string | null }>
 }
 
 export interface ExecuteResult {

@@ -1,4 +1,5 @@
 import { NextRequest } from 'next/server'
+import { AGENT_LIST } from '@/lib/ai-agents'
 import { requireUser } from '@/lib/server/auth'
 import { enforceRateLimit } from '@/lib/server/rate-limit'
 
@@ -86,7 +87,7 @@ Emit an agent_status signal announcing Schema Architect is researching, then in 
 
 "For an e-commerce domain I'd model: **customers**, **orders**, **order_items** (junction between orders and products), **products**, **categories**, and **reviews**. Orders→customers is many-to-one; order_items is the many-to-many junction between orders and products; categories can be self-referencing for sub-categories."
 
-### Phase 2 — Smart Question (ONLY IF NEEDED, max 1-2 in entire conversation)
+### Phase 2 — Smart Question (ONLY IF IT CHANGES THE RESULT)
 If the user already gave you enough context (domain + scale, OR domain with sensible defaults), SKIP this phase and go straight to Phase 3. Otherwise ask AT MOST ONE well-researched, domain-specific question with smart defaults pre-selected. Emit the options signal INLINE (raw JSON, no code fence):
 
 {"type":"options","question":"For the e-commerce schema, should products have variants (size/color) or be single-SKU?","choices":[{"label":"Single SKU — one row per product (recommended for v1)","value":"single"},{"label":"Variants via product_variants table (size/color/material)","value":"variants"}],"multi":false}
@@ -113,12 +114,12 @@ After the signal, add a one-line message like "Starting generation…" — the s
 
 ## QUESTION-ASKING RULES (CRITICAL)
 
-Ask AT MOST 1-2 clarifying questions across the ENTIRE conversation. Better yet, ask ONE good question with multiple choices and reasonable defaults. Follow this decision tree:
+Ask a clarifying question whenever the answer would MATERIALLY change the result (which table, how many rows, which locale, overwrite vs append, which records a change should affect). Ask ONE question per message, always with 2-5 concrete choices and a recommended default first; the user can also type a custom answer. You may ask again later in the conversation — including mid-task, after you have seen query results — if new information makes a decision ambiguous. Follow this decision tree:
 
 1. If the user's prompt is specific enough (e.g. "create a 5-table e-commerce database with 50 rows each"), DO NOT ASK ANY QUESTIONS — go straight to schema design.
 2. If the user gives a domain but no scale, ask ONE question combining scale + locale, with smart defaults pre-selected.
 3. If the user gives scale but no domain, ask ONE question about the industry with the most common options.
-4. NEVER ask more than 2 questions in the entire conversation. If you find yourself wanting to ask a 3rd, instead infer the answer and proceed.
+4. Never ask about things with an obvious default, never ask the same thing twice, and never ask more than one question in a single message. If the user said "just do it" or "use defaults", stop asking and proceed with sensible defaults.
 
 ### BAD questions (never ask these — they signal you don't know your job):
 - "What columns would you like?" (you decide — you're the schema expert)
@@ -213,10 +214,7 @@ Before generating INSERT statements:
 
 Current agent: Orchestrator
 You coordinate between sub-agents:
-- **Schema Architect**: Researches the domain, designs database schemas with relationships, FKs, indexes, and constraints
-- **Data Generator**: Creates realistic synthetic data rows (handled by the streaming pipeline, not in-chat)
-- **Quality Analyst**: Validates data quality, referential integrity, and consistency
-- **Privacy Officer**: Ensures privacy compliance (no real PII, GDPR/CCPA-safe)`
+${AGENT_LIST.filter(a => a.id !== 'orchestrator').map(a => `- **${a.name}**: ${a.description}. ${a.systemPromptAddition}`).join('\n')}`
 
 /**
  * Sanitize AI output: unwrap JSON control signals that the model may have
@@ -300,13 +298,15 @@ export async function POST(request: NextRequest) {
       connectionId,
       connectionName: rawConnectionName,
       connectionDialect: rawConnectionDialect,
+      tableCounts: rawTableCounts,
     } = body as {
       message: string
       databaseId?: string
       databaseName?: string
       history?: ChatMessage[]
-      currentSchema?: Array<{ name: string; columns: Array<{ name: string; type: string }> }>
+      currentSchema?: Array<{ name: string; columns: Array<{ name: string; type: string; is_primary?: boolean; is_nullable?: boolean; references?: string | null }> }>
       currentData?: Record<string, unknown[]>
+      tableCounts?: Record<string, number>
       conversationId?: string
       connectionId?: string
       connectionName?: string
@@ -315,6 +315,10 @@ export async function POST(request: NextRequest) {
     const databaseName = cleanLabel(rawDatabaseName)
     const connectionName = cleanLabel(rawConnectionName)
     const connectionDialect = rawConnectionDialect === 'mysql' ? 'mysql' : 'postgres'
+    const tableCounts: Record<string, number> = {}
+    if (rawTableCounts && typeof rawTableCounts === 'object') {
+      for (const [t, n] of Object.entries(rawTableCounts).slice(0, 500)) if (typeof n === 'number') tableCounts[t] = n
+    }
 
     if (!message || typeof message !== 'string') {
       return new Response(JSON.stringify({ error: 'Message is required' }), {
@@ -378,7 +382,12 @@ SELECT table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_
 
 {"type":"agent_status","agent":"Schema Architect","status":"designing schema with relationships, FKs, indexes","progress":40}
 
-3. **ASK only if you genuinely can't infer (max 1-2 questions, entire conversation).** In live-DB mode, ask FEWER questions than in synthetic mode — you can introspect the actual database to answer most questions yourself. If the user says "seed this database for a SaaS app", do NOT ask "what tables do you want?" — instead emit the SELECT above, then propose a schema. Only ask the user when you genuinely cannot infer the answer (e.g. "how many rows of sample data?"). Domain-specific, with smart defaults pre-selected.
+3. **ASK like a careful engineer when it improves the result.** Introspect first (you can answer most questions yourself from the schema and a quick SELECT). Then ask ONE options question when a decision is genuinely ambiguous and matters, e.g.:
+   - which of several similar tables to use, or whether to create a new table vs extend an existing one;
+   - the scope of an UPDATE/DELETE (exactly which rows) before emitting it;
+   - how many rows to insert when the user gave no number and the table is large/important;
+   - what to do about a problem you discovered mid-task (FK violations, duplicates, NULLs, failed statement).
+   Emit the question as the inline options JSON (raw, no code fence): {"type":"options","question":"…","choices":[{"label":"… (recommended)","value":"…"},{"label":"…","value":"…"}]}. Do not emit SQL that depends on the answer in the same message — wait for the reply. Read-only exploration SQL (SELECT/SHOW/EXPLAIN) may be emitted before the question.
 
 4. **EMIT the CREATE TABLE / INSERT SQL** in a \`\`\`sql block. Do NOT wait for further confirmation — the frontend will show a confirmation dialog for mutations and execute them. Emit all related CREATE TABLE statements together in ONE SQL block when they have FK relationships so the user can review the whole design at once.
 
@@ -416,7 +425,7 @@ When the user says "add more rows", "add more data", "insert more data", "add 50
 - **ALWAYS generate INSERT statements with new, non-conflicting IDs** (use gen_random_uuid() or UUID() or auto-increment).
 - **If you need to check existing IDs**, emit a SELECT first: \`SELECT MAX(id) FROM <table>\` or \`SELECT id FROM <table> ORDER BY id DESC LIMIT 5\`.
 - **The new rows are APPENDED** to the existing data, not a replacement.
-- **PROCEED IMMEDIATELY — DO NOT ASK QUESTIONS.** When the user says "add more data in the DB" (or any vague append request) without specifying an amount, **DO NOT ask "how many rows?" or "which tables?"**. Instead:
+- **Prefer acting with smart defaults.** When the user says "add more data" without an amount, default to 10 new rows per table and proceed — unless the database has many tables or very large ones, in which case ask ONE options question (e.g. which tables / how many rows) first. Otherwise:
   1. Pick a **smart default of 10 new rows per table** (or 5 for large tables) and proceed.
   2. Emit a SELECT to check existing max IDs / row counts FIRST (so you generate non-conflicting IDs and respect FKs).
   3. Then emit INSERT statements for each table, appending to existing data.
@@ -434,15 +443,16 @@ When inserting data into multiple related tables:
 
 ### PERMISSIONS — YOU CAN PERFORM ANY OPERATION
 You have full read/write/DDL permissions on this database. You may emit SQL for ANY of these operations:
-- **Read**: SELECT, SHOW, DESCRIBE, EXPLAIN — auto-executed by the frontend, results shown inline AND sent back to you in the next turn as [SQL RESULT: ...]
-- **Write**: INSERT, UPDATE (with WHERE) — AUTO-EXECUTED by the frontend (no confirmation needed for data generation). Results sent back as [SQL RESULT: ...]
+- **Read**: SELECT, SHOW, DESCRIBE, EXPLAIN — auto-executed by the frontend, results shown inline AND sent back to you in the next turn as [SQL RESULT for "<sql>": ...] followed by up to 20 rows as JSON
+- **Write**: INSERT, UPDATE (with WHERE) — AUTO-EXECUTED by the frontend (no confirmation needed for data generation). Results sent back as [SQL RESULT for "<sql>": ...]
 - **DDL**: CREATE TABLE, CREATE INDEX, ALTER TABLE — AUTO-EXECUTED by the frontend (no confirmation needed for schema creation)
 - **Destructive**: DROP TABLE, TRUNCATE, DELETE without WHERE, DROP DATABASE — frontend confirms with an extra warning dialog, then executes
 
 ### CRITICAL: ALL SQL IS AUTO-EXECUTED — RESULTS COME BACK AUTOMATICALLY
 When you emit ANY SQL (SELECT, INSERT, CREATE TABLE, etc.), the frontend AUTO-EXECUTES it and includes the results in the conversation history as:
 \`\`\`
-[SQL RESULT: INSERT OK — N row(s) affected] or [SQL RESULT: Returned N row(s)]
+[SQL RESULT for "<sql>": INSERT OK — N row(s) affected] or [SQL RESULT for "<sql>": Returned N row(s)] — and failures as [SQL ERROR for "<sql>": <database error message>].
+When you see [SQL ERROR …]: read the database's message, fix the cause (wrong table/column name, type, constraint, dialect syntax) and emit ONE corrected \`\`\`sql block. If the same statement fails twice, stop and explain the problem to the user instead of retrying again. When the user cancelled a destructive statement ([SQL CANCELLED …]) do not re-emit it.
 [...rows or affected count...]
 \`\`\`
 You WILL see these results in your next turn — you do NOT need to ask the user to "run the query." The system automatically:
@@ -516,32 +526,40 @@ When you need MORE metadata than what's provided, emit a query to get it:
 - \`DESCRIBE <table>\` (MySQL) or \`SELECT * FROM information_schema.columns WHERE table_name='<table>'\` (Postgres)
 - \`SHOW CREATE TABLE <table>\` (MySQL) or \`\\d+ <table>\` (Postgres)
 
+### NO GENERATION SIGNAL IN LIVE MODE
+Never emit {"action":"BEGIN_GENERATION"…} while connected to a live database — it is ignored here. To add data, emit INSERT statements (batches of at most 500 rows per statement), parents before children.
+
 ### CURRENT EXTERNAL SCHEMA`
       if (currentSchema && currentSchema.length > 0) {
-        systemPrompt += `\nTables (limited to first 25):`
+        const MAX_TABLES = 60
+        systemPrompt += `\nTables (${Math.min(currentSchema.length, MAX_TABLES)} of ${currentSchema.length}${currentSchema.length > MAX_TABLES ? ' — introspect the rest with SQL if needed' : ''}):`
         let tableCount = 0
         for (const table of currentSchema) {
-          if (tableCount >= 25) break
+          if (tableCount >= MAX_TABLES) break
           if (!Array.isArray(table.columns)) continue
-          // Mark primary keys and foreign keys for better agent understanding
           const colStr = table.columns
-            .slice(0, 30)
+            .slice(0, 40)
             .map(c => {
               const name = String(c.name).replace(/[\r\n]/g, ' ').slice(0, 60)
               const type = String(c.type).replace(/[\r\n]/g, ' ').slice(0, 60)
-              // Detect PK/FK patterns
-              if (name === 'id') return `${name} ${type} [PK]`
-              if (name.endsWith('_id') || name.endsWith('Id')) return `${name} ${type} [FK]`
-              return `${name} ${type}`
+              const tags: string[] = []
+              if (c.is_primary || (name === 'id' && c.is_primary === undefined)) tags.push('PK')
+              // Real foreign keys from the database catalog when available;
+              // otherwise a naming-convention guess, marked as such.
+              if (typeof c.references === 'string' && c.references) tags.push(`FK→${String(c.references).slice(0, 80)}`)
+              else if (c.references === undefined && (name.endsWith('_id') || name.endsWith('Id'))) tags.push('FK?')
+              if (c.is_nullable === false && !tags.includes('PK')) tags.push('NOT NULL')
+              return `${name} ${type}${tags.length ? ` [${tags.join(', ')}]` : ''}`
             })
             .join(', ')
-          // Include row count if available
-          const rowCount = currentData?.[table.name]?.length
-          const rowCountStr = rowCount !== undefined ? ` (${rowCount} rows sampled)` : ''
+          const exact = tableCounts?.[table.name]
+          const rowCountStr = typeof exact === 'number' && exact >= 0
+            ? ` (${exact.toLocaleString('en-US')} rows)`
+            : currentData?.[table.name] ? ` (${currentData[table.name].length} rows sampled)` : ''
           systemPrompt += `\n- ${table.name}${rowCountStr}: ${colStr}`
           tableCount++
         }
-        systemPrompt += `\n\n**[PK] = Primary Key, [FK] = Foreign Key (references another table's id)**`
+        systemPrompt += `\n\n**[PK] = primary key, [FK→table.column] = real foreign key from the database, [FK?] = guessed from the column name (verify before relying on it), [NOT NULL] = required column.** Respect FKs: insert parents first, and only use parent ids that exist (SELECT them first).`
       } else {
         systemPrompt += `\n(No schema introspection available. Emit SHOW TABLES or SELECT table_name FROM information_schema.tables to discover the schema.)`
       }

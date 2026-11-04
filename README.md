@@ -1,146 +1,279 @@
 # SynthForge AI
 
-AI-Powered Synthetic Data Generation Platform with multi-agent pipeline, live DB connections, and CRUD operations via natural language.
+**AI-powered synthetic data platform with live database access.** Describe a database in plain
+English and SynthForge designs the schema and fills it with realistic, referentially-intact data —
+or connect your own PostgreSQL / MySQL database and query, change and export it by chatting with an AI
+that asks good questions before it acts.
+
+[![CI](https://github.com/smazzinni/synthForgeAI/actions/workflows/ci.yml/badge.svg)](https://github.com/smazzinni/synthForgeAI/actions/workflows/ci.yml)
+
+---
+
+## Contents
+
+- [Features](#features)
+- [How it works](#how-it-works)
+- [Quick start (local)](#quick-start-local)
+- [Configuration](#configuration)
+- [Deploy on Railway](#deploy-on-railway)
+- [Other hosting (Docker, Vercel)](#other-hosting-docker-vercel)
+- [Working with large data](#working-with-large-data)
+- [Live database connections](#live-database-connections)
+- [API reference](#api-reference)
+- [Testing & CI](#testing--ci)
+- [Security](#security)
+- [Project structure](#project-structure)
+- [Troubleshooting](#troubleshooting)
+
+---
 
 ## Features
 
-- **Multi-Agent AI Pipeline**: Schema Architect, Data Generator, Quality Analyst, Privacy Officer
-- **Live Database Connections**: Connect to PostgreSQL/MySQL and perform CRUD via AI chat
-- **Synthetic Data Generation**: Generate realistic, referentially-intact test data
-- **AI Chat Studio**: Streaming chat with DeepSeek v4-pro, SQL execution, schema preview
-- **Database Management**: Filter, sort, bulk export (JSON/CSV/SQL), detail views
-- **Workspaces**: Organize databases into collaborative workspaces
-- **Keyboard Shortcuts**: Full studio keyboard navigation
+| Area | What you get |
+|---|---|
+| **AI Studio (chat)** | Streaming chat with a multi-agent pipeline (Orchestrator, Schema Architect, Data Generator, Quality Analyst, Privacy Officer). The AI asks one focused multiple-choice question whenever the answer changes the result — including mid-task — and you can always type your own answer. |
+| **Synthetic data generation** | Any domain, any schema. The AI writes a realistic seed sample, then the expander scales each table up to **100,000 rows (250,000 per generation)** with valid foreign keys, unique ids/emails and realistic distributions. |
+| **Survives disconnects** | Generation runs as a server-side job. Close the tab, lose Wi-Fi, refresh — it keeps going, saves progress every few seconds, and the studio picks it back up. Only **Stop** cancels it. |
+| **SQL on generated data** | A real SQL engine (JOINs, GROUP BY, aggregates, CTEs, sub-queries, multi-statement scripts, INSERT/UPDATE/DELETE, CREATE/ALTER/DROP TABLE) with Postgres syntax support. |
+| **Live databases** | Connect PostgreSQL- or MySQL-compatible databases (Supabase, Neon, RDS/Aurora, Railway, Render, CockroachDB, PlanetScale, MariaDB, TiDB…). Run **every** statement type from the SQL tab or the AI chat; destructive statements ask for confirmation first; multi-statement SQL runs in one transaction and rolls back on error. |
+| **Data & Explorer tabs** | Server-side paging, sorting and filtering for tables with millions of rows; exact row counts; ER diagram of tables and relationships. |
+| **Export** | SQL dump, CSV, JSON or Excel — for generated databases *and* connected live databases, whole database or a single table. |
+| **Accounts** | Built-in email/password accounts (sessions in PostgreSQL, httpOnly cookie, password reset by email); every record is scoped to its owner. A single-user demo mode works with zero setup. |
+| **Mobile** | Responsive layout with a drawer sidebar and a Chat / Data toggle in the studio. |
 
-## Prerequisites
+## How it works
 
-- Node.js >= 18.0.0
-- npm (the repo ships a `package-lock.json`; use `npm ci` for reproducible installs)
+```
+Browser (Next.js app)
+  │  chat / SQL / explorer / export
+  ▼
+Next.js API routes (Node runtime)
+  ├─ /api/chat ─────────────► DeepSeek (streaming)          AI answers, questions, SQL
+  ├─ /api/generate-stream ──► generation job registry ─► DeepSeek seed rows ─► data expander
+  │                                                    └─► progress persisted every few seconds
+  ├─ /api/sql/execute ──────► AlaSQL engine over the stored JSON dataset
+  ├─ /api/connections/* ────► pg / mysql2 pools ─► YOUR database (transactions, confirmation)
+  ├─ /api/export ───────────► SQL / CSV / JSON / Excel
+  └─ storage: Prisma (PostgreSQL)  →  in-memory (dev fallback)
+```
 
-## Quick Start
+## Quick start (local)
 
-### 1. Install dependencies
+Requirements: **Node.js ≥ 20.9**, npm, and Docker (for the local Postgres) or any Postgres 14+.
 
 ```bash
+git clone https://github.com/smazzinni/synthForgeAI.git
+cd synthForgeAI
+cp .env.example .env            # then set DEEPSEEK_API_KEY
+docker compose up -d db         # Postgres on localhost:5432
 npm ci
+npm run db:deploy               # apply Prisma migrations
+npm run dev                     # http://localhost:3000
 ```
 
-### 2. Set up environment variables
+Without `DATABASE_URL` the app still runs (in-memory storage), and without `DEEPSEEK_API_KEY`
+everything except AI chat/generation works.
 
-```bash
-cp .env.example .env
-```
+### Package managers
 
-Edit `.env` and fill in your actual values:
-- `DATABASE_URL` — SQLite for local dev, PostgreSQL for production
-- `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_KEY` — Supabase project credentials
-- `DEEPSEEK_API_KEY` — Your DeepSeek API key (get one at https://platform.deepseek.com)
-- `DEEPSEEK_MODEL` — `deepseek-chat`, `deepseek-reasoner`, or `deepseek-v4-pro`
+The repo ships an npm lockfile, but works with any of them — CI installs and tests with yarn, pnpm and bun too:
 
-### 3. Generate Prisma client
+| | install | dev server | tests | migrations |
+|---|---|---|---|---|
+| npm / npx | `npm ci` | `npm run dev` | `npm test` | `npx prisma migrate deploy` |
+| yarn | `yarn install` | `yarn dev` | `yarn test` | `yarn prisma migrate deploy` |
+| pnpm | `pnpm install` | `pnpm dev` | `pnpm test` | `pnpm prisma migrate deploy` |
+| bun | `bun install` | `bun run dev` | `bun run test` | `bunx prisma migrate deploy` |
 
-```bash
-npm run db:generate
-```
+`package.json` lists the dependencies allowed to run install scripts (`trustedDependencies` for bun,
+`pnpm.onlyBuiltDependencies` for pnpm) so the Prisma engines install everywhere.
 
-### 4. Run the development server
+## Configuration
 
-```bash
-npm run dev
-```
+All settings are environment variables (see [`.env.example`](.env.example)).
 
-Open [http://localhost:3000](http://localhost:3000) in your browser.
+| Variable | Required | Purpose |
+|---|---|---|
+| `DATABASE_URL` | recommended | PostgreSQL URL for the app's own storage (Prisma). Migrations run on boot in Docker/Railway. |
+| `DEEPSEEK_API_KEY` | for AI | DeepSeek API key. |
+| `DEEPSEEK_MODEL` | no | `deepseek-chat` (default), `deepseek-reasoner`, … |
+| `DEEPSEEK_BASE_URL` | no | Override the API base URL (OpenAI-compatible endpoints). |
+| `DEEPSEEK_MAX_TOKENS` | no | Max tokens per AI call (default 32000). |
+| `CONNECTION_ENCRYPTION_KEY` | **production** | Encrypts saved external-database passwords (AES-256-GCM). `openssl rand -base64 32`. |
+| `AUTH_REQUIRED` | no | Runtime switch (`true`/`false`). Unset: login required in production, single-user demo mode in development. |
+| `NEXT_PUBLIC_APP_URL` | for reset emails | Public URL of the app; used to build password-reset links. |
+| `SMTP_URL`, `MAIL_FROM` | for reset emails | SMTP server and from-address for password-reset emails. Without SMTP the link is only logged (and returned in development). |
+| `INSECURE_COOKIES` | no | `true` only for http-only staging; drops the `Secure` flag from the session cookie. |
+| `GENERATION_SEED_ROWS` | no | Rows per table the AI writes before the expander takes over (default 200). |
+| `DB_SSL_REJECT_UNAUTHORIZED` | no | `true` to verify TLS certificates of external databases. |
+| `ALLOW_PRIVATE_DB_HOSTS` | no | `true` to allow connections to private/internal addresses in production (blocked by default). |
 
 ## Deploy on Railway
 
-1. Create a Railway project and add **PostgreSQL** (New → Database → PostgreSQL).
-2. Add a service from this GitHub repo. `railway.json` makes Railway build the `Dockerfile`
-   and health-check `/api/health`. Migrations run automatically on boot.
-3. Set service variables:
-   - `DATABASE_URL` = `${{Postgres.DATABASE_URL}}`
-   - `CONNECTION_ENCRYPTION_KEY` = long random string (`openssl rand -base64 32`)
-   - `DEEPSEEK_API_KEY` (and optionally `DEEPSEEK_MODEL`)
-   - For real user accounts: `NEXT_PUBLIC_AUTH_ENABLED=true`, `NEXT_PUBLIC_SUPABASE_URL`,
-     `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_KEY`, `SUPABASE_JWT_SECRET`
-4. Settings → Networking → Generate Domain (port 3000).
+Everything — the app **and** its PostgreSQL database — runs on Railway.
 
-### GitHub Actions
+1. **Create a project** → *New* → *Database* → **PostgreSQL**.
+2. *New* → *GitHub Repo* → `smazzinni/synthForgeAI`. `railway.json` tells Railway to build the
+   `Dockerfile`, health-check `/api/health` and restart on failure. Migrations run automatically.
+3. **Variables** on the app service:
+   ```
+   DATABASE_URL=${{Postgres.DATABASE_URL}}
+   CONNECTION_ENCRYPTION_KEY=<openssl rand -base64 32>
+   DEEPSEEK_API_KEY=<your key>
+   AUTH_REQUIRED=true
+   NEXT_PUBLIC_APP_URL=https://<your-domain>
+   # optional, for password-reset emails:
+   SMTP_URL=smtps://user:pass@smtp.example.com:465
+   MAIL_FROM="SynthForge <no-reply@example.com>"
+   ```
+4. *Settings* → *Networking* → **Generate Domain** (port 3000).
 
-- `.github/workflows/ci.yml` — lint, type-check, unit tests, build, smoke test against Postgres,
-  Docker build. Runs on every push to `main` and every PR.
-- `.github/workflows/deploy-railway.yml` — deploys `main` after CI passes. Needs repo secret
-  `RAILWAY_TOKEN` (Railway project token) and repo variable `RAILWAY_SERVICE` (service name).
-  Skip it if you connect the repo in Railway's UI instead (auto-deploys on push).
+Pushes to `main` redeploy automatically when the repo is connected. To deploy from GitHub Actions
+instead, add the repo secret `RAILWAY_TOKEN` (project token) and variable `RAILWAY_SERVICE`; the
+[`deploy-railway.yml`](.github/workflows/deploy-railway.yml) workflow deploys after CI passes.
 
-### Local development
+## Other hosting (Docker, Vercel)
 
-```bash
-docker compose up -d db          # Postgres on :5432
-cp .env.example .env             # DATABASE_URL=postgresql://postgres:postgres@localhost:5432/synthforge
-npm ci && npm run db:deploy && npm run dev
-npm test                         # unit tests
-```
-
-## Production checklist
-
-- Set `NEXT_PUBLIC_AUTH_ENABLED=true` and the Supabase keys. Every API route verifies the
-  Supabase session (set `SUPABASE_JWT_SECRET` for fast local verification); without auth
-  enabled the app runs as a single shared demo user.
-- Set `CONNECTION_ENCRYPTION_KEY` so saved database passwords are encrypted at rest.
-- Run `db-connections-migration.sql` in Supabase if you use live DB connections.
-- Data generation runs as a server-side job: it continues if the user closes the tab, saves
-  progress every few seconds, and is stopped only by the Stop button. On Vercel it relies on
-  `maxDuration` (Fluid compute) — very large generations may need a higher plan limit.
-- `GET /api/health` is a safe, unauthenticated probe for uptime monitors.
-
-## Production Deployment
-
-### Build
+**Docker** (any host):
 
 ```bash
-npm run build
+docker build -t synthforge .
+docker run -p 3000:3000 --env-file .env synthforge
+# or the full local stack:
+docker compose up --build
 ```
 
-### Start
+**Vercel** works for the UI and APIs, but serverless time limits (≤300 s) cap how long a single
+generation job can run; very large generations and long-lived DB pools are better on Railway/Docker.
+
+## How data stays correct across tables
+
+Every generation goes through the same pipeline, so related tables always line up:
+
+1. **Dependency order** — tables are sorted parents-first from their foreign keys (`orders.user_id → users`),
+   and the AI is told each relationship explicitly.
+2. **Strict parsing** — rows for tables that aren't in the schema, rows whose columns don't match the
+   table, broken JSON lines and markdown noise are dropped; each row is reduced to the declared columns.
+3. **Quality Analyst repair** ([`data-integrity.ts`](src/lib/server/data-integrity.ts)) — before and after
+   scaling up:
+   - missing/duplicate primary keys get new ids;
+   - foreign keys that point nowhere (or are empty) are re-pointed to an existing parent row;
+     self-references (e.g. `categories.parent_id`) may stay empty for root rows;
+   - child timestamps are moved after their parent's `created_at`;
+   - numbers / booleans / dates are coerced to their declared types;
+   - unique-looking columns (email, username, slug, sku…) are de-duplicated case-insensitively.
+   The share of cells that needed no fix becomes the database's **quality score**.
+4. **Scale-up** ([`data-expander.ts`](src/lib/server/data-expander.ts)) — parents are expanded before
+   children and every new child references a real parent; names are recombined from the AI's sample (so
+   the locale it chose is kept), phone/postcode formats are preserved, and [Faker](https://fakerjs.dev)
+   fills well-known columns when the sample is too small.
+
+Similar open-source tools, for comparison: [SDV](https://github.com/sdv-dev/SDV) (Python, statistical
+multi-table models, Business Source License), [synthdb](https://docs.rs/synthdb) (Rust Postgres seeder),
+[Faker](https://github.com/faker-js/faker) (values only, no relationships). SynthForge combines an LLM for
+domain realism with deterministic integrity rules like those tools.
+
+## Working with large data
+
+- **Generation**: the AI produces up to `GENERATION_SEED_ROWS` realistic rows per table, then the
+  [data expander](src/lib/server/data-expander.ts) synthesises the rest locally — new unique ids,
+  foreign keys that always reference existing parent rows (parents are expanded first), numbers and
+  dates within the observed ranges, categories with the observed distribution, unique emails /
+  usernames. 70,000 rows across two related tables take ~20 s end to end.
+- **Browsing**: the studio loads a 200-row preview per table and pages the rest from the server
+  (`/api/databases/:id/rows`, `/api/connections/:id/rows`) with sorting and filtering.
+- **SQL**: results return at most 1,000 rows (with the true match count and a *truncated* notice);
+  use `LIMIT`, `WHERE` or export for more.
+- **Export**: generated databases export in full; live databases export up to 50,000 rows per table.
+- **Limits**: 100,000 rows per table / 250,000 per generation. The dataset is stored as one JSON
+  document per database, so keep individual databases under a few hundred thousand rows.
+
+## Live database connections
+
+Add a connection from **DB Connections** (fill the form or paste a connection string such as
+`postgresql://user:pass@host:5432/db?sslmode=require`). Then open it in the studio:
+
+- **Data / Explorer** — browse every table with server-side paging and exact counts; ER diagram.
+- **SQL tab** — run anything: SELECT, INSERT/UPDATE/DELETE, DDL, GRANT, EXPLAIN, SHOW, CALL…
+- **AI chat** — "show the 10 biggest orders", "add 20 realistic customers", "add a status column"…
+  The AI reads the schema first, asks one question when something is ambiguous (which rows, how many,
+  which table), runs read queries automatically and shows results inline.
+- **Safety** — DELETE, DROP, TRUNCATE, ALTER, GRANT/REVOKE and UPDATE without WHERE always ask for
+  confirmation. Multi-statement SQL runs in a transaction: if any statement fails, nothing is changed.
+- **Supabase**: use the pooler host (`aws-0-<region>.pooler.supabase.com`, user `postgres.<project-ref>`)
+  or the direct host `db.<project-ref>.supabase.co`; SSL is enabled automatically.
+
+## API reference
+
+All endpoints require a session (`sf_session` cookie or `Authorization: Bearer <token>`) when auth is
+enabled, and are scoped to the caller.
+
+| Method & path | Description |
+|---|---|
+| `POST /api/chat` | Streaming AI chat (SSE: `content`, `reasoning`, `truncated`, `finish`, `done`, `error`). |
+| `POST /api/generate-stream` | Start a generation job; SSE progress (`job_started`, `progress`, `table_complete`, `complete`, `cancelled`, `error`). |
+| `GET /api/generate-stream?jobId=…\|databaseId=…` | Job status JSON, or re-attach with `Accept: text/event-stream`. |
+| `DELETE /api/generate-stream?jobId=…` | Stop a job (rows so far are kept). |
+| `GET/POST/PATCH/DELETE /api/databases` | Synthetic databases CRUD (`?id=…&preview=N`). |
+| `GET /api/databases/:id/rows` | Paged rows: `table, offset, limit, sort, dir, q`. |
+| `POST /api/sql/execute` | Run SQL on a synthetic database (`databaseId`) or a connection (`connectionId`). |
+| `GET/POST /api/connections` | List / create (and test) external connections. |
+| `GET/PATCH/DELETE /api/connections/:id` | Read (`?include=introspect` → schema, sample, counts) / update / delete. |
+| `GET /api/connections/:id/rows` | Paged rows of a live table. |
+| `POST /api/connections/execute` | Run SQL on a live database (`skipDangerousCheck` after the user confirms). |
+| `POST /api/connections/:id/agent` | `introspect` (schema + counts), `execute`, `verify` (read-only). |
+| `POST /api/export` | `{databaseId \| connectionId, format: sql\|csv\|json\|xlsx, tableName?}` → file. |
+| `GET/POST/DELETE /api/conversations` | Chat history. |
+| `GET /api/health` | Public health probe (storage, AI, auth status — no secrets). |
+
+## Testing & CI
 
 ```bash
-npm start
+npm test                      # unit tests (vitest): SQL engine, expander, auth, crypto, jobs, …
+npx tsc --noEmit && npx eslint src --quiet
+./e2e/seed.sh && node e2e/live-db.mjs   # 83 end-to-end scenarios against real Postgres + MySQL
 ```
 
-### Vercel Deployment
+GitHub Actions ([`ci.yml`](.github/workflows/ci.yml)) runs on every push and PR:
 
-1. Push your code to GitHub
-2. Import the repository in Vercel
-3. Set all environment variables from `.env.example` in the Vercel dashboard
-4. Deploy — Vercel will automatically run `npm install` and `npm run build`
+- **verify** — lint, type-check, unit tests, production build, smoke test against Postgres
+- **E2E (live Postgres + MySQL connections)** — the 83-scenario suite against real database services
+- **docker** — builds the production image
 
-## Available Scripts
+## Security
 
-| Script | Description |
-|--------|-------------|
-| `npm run dev` | Start development server on port 3000 |
-| `npm run build` | Create production build |
-| `npm start` | Start production server on port 3000 |
-| `npm run lint` | Run ESLint |
-| `npm run type-check` | Run TypeScript type checker |
-| `npm run db:generate` | Generate Prisma client |
-| `npm run db:push` | Push Prisma schema to database |
-| `npm run db:studio` | Open Prisma Studio |
+- Accounts use salted password hashes and server-side sessions stored in PostgreSQL (httpOnly,
+  SameSite cookie; login is rate limited). Every API route resolves the user from the session; there
+  is no trust in client-supplied user ids. Records are owner-scoped in every storage backend.
+- External database passwords are encrypted at rest and never returned to the browser.
+- Connections to private/internal network addresses are blocked in production (SSRF guard).
+- Destructive SQL requires explicit confirmation; multi-statement SQL is transactional.
+- Per-user rate limits; security headers (HSTS, X-Frame-Options, nosniff…); no wildcard CORS.
+- Report vulnerabilities privately to the repository owner.
 
-## Tech Stack
+## Project structure
 
-- **Framework**: Next.js 16 (App Router, Turbopack)
-- **Language**: TypeScript 5
-- **Styling**: Tailwind CSS 4, shadcn/ui (New York)
-- **Database**: Prisma ORM (SQLite/PostgreSQL)
-- **Auth**: Supabase
-- **AI**: DeepSeek v4-pro (streaming, reasoning)
-- **State**: Zustand, TanStack Query
+```
+src/
+  app/
+    api/                 route handlers (chat, generate-stream, databases, connections, sql, export, …)
+    dashboard/           studio, databases, connections, settings pages
+  components/            UI (shadcn/ui) and layout
+  lib/
+    server/              auth, crypto, rate limits, generation jobs, SQL engine, data expander, storage
+    db-connections/      external DB store, executor (pools, transactions), confirmation rules
+prisma/                  schema + migrations (PostgreSQL)
+e2e/                     live-database end-to-end suite
+Dockerfile, railway.json, docker-compose.yml, .github/workflows/
+```
 
-## Environment Variables
+## Troubleshooting
 
-See [`.env.example`](.env.example) for all required and optional environment variables.
-
-## License
-
-Private — All rights reserved.
+| Symptom | Fix |
+|---|---|
+| `/api/health` → `storage: error` | `DATABASE_URL` unreachable, or run `npm run db:deploy`. |
+| AI chat says the service is not configured | Set `DEEPSEEK_API_KEY`. |
+| "Connections to private or internal network addresses are not allowed" | Expected in production; set `ALLOW_PRIVATE_DB_HOSTS=true` only for trusted self-hosted setups. |
+| Supabase connection: "tenant/user not found" | Pooler user must be `postgres.<project-ref>` and the region must match. |
+| Everyone shares the same data | Auth is off (demo mode). Set `AUTH_REQUIRED=true`. |
+| Prisma: "URL must start with file:" | Stale client — run `npx prisma generate`. |

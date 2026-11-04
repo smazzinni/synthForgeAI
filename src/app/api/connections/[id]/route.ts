@@ -5,7 +5,7 @@ import {
   updateConnection,
   deleteConnection,
 } from '@/lib/db-connections/store'
-import { evictPool, testConnection, fetchExternalSchema, fetchSampleRows } from '@/lib/db-connections/executor'
+import { evictPool, testConnection, fetchExternalSchema, fetchSampleRows, fetchTableCounts } from '@/lib/db-connections/executor'
 import { toSafeRecord } from '@/lib/db-connections/types'
 
 // ─── Per-item routes: /api/connections/[id] ───
@@ -55,7 +55,9 @@ export async function GET(request: NextRequest, { params }: Params) {
             data[table.name] = []
           }
         }
-        return NextResponse.json({ connection: safe, schema, data })
+        // Exact row counts so the UI shows real sizes (data holds only a sample).
+        const counts = await fetchTableCounts(conn, schema.map(t => t.name)).catch(() => ({}))
+        return NextResponse.json({ connection: safe, schema, data, counts })
       } catch (err) {
         return NextResponse.json({
           connection: safe,
