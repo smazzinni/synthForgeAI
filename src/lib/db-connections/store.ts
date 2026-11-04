@@ -17,6 +17,9 @@ import type { DbConnectionInput, DbConnectionRecord, SafeDbConnectionRecord } fr
 import { toSafeRecord } from './types'
 import { encryptSecret, decryptSecret } from '@/lib/server/crypto'
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnySupabase = any
+
 /** Decrypt the stored password so callers always see plaintext in memory. */
 function reveal(rec: DbConnectionRecord): DbConnectionRecord {
   try {
@@ -67,7 +70,7 @@ function prismaToRecord(p: {
     username: p.username,
     password: p.password,
     database: p.database,
-    schema: p.schema,
+    schema: p.schema ?? undefined,
     ssl: p.ssl,
     status: p.status as 'untested' | 'connected' | 'failed',
     last_connected_at: p.lastConnectedAt?.toISOString() || null,
@@ -106,7 +109,7 @@ async function prismaCreate(record: DbConnectionRecord): Promise<DbConnectionRec
     const row = await db.dbConnection.create({
       data: {
         id: record.id,
-        userId: record.user_id,
+        userId: record.user_id ?? '',
         name: record.name,
         dialect: record.dialect,
         host: record.host,
@@ -225,7 +228,7 @@ export function _resetSupabaseProbeForTesting(): void {
 
 export async function listConnections(userId: string): Promise<SafeDbConnectionRecord[]> {
   if (await trySupabase()) {
-    const admin = getSupabaseAdmin()!
+    const admin = getSupabaseAdmin()! as unknown as AnySupabase
     const { data, error } = await admin
       .from('db_connections')
       .select('*')
@@ -250,7 +253,7 @@ export async function getConnection(userId: string, id: string): Promise<DbConne
   // id-only fallback: that would let any caller use another user's database.
   if (!id || !userId) return null
   if (await trySupabase()) {
-    const admin = getSupabaseAdmin()!
+    const admin = getSupabaseAdmin()! as unknown as AnySupabase
     const { data, error } = await admin
       .from('db_connections')
       .select('*')
@@ -284,7 +287,7 @@ export async function createConnection(
   }
 
   if (await trySupabase()) {
-    const admin = getSupabaseAdmin()!
+    const admin = getSupabaseAdmin()! as unknown as AnySupabase
     const { data, error } = await admin
       .from('db_connections')
       .insert({
@@ -342,7 +345,7 @@ export async function updateConnection(
   const now = new Date().toISOString()
 
   if (await trySupabase()) {
-    const admin = getSupabaseAdmin()!
+    const admin = getSupabaseAdmin()! as unknown as AnySupabase
     const updatePayload: Record<string, unknown> = { updated_at: now }
     if (patch.name !== undefined) updatePayload.name = patch.name
     if (patch.host !== undefined) updatePayload.host = patch.host
@@ -390,7 +393,7 @@ export async function updateConnection(
 
 export async function deleteConnection(userId: string, id: string): Promise<boolean> {
   if (await trySupabase()) {
-    const admin = getSupabaseAdmin()!
+    const admin = getSupabaseAdmin()! as unknown as AnySupabase
     const { data, error } = await admin
       .from('db_connections')
       .delete({ count: 'exact' })

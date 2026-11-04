@@ -443,9 +443,9 @@ export default function MyDatabasesPage() {
   return (
     <div className="p-4 md:p-8 max-w-7xl mx-auto">
       {/* Header */}
-      <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-6 gap-4">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-6 gap-4">
         <div>
-          <h1 className="text-2xl md:text-3xl font-bold">My Databases</h1>
+          <h1 className="text-2xl md:text-3xl font-bold break-words">My Databases</h1>
           <p className="text-muted-foreground mt-1 text-sm">View and manage all your synthetic databases</p>
         </div>
         <Button asChild className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white">
@@ -458,7 +458,7 @@ export default function MyDatabasesPage() {
 
       {/* Stats Summary Row */}
       {!loading && databases.length > 0 && (
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4 mb-6">
+        <div className="grid grid-cols-1 min-[360px]:grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4 mb-6">
           {statCards.map((stat) => {
             const Icon = stat.icon
             return (
@@ -527,9 +527,9 @@ export default function MyDatabasesPage() {
                   className="pl-10"
                 />
               </div>
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-3 [&>button]:flex-1 sm:[&>button]:flex-none">
                 <Select value={sortBy} onValueChange={(v) => setSortBy(v as SortBy)}>
-                  <SelectTrigger className="w-[180px]">
+                  <SelectTrigger className="w-full sm:w-[180px]">
                     <SelectValue placeholder="Sort by" />
                   </SelectTrigger>
                   <SelectContent>

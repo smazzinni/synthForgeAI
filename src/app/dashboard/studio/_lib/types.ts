@@ -14,6 +14,21 @@ export interface GenerationProgress {
   databaseId?: string
 }
 
+export interface SqlBlockResult {
+  ok: boolean
+  message: string
+  rowCount?: number
+  affectedRows?: number
+  rows?: Record<string, unknown>[]
+  columns?: string[]
+}
+
+export interface SavedQuery {
+  name: string
+  sql: string
+  createdAt?: string
+}
+
 export interface Message {
   id: string
   role: 'user' | 'assistant' | 'system'
@@ -30,14 +45,8 @@ export interface Message {
   sqlBlock?: string | null
   sqlBlocks?: string[]
   sqlBlockExecuting?: boolean
-  sqlBlockResult?: {
-    ok: boolean
-    message: string
-    rowCount?: number
-    affectedRows?: number
-    rows?: Record<string, unknown>[]
-    columns?: string[]
-  } | null
+  sqlBlockResult?: SqlBlockResult | null
+  sqlBlockStates?: Record<string, { executing: boolean; result: SqlBlockResult | null }>
 }
 
 export interface SchemaTable {
@@ -56,4 +65,17 @@ export interface StudioPageProps {
   initialConnectionId?: string
   initialConnectionName?: string
   initialConnectionDialect?: 'postgres' | 'mysql'
+}
+
+export interface SavedConversation {
+  id: string
+  title: string
+  messages: Message[]
+  schema: SchemaTable[]
+  data: Record<string, unknown[]>
+  databaseName: string
+  databaseId: string | null
+  connectionId?: string | null
+  createdAt: string
+  updatedAt: string
 }

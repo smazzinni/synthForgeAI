@@ -171,7 +171,7 @@ export default function ApiKeysPage() {
   }
 
   return (
-    <div className="p-4 md:p-8 max-w-5xl mx-auto min-h-screen">
+    <div className="p-4 md:p-8 max-w-5xl mx-auto min-h-dvh">
       {/* Header */}
       <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-8 gap-4">
         <div className="flex items-center gap-3">

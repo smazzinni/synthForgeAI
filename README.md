@@ -15,24 +15,14 @@ AI-Powered Synthetic Data Generation Platform with multi-agent pipeline, live DB
 ## Prerequisites
 
 - Node.js >= 18.0.0
-- A package manager: npm, yarn, pnpm, or bun
+- npm (the repo ships a `package-lock.json`; use `npm ci` for reproducible installs)
 
 ## Quick Start
 
 ### 1. Install dependencies
 
 ```bash
-# npm
-npm install
-
-# yarn
-yarn install
-
-# pnpm
-pnpm install
-
-# bun
-bun install
+npm ci
 ```
 
 ### 2. Set up environment variables
@@ -60,6 +50,18 @@ npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000) in your browser.
+
+## Production checklist
+
+- Set `NEXT_PUBLIC_AUTH_ENABLED=true` and the Supabase keys. Every API route verifies the
+  Supabase session (set `SUPABASE_JWT_SECRET` for fast local verification); without auth
+  enabled the app runs as a single shared demo user.
+- Set `CONNECTION_ENCRYPTION_KEY` so saved database passwords are encrypted at rest.
+- Run `db-connections-migration.sql` in Supabase if you use live DB connections.
+- Data generation runs as a server-side job: it continues if the user closes the tab, saves
+  progress every few seconds, and is stopped only by the Stop button. On Vercel it relies on
+  `maxDuration` (Fluid compute) — very large generations may need a higher plan limit.
+- `GET /api/health` is a safe, unauthenticated probe for uptime monitors.
 
 ## Production Deployment
 

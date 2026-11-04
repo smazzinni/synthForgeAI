@@ -292,9 +292,9 @@ export default function DashboardPage() {
   })
 
   return (
-    <div className="p-4 md:p-8 max-w-7xl mx-auto min-h-screen">
+    <div className="p-4 md:p-8 max-w-7xl mx-auto min-h-dvh">
       {/* Header */}
-      <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-8">
+      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-8">
         <div>
           <div className="flex items-center gap-2 mb-1">
             <div className="h-8 w-8 rounded-lg bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center shadow-md">
@@ -423,7 +423,7 @@ export default function DashboardPage() {
       </div>
 
       {/* Stats Grid */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+      <div className="grid grid-cols-1 min-[360px]:grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4 mb-8">
         {stats.map((stat) => (
           <Card key={stat.label} className={`relative overflow-hidden hover:shadow-lg transition-all duration-300 group bg-gradient-to-br ${stat.gradientBg}`}>
             <CardContent className="pt-5 pb-5">

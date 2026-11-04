@@ -33,7 +33,7 @@ export default function ForgotPasswordPage() {
     try {
       const { error } = await resetPassword(email)
       if (error) {
-        setError(error.message)
+        setError(error instanceof Error ? error.message : 'Could not send reset email. Please try again.')
       } else {
         setSuccess(true)
       }

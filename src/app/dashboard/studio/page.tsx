@@ -99,6 +99,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
+import { useIsMobile } from '@/hooks/use-mobile'
 import { apiPost, apiPatch, apiDelete, apiGet, invalidateCache } from '@/lib/api-client'
 import {
   parseAgentStatus,
@@ -115,7 +116,7 @@ import {
   type BeginGenerationSignal,
 } from '@/lib/ai-agents'
 // Extracted types + helpers + sub-components (kept the main file focused)
-import type { Message, SchemaTable, StudioPageProps, GenerationProgress } from './_lib/types'
+import type { Message, SchemaTable, StudioPageProps, GenerationProgress, SavedConversation } from './_lib/types'
 import {
   exportAsCSV,
   exportAsJSON,
@@ -132,7 +133,7 @@ import {
 } from './_lib/utils'
 import { AgentIcon } from './_components/agent-icon'
 import { ShowMoreText } from './_components/show-more-text'
-import { SqlBlockCard } from './_components/sql-block-card'
+import { SqlBlockCard, type SqlBlockResult } from './_components/sql-block-card'
 
 
 // ─── Conversation history (localStorage persistence) ───
@@ -142,17 +143,11 @@ import { SqlBlockCard } from './_components/sql-block-card'
 // the entire studio state can be restored on load.
 const CONVERSATION_STORAGE_KEY = 'synthforge_conversations'
 const MAX_CONVERSATIONS = 50
+const MAX_AUTO_TURNS = 5
+const ACTIVE_GENERATION_KEY = 'synthforge:activeGeneration'
 
-interface SavedConversation {
-  id: string
-  title: string
-  messages: Message[]
-  schema: SchemaTable[]
-  data: Record<string, unknown[]>
-  databaseName: string
-  databaseId: string | null
-  createdAt: string
-  updatedAt: string
+function clearActiveGeneration() {
+  try { localStorage.removeItem(ACTIVE_GENERATION_KEY) } catch { /* ignore */ }
 }
 
 // SSR-safe lazy loader. Guards against malformed JSON, missing fields, and
@@ -455,6 +450,9 @@ function StudioPageInner({
   // floating button is rendered to re-open it.
   const [showShortcuts, setShowShortcuts] = useState(false)
   const [panelVisible, setPanelVisible] = useState(true)
+  const isMobile = useIsMobile()
+  const [mobileView, setMobileView] = useState<'chat' | 'data'>('chat')
+  const rightPanelShown = isMobile ? mobileView === 'data' : panelVisible
   // Auto-resizing textarea ref. We swap from a single-line <Input> to a
   // <Textarea> so the chat box can grow with content (capped at 3 lines).
   const chatInputRef = useRef<HTMLTextAreaElement>(null)
@@ -475,6 +473,10 @@ function StudioPageInner({
     statusMessages: [],
   })
   const generationAbortRef = useRef<AbortController | null>(null)
+  const generationJobIdRef = useRef<{ jobId: string; databaseId: string } | null>(null)
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const pendingTimeoutsRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set())
+  const autoTurnsRef = useRef(0)
 
   const chatEndRef = useRef<HTMLDivElement>(null)
   const chatContainerRef = useRef<HTMLDivElement>(null)
@@ -537,6 +539,7 @@ function StudioPageInner({
           toast.error(`Connection test failed: ${result.connection.error_message || 'unknown error'}`)
         }
 
+        const conn = result.connection
         setActiveConnectionId(result.connection.id)
         setActiveConnectionName(result.connection.name)
         setActiveConnectionDialect(result.connection.dialect)
@@ -558,7 +561,7 @@ function StudioPageInner({
           if (hasRealHistory) return prev
           return prev.map(m => m.id === '1' ? {
             ...m,
-            content: `Connected to live ${result.connection.dialect} **"${result.connection.name}"**. I have direct access to this database — ask me anything and I'll run SQL against it.\n\n**Examples:**\n- "show me the first 10 rows of users"\n- "how many rows are in the orders table?"\n- "what tables are in this database?"\n- "add a status column to the orders table"\n\n**How it works:**\n- **SELECT** queries are auto-executed immediately — results appear inline below.\n- **INSERT / UPDATE / DELETE / DDL** operations show a confirmation dialog before executing.`,
+            content: `Connected to live ${conn.dialect} **"${conn.name}"**. I have direct access to this database — ask me anything and I'll run SQL against it.\n\n**Examples:**\n- "show me the first 10 rows of users"\n- "how many rows are in the orders table?"\n- "what tables are in this database?"\n- "add a status column to the orders table"\n\n**How it works:**\n- **SELECT** queries are auto-executed immediately — results appear inline below.\n- **INSERT / UPDATE / DELETE / DDL** operations show a confirmation dialog before executing.`,
           } : m)
         })
 
@@ -586,6 +589,83 @@ function StudioPageInner({
   // AND the conversation history so the chat is restored.
   // BUGFIX: previously the studio only loaded connection mode (?connectionId=)
   // but never restored a generated database's schema/data/messages on refresh.
+  // ─── Poll a server-side generation job (after disconnect / page reload) ───
+  const pollGeneration = (databaseId: string) => {
+    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
+    const startedAt = Date.now()
+    setGenerationProgress(prev => ({ ...prev, isGenerating: true, databaseId }))
+    const stop = () => {
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
+      pollIntervalRef.current = null
+    }
+    let inFlight = false
+    pollIntervalRef.current = setInterval(async () => {
+      if (inFlight) return
+      if (Date.now() - startedAt > 30 * 60 * 1000) {
+        stop()
+        setGenerationProgress(prev => ({ ...prev, isGenerating: false }))
+        toast.warning('Generation is taking longer than expected. Refresh the page to check its status.')
+        return
+      }
+      inFlight = true
+      try {
+        const res = await apiGet<{ database?: { data_json: Record<string, unknown[]>; schema_json: SchemaTable[]; row_count?: number; status: string } }>(
+          `/api/databases?id=${databaseId}`, { cacheTtl: 0, force: true, timeout: 15000 })
+        const db = res.database
+        if (!db) return
+        if (db.status === 'generating') {
+          if (typeof db.row_count === 'number') {
+            setGenerationProgress(prev => ({ ...prev, isGenerating: true, totalInserted: db.row_count as number }))
+          }
+          return
+        }
+        stop()
+        generationJobIdRef.current = null
+        clearActiveGeneration()
+        if (db.data_json && Object.keys(db.data_json).length > 0) setGeneratedData(db.data_json)
+        if (Array.isArray(db.schema_json) && db.schema_json.length > 0) setGeneratedSchema(db.schema_json)
+        setGenerationProgress(prev => ({
+          ...prev,
+          isGenerating: false,
+          totalInserted: db.row_count ?? prev.totalInserted,
+        }))
+        toast.success('Database generation finished')
+        invalidateCache('/api/databases')
+      } catch (err) {
+        console.warn('[Studio] Generation poll failed:', err)
+      } finally {
+        inFlight = false
+      }
+    }, 3000)
+  }
+
+  // Resume polling for a generation that was started before a reload.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(ACTIVE_GENERATION_KEY)
+      if (!raw) return
+      const saved = JSON.parse(raw) as { jobId?: string; databaseId?: string }
+      const urlDbId = new URLSearchParams(window.location.search).get('databaseId')
+      if (!saved.databaseId || (urlDbId && urlDbId !== saved.databaseId)) return
+      generationJobIdRef.current = saved.jobId ? { jobId: saved.jobId, databaseId: saved.databaseId } : null
+      if (!urlDbId) setCurrentDatabaseId(saved.databaseId)
+      pollGeneration(saved.databaseId)
+    } catch { /* ignore */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Detach from in-flight requests on unmount (the server keeps generating).
+  useEffect(() => {
+    const timeouts = pendingTimeoutsRef.current
+    return () => {
+      abortRef.current?.abort()
+      generationAbortRef.current?.abort()
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
+      timeouts.forEach(clearTimeout)
+      timeouts.clear()
+    }
+  }, [])
+
   useEffect(() => {
     const dbId = searchParams.get('databaseId')
     if (!dbId || currentDatabaseId === dbId) return
@@ -608,6 +688,9 @@ function StudioPageInner({
 
         setCurrentDatabaseId(result.database.id)
         setDatabaseName(result.database.name)
+        if (result.database.status === 'generating') {
+          pollGeneration(result.database.id)
+        }
         if (Array.isArray(result.database.schema_json) && result.database.schema_json.length > 0) {
           setGeneratedSchema(result.database.schema_json)
         }
@@ -728,9 +811,11 @@ function StudioPageInner({
   }, [conversationId, currentDatabaseId, databaseName])
 
   // ─── Send message with DeepSeek streaming ───
-  const sendMessage = useCallback(async (messageText?: string) => {
+  const sendMessage = useCallback(async (messageText?: string, isAuto = false) => {
     const textToSend = messageText || input
     if (!textToSend.trim() || loadingRef.current) return
+    if (isAuto === true) autoTurnsRef.current += 1
+    else autoTurnsRef.current = 0
 
     if (abortRef.current) {
       abortRef.current.abort()
@@ -763,6 +848,9 @@ function StudioPageInner({
 
     const controller = new AbortController()
     abortRef.current = controller
+    let flushTimer: ReturnType<typeof setTimeout> | null = null
+    let errorDetail: string | null = null
+    let errorStatus = 0
 
     try {
       // BUGFIX: Wire sqlBlockResult into chat history so the AI model can
@@ -837,6 +925,7 @@ function StudioPageInner({
         // (e.g. "DeepSeek API key not configured", "Rate limit exceeded")
         // instead of a vague "API error: 503".
         let detail = `API error: ${response.status}`
+        errorStatus = response.status
         try {
           const errBody = await response.json()
           if (errBody?.error) detail = errBody.error
@@ -844,6 +933,7 @@ function StudioPageInner({
         } catch {
           // Body wasn't JSON — keep the generic status message
         }
+        errorDetail = detail
         throw new Error(detail)
       }
 
@@ -857,6 +947,49 @@ function StudioPageInner({
       let lastAgentName = 'Orchestrator'
       let lastAgentStatus: AgentStatus | null = null
       let lastInteractiveOptions: InteractiveOptions | null = null
+      let reasoningDirty = false
+      let contentDirty = false
+
+      // Flush buffered tokens to state (at most every 50ms). Parsing runs
+      // here rather than per token.
+      const flush = () => {
+        if (flushTimer) {
+          clearTimeout(flushTimer)
+          flushTimer = null
+        }
+        if (reasoningDirty) {
+          reasoningDirty = false
+          const r = fullReasoning
+          setCurrentReasoning(r)
+          setMessages(prev => prev.map(m =>
+            m.id === assistantId ? { ...m, reasoningContent: r } : m
+          ))
+        }
+        if (contentDirty) {
+          contentDirty = false
+          const agentStatus = parseAgentStatus(fullContent)
+          if (agentStatus) {
+            lastAgentStatus = agentStatus
+            lastAgentName = agentStatus.agent
+          }
+          const allOptions = parseAllInteractiveOptions(fullContent)
+          if (allOptions.length > 0) {
+            lastInteractiveOptions = allOptions[allOptions.length - 1]
+          }
+          const c = fullContent
+          const an = lastAgentName
+          const as = lastAgentStatus
+          const io = lastInteractiveOptions
+          setMessages(prev => prev.map(m =>
+            m.id === assistantId
+              ? { ...m, content: c, agentName: an, agentStatus: as, interactiveOptions: io }
+              : m
+          ))
+        }
+      }
+      const scheduleFlush = () => {
+        if (!flushTimer) flushTimer = setTimeout(flush, 50)
+      }
 
       while (true) {
         const { done, value } = await reader.read()
@@ -868,7 +1001,7 @@ function StudioPageInner({
 
         for (const line of lines) {
           const trimmed = line.trim()
-          if (!trimmed || !trimmed.startsWith('data: ')) continue
+          if (!trimmed || trimmed.startsWith(':') || !trimmed.startsWith('data: ')) continue
 
           const data = trimmed.slice(6)
           try {
@@ -876,47 +1009,21 @@ function StudioPageInner({
 
             if (parsed.type === 'reasoning') {
               fullReasoning += parsed.content
-              setCurrentReasoning(fullReasoning)
-              setMessages(prev => prev.map(m =>
-                m.id === assistantId
-                  ? { ...m, reasoningContent: fullReasoning }
-                  : m
-              ))
+              reasoningDirty = true
+              scheduleFlush()
             } else if (parsed.type === 'content') {
               fullContent += parsed.content
-
-              // Parse for agent status updates
-              const agentStatus = parseAgentStatus(fullContent)
-              if (agentStatus) {
-                lastAgentStatus = agentStatus
-                lastAgentName = agentStatus.agent
-              }
-
-              // Parse for interactive options (all of them, use last)
-              const allOptions = parseAllInteractiveOptions(fullContent)
-              if (allOptions.length > 0) {
-                lastInteractiveOptions = allOptions[allOptions.length - 1]
-              }
-
-              // During streaming, store raw content but display cleaned version
-              setMessages(prev => prev.map(m =>
-                m.id === assistantId
-                  ? {
-                    ...m,
-                    content: fullContent,
-                    agentName: lastAgentName,
-                    agentStatus: lastAgentStatus,
-                    interactiveOptions: lastInteractiveOptions,
-                  }
-                  : m
-              ))
+              contentDirty = true
+              scheduleFlush()
             } else if (parsed.type === 'done' || parsed.type === 'finish') {
+              flush()
               setMessages(prev => prev.map(m =>
                 m.id === assistantId
                   ? { ...m, isStreaming: false }
                   : m
               ))
             } else if (parsed.type === 'truncated') {
+              flush()
               // BUGFIX (Root cause #3): Response was cut off due to token limit.
               // Show a warning and auto-continue after a short delay.
               toast.warning('Response was cut off due to token limit. Auto-continuing...')
@@ -925,13 +1032,19 @@ function StudioPageInner({
                   ? { ...m, isStreaming: false, content: m.content + '\n\n⚠️ *[Response was truncated due to token limit. Continuing...]*' }
                   : m
               ))
-              // Auto-continue after 2 seconds
-              setTimeout(() => {
+              // Auto-continue after 2 seconds (capped)
+              const t = setTimeout(() => {
+                pendingTimeoutsRef.current.delete(t)
                 const lastMsg = messagesRef.current[messagesRef.current.length - 1]
                 if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isStreaming) {
-                  sendMessage('[Auto-continue: Your previous response was cut off. Please continue from where you left off, completing any SQL blocks that were truncated.]')
+                  if (autoTurnsRef.current >= MAX_AUTO_TURNS) {
+                    toast.info('Paused automatic follow-ups — send a message to continue.')
+                    return
+                  }
+                  sendMessage('[Auto-continue: Your previous response was cut off. Please continue from where you left off, completing any SQL blocks that were truncated.]', true)
                 }
               }, 2000)
+              pendingTimeoutsRef.current.add(t)
             } else if (parsed.type === 'error') {
               console.error('[Studio] Stream error:', parsed.content)
               // Surface the mid-stream error to the user and stop the
@@ -951,6 +1064,7 @@ function StudioPageInner({
       }
 
       // Finalize the message
+      flush()
       setMessages(prev => prev.map(m =>
         m.id === assistantId
           ? { ...m, isStreaming: false }
@@ -1090,12 +1204,18 @@ function StudioPageInner({
             // `loadingRef.current` (the authoritative loading flag), which is
             // false at this point because the stream already finished.
             if ((hadReadOnlyQueries || hadMutations) && !loadingRef.current) {
-              setTimeout(() => {
+              const t = setTimeout(() => {
+                pendingTimeoutsRef.current.delete(t)
                 const lastMsg = messagesRef.current[messagesRef.current.length - 1]
                 if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isStreaming && !loadingRef.current) {
-                  sendMessage('[Auto-continue: SQL executed successfully. Results are in conversation history. Proceed with the next step.]')
+                  if (autoTurnsRef.current >= MAX_AUTO_TURNS) {
+                    toast.info('Paused automatic follow-ups — send a message to continue.')
+                    return
+                  }
+                  sendMessage('[Auto-continue: SQL executed successfully. Results are in conversation history. Proceed with the next step.]', true)
                 }
               }, 1500)
+              pendingTimeoutsRef.current.add(t)
             }
           }
           runSequentially().catch(err => {
@@ -1190,6 +1310,7 @@ function StudioPageInner({
       // finished" case the state is correct — but for any OTHER abort
       // reason (component unmount, future Stop button) the UI would hang.
       // Always reset state here, even on abort.
+      if (flushTimer) clearTimeout(flushTimer)
       if ((err as Error).name === 'AbortError') {
         setLoading(false)
         loadingRef.current = false
@@ -1202,12 +1323,16 @@ function StudioPageInner({
         return
       }
 
+      const errText = errorStatus === 401
+        ? 'Your session expired — please sign in again.'
+        : (errorDetail || 'Sorry, I encountered an error connecting to the AI service. Please try again.')
+      toast.error(errText)
       setMessages(prev => [
         ...prev.filter(m => m.id !== assistantId),
         {
           id: assistantId,
           role: 'assistant',
-          content: 'Sorry, I encountered an error connecting to the AI service. Please try again.',
+          content: errText,
           agentName: 'System',
           timestamp: new Date(),
         },
@@ -1394,7 +1519,7 @@ function StudioPageInner({
     setConversationId('')
     if (!isLiveDbMode) {
       setGeneratedSchema([])
-      setGeneratedData([])
+      setGeneratedData({})
       setDatabaseName('')
       setCurrentDatabaseId(undefined)
     }
@@ -1486,6 +1611,16 @@ function StudioPageInner({
       generationAbortRef.current.abort()
       generationAbortRef.current = null
     }
+    const activeJob = generationJobIdRef.current
+    if (activeJob) {
+      fetch('/api/generate-stream?jobId=' + encodeURIComponent(activeJob.jobId), { method: 'DELETE' }).catch(() => {})
+      generationJobIdRef.current = null
+    }
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current)
+      pollIntervalRef.current = null
+    }
+    clearActiveGeneration()
     setLoading(false)
     loadingRef.current = false
     setReasoningVisible(false)
@@ -1754,6 +1889,7 @@ function StudioPageInner({
   const startStreamingGeneration = async (signal: BeginGenerationSignal, assistantId: string) => {
     const controller = new AbortController()
     generationAbortRef.current = controller
+    generationJobIdRef.current = null
 
     const genProgressId = (Date.now() + 2).toString()
 
@@ -1838,7 +1974,14 @@ function StudioPageInner({
           try {
             const event = JSON.parse(sseData)
 
-            if (event.type === 'database_created' && event.databaseId) {
+            if ((event.type === 'job_started' || event.type === 'database_created') && event.jobId && event.databaseId) {
+              generationJobIdRef.current = { jobId: event.jobId, databaseId: event.databaseId }
+              try {
+                localStorage.setItem(ACTIVE_GENERATION_KEY, JSON.stringify({ jobId: event.jobId, databaseId: event.databaseId, startedAt: Date.now() }))
+              } catch { /* ignore */ }
+            }
+
+            if ((event.type === 'job_started' || event.type === 'database_created') && event.databaseId) {
               // Update both React state AND the local closure variable so the
               // `complete` handler later in this same async function reads the
               // freshly-assigned id instead of the stale `currentDatabaseId`.
@@ -1918,7 +2061,9 @@ function StudioPageInner({
               ))
             }
 
-            if (event.type === 'complete') {
+            if (event.type === 'complete' || event.type === 'cancelled') {
+              clearActiveGeneration()
+              const isCancelled = event.type === 'cancelled'
               const durationSec = ((event.durationMs || 0) / 1000).toFixed(1)
               const totalRows = event.totalRows || 0
               const tablesGen = event.tablesGenerated || 0
@@ -1948,7 +2093,9 @@ function StudioPageInner({
                 setGeneratedData(accumulatedData)
               }
 
-              const finalMsg = `Generation complete — ${totalRows.toLocaleString()} rows across ${tablesGen} tables (${durationSec}s)`
+              const finalMsg = isCancelled
+                ? (event.message || 'Generation cancelled')
+                : `Generation complete — ${totalRows.toLocaleString()} rows across ${tablesGen} tables (${durationSec}s)`
 
               setGenerationProgress(prev => ({
                 ...prev,
@@ -1980,12 +2127,14 @@ function StudioPageInner({
               // Update database name
               if (signal.databaseName) setDatabaseName(signal.databaseName)
 
-              toast.success(`Database generated: ${totalRows.toLocaleString()} rows across ${tablesGen} tables`)
+              if (isCancelled) toast.info(event.message || 'Generation cancelled')
+              else toast.success(`Database generated: ${totalRows.toLocaleString()} rows across ${tablesGen} tables`)
               invalidateCache('/api/databases')
             }
 
             if (event.type === 'error') {
               const errorMsg = event.message || 'Generation failed'
+              if (!event.recoverable) clearActiveGeneration()
 
               setGenerationProgress(prev => ({
                 ...prev,
@@ -2023,6 +2172,14 @@ function StudioPageInner({
       setGenerationProgress(prev => ({ ...prev, isGenerating: false }))
     } catch (err) {
       if ((err as Error).name === 'AbortError') return
+
+      // Network drop after the job is known: the server keeps generating.
+      const knownDbId = generationJobIdRef.current?.databaseId
+      if (knownDbId) {
+        toast.info('Connection lost — generation continues on the server. Reconnecting…')
+        pollGeneration(knownDbId)
+        return
+      }
 
       const errorMsg = err instanceof Error ? err.message : 'Generation failed'
 
@@ -2456,15 +2613,37 @@ function StudioPageInner({
   }, [])
 
   return (
-    <div className="flex h-[calc(100vh-44px)] bg-background relative">
+    <div className={cn('flex h-[calc(100dvh-44px)] bg-background relative', isMobile && 'flex-col')}>
+      {isMobile && (
+        <div className="flex gap-1 p-1.5 border-b bg-card shrink-0">
+          <Button
+            size="sm"
+            variant={mobileView === 'chat' ? 'default' : 'outline'}
+            className="flex-1 h-9"
+            onClick={() => setMobileView('chat')}
+          >
+            Chat
+          </Button>
+          <Button
+            size="sm"
+            variant={mobileView === 'data' ? 'default' : 'outline'}
+            className="flex-1 h-9"
+            onClick={() => setMobileView('data')}
+          >
+            Data
+          </Button>
+        </div>
+      )}
       {/* ─── Left Panel: AI Chat (resizable) ─── */}
       {/* When the right panel is hidden the chat expands to full width. */}
       <div
         className={cn(
           'flex flex-col bg-background',
-          panelVisible ? 'border-r shrink-0' : 'flex-1 border-r-0'
+          isMobile
+            ? cn('w-full flex-1 min-h-0', mobileView !== 'chat' && 'hidden')
+            : panelVisible ? 'border-r shrink-0' : 'flex-1 border-r-0'
         )}
-        style={panelVisible ? { width: chatWidth } : undefined}
+        style={!isMobile && panelVisible ? { width: chatWidth } : undefined}
       >
         {/* Chat Header */}
         <div className="px-3 py-2.5 border-b flex items-center justify-between bg-card shrink-0">
@@ -2646,7 +2825,7 @@ function StudioPageInner({
             >
               <Keyboard className="h-3 w-3" />
             </Button>
-            {panelVisible && (
+            {panelVisible && !isMobile && (
               <Button
                 variant="ghost"
                 size="sm"
@@ -2899,7 +3078,7 @@ function StudioPageInner({
         </div>
 
         {/* Chat Input */}
-        <div className="px-2.5 py-2 border-t bg-card shrink-0">
+        <div className="px-2.5 py-2 border-t bg-card shrink-0 pb-[env(safe-area-inset-bottom)]">
           {/* Pulsing "AI is thinking..." indicator — shown above the input row
               while a generation is in flight so the user has clear feedback
               that the assistant is working (in addition to the typing dots
@@ -2935,14 +3114,14 @@ function StudioPageInner({
               placeholder={isLiveDbMode ? 'Ask me to edit, delete, drop, or query your live DB...' : 'Describe the data you need...'}
               disabled={loading || connectionLoading}
               rows={1}
-              className="flex-1 text-xs min-h-[32px] max-h-[72px] [field-sizing:fixed] resize-none border-0 bg-transparent focus-visible:ring-0 focus-visible:ring-offset-0 px-1.5 py-1.5 leading-snug"
+              className="flex-1 text-xs min-h-[32px] max-md:min-h-[36px] max-h-[72px] [field-sizing:fixed] resize-none border-0 bg-transparent focus-visible:ring-0 focus-visible:ring-offset-0 px-1.5 py-1.5 leading-snug"
             />
             {loading ? (
               <Button
                 onClick={handleStopGeneration}
                 size="sm"
                 variant="destructive"
-                className="h-8 w-8 p-0 shrink-0 hover:scale-105 transition-transform"
+                className="h-8 w-8 max-md:h-9 max-md:w-9 p-0 shrink-0 hover:scale-105 transition-transform"
                 title="Stop generation"
                 aria-label="Stop generation"
               >
@@ -2953,7 +3132,7 @@ function StudioPageInner({
                 onClick={() => sendMessage()}
                 disabled={!input.trim()}
                 size="sm"
-                className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white h-8 w-8 p-0 shrink-0 transition-transform hover:scale-105 disabled:scale-100 disabled:opacity-50"
+                className="bg-gradient-to-r from-amber-600 to-red-600 hover:from-amber-700 hover:to-red-700 text-white h-8 w-8 max-md:h-9 max-md:w-9 p-0 shrink-0 transition-transform hover:scale-105 disabled:scale-100 disabled:opacity-50"
                 aria-label="Send message"
               >
                 <Send className="h-3.5 w-3.5" />
@@ -2990,7 +3169,7 @@ function StudioPageInner({
 
       {/* ─── Resize Handle ─── */}
       {/* Hidden when the right panel is collapsed — there's nothing to resize. */}
-      {panelVisible && (
+      {panelVisible && !isMobile && (
         <div
           ref={resizeRef}
           className="w-1.5 cursor-col-resize bg-border hover:bg-amber-400 transition-colors shrink-0 active:bg-amber-500"
@@ -3001,8 +3180,8 @@ function StudioPageInner({
       {/* ─── Right Panel: Data/SQL/Explorer ─── */}
       {/* The entire panel (header + tabs) is unmounted when `panelVisible`
           is false so the chat column can take the full viewport width. */}
-      {panelVisible ? (
-        <div className="flex-1 flex flex-col min-w-0">
+      {rightPanelShown ? (
+        <div className={cn('flex-1 flex flex-col min-w-0', isMobile && 'w-full min-h-0')}>
         {/* Panel Header */}
         <div className="px-3 py-2 border-b flex items-center justify-between bg-card shrink-0">
           <div className="flex items-center gap-2 min-w-0">
@@ -3253,7 +3432,7 @@ function StudioPageInner({
         {hasGeneratedData ? (
           <Tabs value={activeTab} onValueChange={setActiveTab} className="flex flex-col flex-1 min-h-0">
             <div className="px-3 pt-1.5 border-b shrink-0">
-              <TabsList className="h-8">
+              <TabsList className={cn('h-8', isMobile && 'overflow-x-auto max-w-full justify-start')}>
                 <TabsTrigger value="data" className="text-[11px] gap-1 px-2.5">
                   <Table2 className="h-3 w-3" />
                   Data
@@ -4372,7 +4551,7 @@ function StudioPageInner({
 
       {/* Floating "Show Panel" button — only rendered when the right panel
           is collapsed. Anchored to the top-right of the studio container. */}
-      {!panelVisible && (
+      {!panelVisible && !isMobile && (
         <Button
           variant="outline"
           size="sm"

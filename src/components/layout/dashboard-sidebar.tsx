@@ -45,7 +45,7 @@ const toolLinks = [
   { href: '/dashboard/settings', label: 'Settings', icon: Settings },
 ]
 
-export function DashboardSidebar() {
+export function DashboardSidebar({ onNavigate }: { onNavigate?: () => void } = {}) {
   const pathname = usePathname()
   const { theme, setTheme } = useTheme()
   const { user, signOut } = useAuth()
@@ -61,6 +61,7 @@ export function DashboardSidebar() {
       <Link
         key={link.href}
         href={link.href}
+        onClick={onNavigate}
         className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all duration-150 ${
           isActive
             ? 'border-l-2 border-amber-500 bg-amber-50 dark:bg-amber-950/20 text-amber-700 dark:text-amber-400 pl-[10px]'
@@ -77,7 +78,7 @@ export function DashboardSidebar() {
     <div className="flex flex-col h-full w-64 border-r bg-card">
       {/* Logo Header */}
       <div className="p-4 border-b">
-        <Link href="/" className="flex items-center gap-2">
+        <Link href="/" onClick={onNavigate} className="flex items-center gap-2">
           <div className="h-8 w-8 rounded-lg bg-gradient-to-br from-amber-500 to-red-600 flex items-center justify-center">
             <Zap className="h-4 w-4 text-white" />
           </div>
@@ -91,7 +92,7 @@ export function DashboardSidebar() {
           asChild
           className="w-full h-9 bg-gradient-to-r from-amber-500 to-red-600 hover:from-amber-600 hover:to-red-700 text-white text-sm font-medium"
         >
-          <Link href="/dashboard/studio">
+          <Link href="/dashboard/studio" onClick={onNavigate}>
             <Plus className="h-4 w-4 mr-1.5" />
             New Database
           </Link>

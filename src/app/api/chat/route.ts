@@ -1,43 +1,26 @@
 import { NextRequest } from 'next/server'
+import { requireUser } from '@/lib/server/auth'
+import { enforceRateLimit } from '@/lib/server/rate-limit'
 
 // ─── DeepSeek v4 API configuration ───
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'
 const DEEPSEEK_REASONING_MODEL = process.env.DEEPSEEK_REASONING_MODEL || DEEPSEEK_MODEL
-const DEEPSEEK_MAX_TOKENS = parseInt(process.env.DEEPSEEK_MAX_TOKENS || '32000', 10)
+const DEEPSEEK_MAX_TOKENS = Number.parseInt(process.env.DEEPSEEK_MAX_TOKENS || '', 10) || 32000
 const DEEPSEEK_THINKING_ENABLED = process.env.DEEPSEEK_THINKING_ENABLED === 'true'
 const STREAM_THINKING_CONTENT = process.env.STREAM_THINKING_CONTENT === 'true'
 
-// ─── Rate limiter ───
-const chatRateLimiter = new Map<string, { count: number; resetAt: number }>()
-const CHAT_RATE_LIMIT = 30
-const CHAT_RATE_WINDOW = 60000
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
+export const maxDuration = 300
 
-let lastCleanup = Date.now()
-const CLEANUP_INTERVAL = 120000
+const UPSTREAM_HEADERS_TIMEOUT_MS = 60_000
+const UPSTREAM_IDLE_TIMEOUT_MS = 90_000
+const MAX_ACCUMULATOR_CHARS = 2_000_000
 
-function cleanup() {
-  const now = Date.now()
-  if (now - lastCleanup < CLEANUP_INTERVAL) return
-  lastCleanup = now
-  for (const [key, entry] of chatRateLimiter.entries()) {
-    if (now > entry.resetAt) chatRateLimiter.delete(key)
-  }
-}
-
-function checkRateLimit(clientId: string): boolean {
-  const key = `chat:${clientId}`
-  const now = Date.now()
-  const entry = chatRateLimiter.get(key)
-  if (!entry || now > entry.resetAt) {
-    chatRateLimiter.set(key, { count: 1, resetAt: now + CHAT_RATE_WINDOW })
-    return true
-  }
-  if (entry.count >= CHAT_RATE_LIMIT) return false
-  entry.count++
-  return true
-}
+const cleanLabel = (v: unknown): string =>
+  typeof v === 'string' ? v.replace(/[\r\n`]/g, ' ').slice(0, 100) : ''
 
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
@@ -276,16 +259,11 @@ function sanitizeAISignals(content: string): string {
 }
 
 export async function POST(request: NextRequest) {
-  cleanup()
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
 
-  const forwarded = request.headers.get('x-forwarded-for')
-  const clientId = forwarded ? forwarded.split(',')[0] : 'unknown'
-  if (!checkRateLimit(clientId)) {
-    return new Response(JSON.stringify({ error: 'Rate limit exceeded' }), {
-      status: 429,
-      headers: { 'Content-Type': 'application/json' },
-    })
-  }
+  const limited = enforceRateLimit(auth.userId, 'chat', 30)
+  if (limited) return limited
 
   try {
     const text = await request.text()
@@ -296,18 +274,32 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    const body = JSON.parse(text)
+    let body: unknown
+    try {
+      body = JSON.parse(text)
+    } catch {
+      return new Response(JSON.stringify({ error: 'Invalid JSON body' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+    if (!body || typeof body !== 'object') {
+      return new Response(JSON.stringify({ error: 'Invalid JSON body' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
     const {
       message,
       databaseId,
-      databaseName,
+      databaseName: rawDatabaseName,
       history = [],
       currentSchema,
       currentData,
       conversationId,
       connectionId,
-      connectionName,
-      connectionDialect,
+      connectionName: rawConnectionName,
+      connectionDialect: rawConnectionDialect,
     } = body as {
       message: string
       databaseId?: string
@@ -320,6 +312,9 @@ export async function POST(request: NextRequest) {
       connectionName?: string
       connectionDialect?: 'postgres' | 'mysql'
     }
+    const databaseName = cleanLabel(rawDatabaseName)
+    const connectionName = cleanLabel(rawConnectionName)
+    const connectionDialect = rawConnectionDialect === 'mysql' ? 'mysql' : 'postgres'
 
     if (!message || typeof message !== 'string') {
       return new Response(JSON.stringify({ error: 'Message is required' }), {
@@ -344,7 +339,7 @@ export async function POST(request: NextRequest) {
 
 You are connected to a LIVE external database:
 - Connection name: ${connectionName || '(unnamed)'}
-- Dialect: ${connectionDialect || 'postgres'}
+- Dialect: ${connectionDialect}
 
 ### CRITICAL: YOU HAVE DIRECT DATABASE ACCESS — ALL PERMISSIONS
 
@@ -555,7 +550,7 @@ When you need MORE metadata than what's provided, emit a query to get it:
         let tableCount = 0
         for (const [tableName, rows] of Object.entries(currentData)) {
           if (tableCount >= 25) break
-          if (Array.isArray(rows) && rows.length > 0) {
+          if (Array.isArray(rows) && rows.length > 0 && rows[0] != null) {
             let sampleStr = JSON.stringify(rows[0])
             if (sampleStr.length > 1000) sampleStr = sampleStr.slice(0, 1000) + '...(truncated)'
             systemPrompt += `\n- ${tableName}: ${sampleStr}`
@@ -573,6 +568,7 @@ When you need MORE metadata than what's provided, emit a query to get it:
       if (currentSchema && currentSchema.length > 0) {
         systemPrompt += `\n\n### Current Schema:`
         for (const table of currentSchema) {
+          if (!table || typeof table.name !== 'string' || !Array.isArray(table.columns)) continue
           systemPrompt += `\n- Table "${table.name}": ${table.columns.map(c => `${c.name}(${c.type})`).join(', ')}`
         }
       }
@@ -582,7 +578,7 @@ When you need MORE metadata than what's provided, emit a query to get it:
         for (const [tableName, rows] of Object.entries(currentData)) {
           if (Array.isArray(rows)) {
             systemPrompt += `\n- Table "${tableName}": ${rows.length} rows`
-            if (rows.length > 0) {
+            if (rows.length > 0 && rows[0] && typeof rows[0] === 'object') {
               const sampleRow = rows[0] as Record<string, unknown>
               systemPrompt += ` | Columns: ${Object.keys(sampleRow).join(', ')}`
             }
@@ -602,7 +598,7 @@ When you need MORE metadata than what's provided, emit a query to get it:
     const safeHistory: ChatMessage[] = Array.isArray(history)
       ? history.filter((msg): msg is ChatMessage =>
           msg !== null && typeof msg === 'object' &&
-          (msg.role === 'user' || msg.role === 'assistant' || msg.role === 'system') &&
+          (msg.role === 'user' || msg.role === 'assistant') &&
           typeof msg.content === 'string'
         )
       : []
@@ -633,14 +629,40 @@ When you need MORE metadata than what's provided, emit a query to get it:
       deepseekBody.thinking = { type: 'enabled' }
     }
 
-    const deepseekResponse = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
+    const upstreamAbort = new AbortController()
+    let timedOut = false
+    const abortUpstream = () => upstreamAbort.abort()
+    if (request.signal.aborted) abortUpstream()
+    else request.signal.addEventListener('abort', abortUpstream, { once: true })
+    const headersTimer = setTimeout(() => {
+      timedOut = true
+      abortUpstream()
+    }, UPSTREAM_HEADERS_TIMEOUT_MS)
+
+    let deepseekResponse: Response
+    try {
+      deepseekResponse = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
       },
       body: JSON.stringify(deepseekBody),
+      signal: upstreamAbort.signal,
     })
+    } catch (err) {
+      request.signal.removeEventListener('abort', abortUpstream)
+      if (timedOut) {
+        console.error('[Chat API] DeepSeek header timeout')
+        return new Response(JSON.stringify({
+          error: 'AI service timed out',
+          content: 'The AI service timed out. Please try again.',
+        }), { status: 504, headers: { 'Content-Type': 'application/json' } })
+      }
+      throw err
+    } finally {
+      clearTimeout(headersTimer)
+    }
 
     if (!deepseekResponse.ok) {
       const errorText = await deepseekResponse.text().catch(() => 'Unknown error')
@@ -661,6 +683,7 @@ When you need MORE metadata than what's provided, emit a query to get it:
     const reader = deepseekResponse.body?.getReader()
 
     if (!reader) {
+      abortUpstream()
       return new Response(JSON.stringify({ error: 'No response stream' }), {
         status: 500,
         headers: { 'Content-Type': 'application/json' },
@@ -681,7 +704,17 @@ When you need MORE metadata than what's provided, emit a query to get it:
         // Accumulate content so we can sanitize signals before emitting to the
         // frontend. We buffer incrementally and emit sanitized chunks.
         let contentAccumulator = ''
-        let lastEmittedLen = 0
+        let emittedSanitized = ''
+        let doneSent = false
+        let streamEnded = false
+        let idleTimer: ReturnType<typeof setTimeout> | undefined
+        const resetIdle = () => {
+          clearTimeout(idleTimer)
+          idleTimer = setTimeout(() => {
+            timedOut = true
+            abortUpstream()
+          }, UPSTREAM_IDLE_TIMEOUT_MS)
+        }
 
         const safeEnqueue = (data: Uint8Array) => {
           if (closed) return
@@ -691,46 +724,37 @@ When you need MORE metadata than what's provided, emit a query to get it:
             closed = true
           }
         }
+        const sendEvent = (obj: unknown) =>
+          safeEnqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`))
 
-        // Emit sanitized content delta. We only emit text that is "safe" —
-        // i.e. not part of an in-progress code fence that might be a signal.
-        // BUGFIX (BUG-70): The old code used lastIndexOf('```') which always
-        // finds the LAST fence, making closingFence always -1 by construction.
-        // This caused text after a closed ```sql...``` block to be stuck and
-        // never streamed. The fix uses fence PARITY (odd count = open fence).
-        const flushSafe = () => {
-          if (contentAccumulator.length <= lastEmittedLen) return
-          const pending = contentAccumulator.slice(lastEmittedLen)
-          // Count ``` delimiters — odd means a fence is still open
-          const fenceCount = (pending.match(/```/g) || []).length
-          if (fenceCount % 2 === 1) {
-            // Fence is still open — find the last ``` and emit only up to it
-            const lastOpenFence = pending.lastIndexOf('```')
-            if (lastOpenFence !== -1) {
-              const safe = pending.slice(0, lastOpenFence)
-              if (safe) {
-                safeEnqueue(encoder.encode(`data: ${JSON.stringify({
-                  type: 'content',
-                  content: safe,
-                })}\n\n`))
-              }
-              lastEmittedLen += lastOpenFence
-              return
-            }
+        // Emit the new suffix of the SANITIZED text. Text inside an open
+        // code fence is held back (fence parity on the raw accumulator).
+        // If sanitization changed already-emitted text (not a prefix
+        // extension), hold until the end, then emit past the common prefix.
+        const flushSafe = (final = false) => {
+          let raw = contentAccumulator
+          if (!final) {
+            const fences = (raw.match(/```/g) || []).length
+            if (fences % 2 === 1) raw = raw.slice(0, raw.lastIndexOf('```'))
           }
-          // No open fence (even count including 0) — emit everything
-          safeEnqueue(encoder.encode(`data: ${JSON.stringify({
-            type: 'content',
-            content: pending,
-          })}\n\n`))
-          lastEmittedLen = contentAccumulator.length
+          const s = sanitizeAISignals(raw)
+          let from = emittedSanitized.length
+          if (!s.startsWith(emittedSanitized)) {
+            if (!final) return
+            from = 0
+            while (from < s.length && from < emittedSanitized.length && s[from] === emittedSanitized[from]) from++
+          }
+          if (s.length > from) sendEvent({ type: 'content', content: s.slice(from) })
+          if (s.length >= from) emittedSanitized = s
         }
 
         try {
           while (true) {
-            if (clientCancelled) break
+            if (clientCancelled || streamEnded) break
+            resetIdle()
             const { done, value } = await reader.read()
             if (done) break
+            resetIdle()
 
             buffer += decoder.decode(value, { stream: true })
             const lines = buffer.split('\n')
@@ -742,24 +766,7 @@ When you need MORE metadata than what's provided, emit a query to get it:
 
               const data = trimmed.slice(6)
               if (data === '[DONE]') {
-                // Flush any remaining content, then send done
-                flushSafe()
-                // BUGFIX (BUG-70): Unconditionally flush any remaining unsent
-                // content on [DONE]. The old code only flushed if
-                // sanitizeAISignals() changed the text, which meant normal
-                // prose after a closed code block was silently lost.
-                const sanitized = sanitizeAISignals(contentAccumulator)
-                if (sanitized.length > lastEmittedLen) {
-                  const delta = sanitized.slice(lastEmittedLen)
-                  if (delta) {
-                    safeEnqueue(encoder.encode(`data: ${JSON.stringify({
-                      type: 'content',
-                      content: delta,
-                    })}\n\n`))
-                    lastEmittedLen = sanitized.length
-                  }
-                }
-                safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`))
+                streamEnded = true
                 continue
               }
 
@@ -781,6 +788,12 @@ When you need MORE metadata than what's provided, emit a query to get it:
                 // Handle main content (answer)
                 if (delta?.content) {
                   contentAccumulator += delta.content
+                  if (contentAccumulator.length > MAX_ACCUMULATOR_CHARS) {
+                    sendEvent({ type: 'truncated', message: 'Response exceeded the maximum length and was cut off.' })
+                    abortUpstream()
+                    streamEnded = true
+                    break
+                  }
                   flushSafe()
                 }
 
@@ -798,11 +811,11 @@ When you need MORE metadata than what's provided, emit a query to get it:
                       message: 'Response was cut off due to token limit. The SQL block may be incomplete.',
                     })}\n\n`))
                   }
-                  safeEnqueue(encoder.encode(`data: ${JSON.stringify({
+                  sendEvent({
                     type: 'finish',
                     reason: choice.finish_reason,
                     usage: parsed.usage || null,
-                  })}\n\n`))
+                  })
                 }
               } catch {
                 // Skip unparseable chunks
@@ -810,12 +823,25 @@ When you need MORE metadata than what's provided, emit a query to get it:
             }
           }
         } catch (err) {
-          console.error('[Chat API] Stream error:', err)
-          safeEnqueue(encoder.encode(`data: ${JSON.stringify({
-            type: 'error',
-            content: 'Stream interrupted',
-          })}\n\n`))
+          if (timedOut) {
+            console.error('[Chat API] Upstream stream timeout')
+            sendEvent({ type: 'error', content: 'The AI service timed out. Please try again.' })
+          } else if (!clientCancelled && !request.signal.aborted && !streamEnded) {
+            console.error('[Chat API] Stream error:', err)
+            sendEvent({ type: 'error', content: 'Stream interrupted' })
+          }
         } finally {
+          clearTimeout(idleTimer)
+          request.signal.removeEventListener('abort', abortUpstream)
+          try {
+            flushSafe(true)
+          } catch (err) {
+            console.error('[Chat API] Final flush error:', err)
+          }
+          if (!doneSent) {
+            doneSent = true
+            sendEvent({ type: 'done' })
+          }
           if (!closed) {
             try {
               controller.close()
@@ -827,6 +853,7 @@ When you need MORE metadata than what's provided, emit a query to get it:
       },
       async cancel() {
         clientCancelled = true
+        abortUpstream()
         try {
           await reader.cancel()
         } catch {

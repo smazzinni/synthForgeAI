@@ -36,6 +36,7 @@ export interface Database {
           role?: string
           updated_at?: string
         }
+        Relationships: []
       }
       synthetic_databases: {
         Row: {
@@ -72,6 +73,7 @@ export interface Database {
           status?: string
           updated_at?: string
         }
+        Relationships: []
       }
       conversations: {
         Row: {
@@ -99,6 +101,7 @@ export interface Database {
           status?: string
           updated_at?: string
         }
+        Relationships: []
       }
       messages: {
         Row: {
@@ -133,6 +136,7 @@ export interface Database {
           options?: Json | null
           metadata?: Json
         }
+        Relationships: []
       }
       datasets: {
         Row: {
@@ -158,6 +162,18 @@ export interface Database {
           row_count?: number
           quality_score?: number | null
         }
+        Update: {
+          id?: string
+          database_id?: string
+          name?: string
+          version?: number
+          format?: string
+          data_json?: Json
+          schema_json?: Json
+          row_count?: number
+          quality_score?: number | null
+        }
+        Relationships: []
       }
       api_keys: {
         Row: {
@@ -180,6 +196,16 @@ export interface Database {
           permissions?: Json
           expires_at?: string | null
         }
+        Update: {
+          id?: string
+          user_id?: string | null
+          name?: string
+          key_hash?: string
+          key_prefix?: string
+          permissions?: Json
+          expires_at?: string | null
+        }
+        Relationships: []
       }
       db_connections: {
         Row: {
@@ -231,10 +257,12 @@ export interface Database {
           error_message?: string | null
           updated_at?: string
         }
+        Relationships: []
       }
     }
-    Views: Record<string, never>
-    Functions: Record<string, never>
+    Views: { [_ in never]: never }
+    Functions: { [_ in never]: never }
+    CompositeTypes: { [_ in never]: never }
     Enums: {
       database_status: 'draft' | 'generating' | 'ready' | 'error'
       conversation_status: 'active' | 'archived' | 'error'

@@ -436,7 +436,7 @@ export default function DatabaseConnectionsPage() {
   return (
     <div className="p-4 md:p-8 max-w-7xl mx-auto">
       {/* Header */}
-      <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-6 gap-3">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-6 gap-3">
         <div>
           <h1 className="text-2xl md:text-3xl font-bold flex items-center gap-2">
             <PlugZap className="h-7 w-7 text-amber-600" />
@@ -453,7 +453,7 @@ export default function DatabaseConnectionsPage() {
               New Connection
             </Button>
           </DialogTrigger>
-          <DialogContent className="max-w-lg">
+          <DialogContent className="max-w-lg max-h-[90dvh] overflow-y-auto">
             <DialogHeader>
               <DialogTitle>{editingId ? 'Edit Connection' : 'New Database Connection'}</DialogTitle>
               <DialogDescription>
@@ -527,7 +527,7 @@ export default function DatabaseConnectionsPage() {
               </div>
 
               {/* Host & Port */}
-              <div className="grid grid-cols-3 gap-3">
+              <div className="grid grid-cols-1 min-[420px]:grid-cols-3 gap-3">
                 <div className="col-span-2 space-y-1.5">
                   <Label htmlFor="host">Host</Label>
                   <Input
@@ -653,7 +653,7 @@ export default function DatabaseConnectionsPage() {
       </div>
 
       {/* Stats summary */}
-      <div className="grid grid-cols-3 gap-3 mb-6">
+      <div className="grid grid-cols-1 min-[360px]:grid-cols-3 gap-3 mb-6">
         <Card>
           <CardContent className="pt-4 pb-4">
             <div className="flex items-center gap-3">

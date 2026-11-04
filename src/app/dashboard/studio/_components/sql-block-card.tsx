@@ -21,14 +21,8 @@ import { isDestructiveSQL } from '@/lib/ai-agents'
 // When a block fails, shows a Retry button + an error-recovery hint so
 // the user (or the autonomous agent loop) can re-run with adjustments.
 
-export interface SqlBlockResult {
-  ok: boolean
-  message: string
-  rowCount?: number
-  affectedRows?: number
-  rows?: Record<string, unknown>[]
-  columns?: string[]
-}
+import type { SqlBlockResult } from '../_lib/types'
+export type { SqlBlockResult }
 
 export function SqlBlockCard({
   sql,

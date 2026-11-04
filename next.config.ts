@@ -1,30 +1,34 @@
 import type { NextConfig } from "next";
 
+const securityHeaders = [
+  { key: 'X-Content-Type-Options', value: 'nosniff' },
+  { key: 'X-Frame-Options', value: 'DENY' },
+  { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
+  { key: 'Permissions-Policy', value: 'camera=(), microphone=(), geolocation=()' },
+  { key: 'Strict-Transport-Security', value: 'max-age=63072000; includeSubDomains; preload' },
+];
+
 const nextConfig: NextConfig = {
-  // Skip TypeScript errors during build — the codebase has pre-existing
-  // type mismatches in the Supabase generic typing that don't affect runtime.
+  // Type errors now fail the build (the codebase type-checks cleanly).
   typescript: {
-    ignoreBuildErrors: true,
+    ignoreBuildErrors: false,
   },
-  reactStrictMode: false,
-  allowedDevOrigins: ['.space-z.ai', '.space-chatglm.site', 'localhost', '127.0.0.1'],
+  reactStrictMode: true,
+  poweredByHeader: false,
+  // Native/DB drivers and the SQL engine must not be bundled by webpack/turbopack.
+  serverExternalPackages: ['pg', 'mysql2', 'alasql'],
   async headers() {
     return [
-      {
-        source: '/api/:path*',
-        headers: [
-          { key: 'Access-Control-Allow-Origin', value: '*' },
-          { key: 'Access-Control-Allow-Methods', value: 'GET, POST, PATCH, DELETE, OPTIONS' },
-          { key: 'Access-Control-Allow-Headers', value: 'Content-Type, Authorization' },
-        ],
-      },
+      // API is same-origin only: no wildcard CORS (cookies carry the session).
+      { source: '/api/:path*', headers: [{ key: 'Cache-Control', value: 'no-store' }] },
+      { source: '/:path*', headers: securityHeaders },
     ]
   },
   images: {
     unoptimized: true,
   },
   compiler: {
-    removeConsole: process.env.NODE_ENV === 'production' ? { exclude: ['error', 'warn'] } : false,
+    removeConsole: process.env.NODE_ENV === 'production' ? { exclude: ['error', 'warn', 'log'] } : false,
   },
 };
 
