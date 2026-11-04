@@ -71,7 +71,7 @@ function toCsv(rows: Row[], schema?: TableSchema): string {
 }
 
 const xmlEscape = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-  // eslint-disable-next-line no-control-regex
+   
   .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
 
 /** Excel-native SpreadsheetML workbook (one worksheet per table). */

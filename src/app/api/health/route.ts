@@ -29,9 +29,13 @@ export async function GET() {
   const ai: Check = process.env.DEEPSEEK_API_KEY ? 'ok' : 'not_configured'
   const auth: Check = isAuthRequired() ? 'ok' : 'not_configured'
 
+  const encryption: 'ok' | 'missing' | 'not_configured' = process.env.CONNECTION_ENCRYPTION_KEY
+    ? 'ok'
+    : process.env.NODE_ENV === 'production' ? 'missing' : 'not_configured'
+
   const status = storage.status === 'error'
     ? 'unhealthy'
-    : ai !== 'ok' ? 'degraded' : 'healthy'
+    : ai !== 'ok' || encryption === 'missing' ? 'degraded' : 'healthy'
 
   return NextResponse.json(
     {
@@ -39,7 +43,7 @@ export async function GET() {
       timestamp: new Date().toISOString(),
       version: process.env.npm_package_version || process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) || 'dev',
       uptime: Math.round(process.uptime()),
-      checks: { storage: storage.status, storageBackend: storage.backend, ai, auth },
+      checks: { storage: storage.status, storageBackend: storage.backend, ai, auth, encryption },
     },
     { status: status === 'unhealthy' ? 503 : 200, headers: { 'Cache-Control': 'no-store' } },
   )

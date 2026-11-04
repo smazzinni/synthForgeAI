@@ -43,6 +43,15 @@ describe('request auth', () => {
     expect(isCrossSiteWrite(req({ method: 'GET', headers: { origin: 'https://evil.example', host: 'app.test' } }))).toBe(false)
   })
 
+  it('accepts the configured public URL and allow-listed origins behind a proxy', () => {
+    process.env['NEXT_PUBLIC_APP_URL'] = 'https://synthforge.up.railway.app'
+    process.env.ALLOWED_ORIGINS = 'https://admin.example.com, https://staging.example.com'
+    const post = (origin: string) => req({ method: 'POST', headers: { origin, host: '10.0.0.5:3000' } })
+    expect(isCrossSiteWrite(post('https://synthforge.up.railway.app'))).toBe(false)
+    expect(isCrossSiteWrite(post('https://staging.example.com'))).toBe(false)
+    expect(isCrossSiteWrite(post('https://evil.example'))).toBe(true)
+  })
+
   it('auth mode: explicit flag wins, otherwise required only in production', () => {
     process.env.AUTH_REQUIRED = 'true'
     expect(isAuthRequired()).toBe(true)

@@ -23,7 +23,7 @@ INSERT INTO "Order Details" (note) VALUES ('x');
 INSERT INTO sales.leads (source) VALUES ('web');
 SQL
 
-mysql -h 127.0.0.1 -uroot ${MYSQL_ROOT_PWD:+-p"$MYSQL_ROOT_PWD"} <<'SQL'
+MYSQL_PWD="$MYSQL_ROOT_PWD" mysql -h 127.0.0.1 -uroot <<'SQL'
 DROP DATABASE IF EXISTS shop;
 CREATE DATABASE shop;
 CREATE USER IF NOT EXISTS 'app'@'%' IDENTIFIED BY 'apppass';

@@ -665,7 +665,7 @@ function StudioPageInner({
       if (!urlDbId) setCurrentDatabaseId(saved.databaseId)
       pollGeneration(saved.databaseId)
     } catch { /* ignore */ }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, [])
 
   // Detach from in-flight requests on unmount (the server keeps generating).

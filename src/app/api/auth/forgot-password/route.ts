@@ -24,7 +24,7 @@ export async function POST(request: NextRequest) {
       await db.passwordResetToken.create({
         data: { userId: user.id, tokenHash: hashResetToken(token), expiresAt: new Date(Date.now() + RESET_TTL_MS) },
       })
-      const origin = process.env.NEXT_PUBLIC_APP_URL || request.nextUrl.origin
+      const origin = process.env['NEXT_PUBLIC_APP_URL'] || request.nextUrl.origin
       const link = `${origin}/forgot-password?token=${encodeURIComponent(token)}`
       const how = await sendMail(email, 'Reset your SynthForge AI password',
         `Someone asked to reset the password for ${email}.\n\nOpen this link within one hour to choose a new password:\n${link}\n\nIf this wasn't you, ignore this email.`)

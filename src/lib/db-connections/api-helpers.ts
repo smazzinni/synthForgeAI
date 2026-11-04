@@ -1,8 +1,6 @@
 import type { NextRequest } from 'next/server'
 import type { DbConnectionInput, DbDialect } from './types'
 
-// ─── Default user id (matches the convention used by /api/databases) ───
-export const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
 
 /**
  * Validate a connection input body. Returns either the validated input

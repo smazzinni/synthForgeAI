@@ -49,12 +49,24 @@ export function isCrossSiteWrite(request: NextRequest): boolean {
   if (['GET', 'HEAD', 'OPTIONS'].includes(request.method)) return false
   const origin = request.headers.get('origin')
   if (!origin) return false // non-browser clients
+  let originHost: string
   try {
-    const host = request.headers.get('x-forwarded-host') || request.headers.get('host')
-    return new URL(origin).host !== host
+    originHost = new URL(origin).host
   } catch {
     return true
   }
+  // Behind proxies (Railway, Vercel, Nginx) Host and X-Forwarded-Host can
+  // differ from the public domain, so accept any of them plus the configured
+  // public URL and an explicit allow-list.
+  const allowed = new Set<string>()
+  for (const h of [request.headers.get('host'), request.headers.get('x-forwarded-host'), request.nextUrl.host]) {
+    if (h) for (const part of h.split(',')) allowed.add(part.trim())
+  }
+  for (const url of [process.env['NEXT_PUBLIC_APP_URL'], ...(process.env.ALLOWED_ORIGINS || '').split(',')]) {
+    if (!url?.trim()) continue
+    try { allowed.add(new URL(url.trim()).host) } catch { /* ignore malformed entries */ }
+  }
+  return !allowed.has(originHost)
 }
 
 /** Resolve the caller. Returns null only when auth is required and missing/invalid. */
