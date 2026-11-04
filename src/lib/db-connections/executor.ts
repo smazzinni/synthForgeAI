@@ -432,7 +432,21 @@ export async function fetchExternalSchema(conn: DbConnectionRecord): Promise<Sch
        ORDER BY t.table_name, c.ordinal_position`,
       [schemaName],
     )
-    return groupRowsByTable(rows)
+    const tables = groupRowsByTable(rows)
+    try {
+      const fk = await pool.query(
+        `SELECT kcu.table_name, kcu.column_name, ccu.table_name AS ref_table, ccu.column_name AS ref_column
+           FROM information_schema.table_constraints tc
+           JOIN information_schema.key_column_usage kcu
+             ON kcu.constraint_name = tc.constraint_name AND kcu.table_schema = tc.table_schema
+           JOIN information_schema.constraint_column_usage ccu
+             ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+          WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = $1`,
+        [schemaName],
+      )
+      annotateForeignKeys(tables, fk.rows)
+    } catch { /* FK metadata is optional */ }
+    return tables
   }
 
   // MySQL
@@ -454,7 +468,29 @@ export async function fetchExternalSchema(conn: DbConnectionRecord): Promise<Sch
   const rows = Array.isArray(resultRows) && Array.isArray(resultRows[0]) && !resultRows[0]?.table_name
     ? (resultRows[0] as Record<string, unknown>[])
     : resultRows
-  return groupRowsByTable(rows)
+  const tables = groupRowsByTable(rows)
+  try {
+    const fkRaw = (await pool.query(
+      `SELECT TABLE_NAME AS table_name, COLUMN_NAME AS column_name,
+              REFERENCED_TABLE_NAME AS ref_table, REFERENCED_COLUMN_NAME AS ref_column
+         FROM information_schema.KEY_COLUMN_USAGE
+        WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL`,
+      [conn.database],
+    )) as unknown as Record<string, unknown>[]
+    const fkRows = Array.isArray(fkRaw) && Array.isArray(fkRaw[0]) ? (fkRaw[0] as Record<string, unknown>[]) : fkRaw
+    annotateForeignKeys(tables, fkRows)
+  } catch { /* FK metadata is optional */ }
+  return tables
+}
+
+/** Mark each column with its real foreign key ('table.column') or null. */
+function annotateForeignKeys(tables: SchemaTable[], fkRows: Record<string, unknown>[]): void {
+  const map = new Map<string, string>()
+  for (const r of fkRows) {
+    const t = String(r.table_name ?? r.TABLE_NAME), c = String(r.column_name ?? r.COLUMN_NAME)
+    map.set(`${t}.${c}`, `${String(r.ref_table ?? r.REF_TABLE)}.${String(r.ref_column ?? r.REF_COLUMN)}`)
+  }
+  for (const t of tables) for (const c of t.columns) c.references = map.get(`${t.name}.${c.name}`) ?? null
 }
 
 function groupRowsByTable(rows: Record<string, unknown>[]): SchemaTable[] {

@@ -51,7 +51,8 @@ export function toSafeRecord(rec: DbConnectionRecord): SafeDbConnectionRecord {
 
 export interface SchemaTable {
   name: string
-  columns: Array<{ name: string; type: string; is_nullable?: boolean; is_primary?: boolean }>
+  /** references: 'table.column' for a real foreign key, null when the catalog says it isn't one */
+  columns: Array<{ name: string; type: string; is_nullable?: boolean; is_primary?: boolean; references?: string | null }>
 }
 
 export interface ExecuteResult {

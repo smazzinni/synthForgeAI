@@ -17,6 +17,7 @@ import {
   type GenerationJob,
 } from '@/lib/server/generation-jobs'
 import { expandDataset } from '@/lib/server/data-expander'
+import { applyPrivacy, privacyMaskingEnabled } from '@/lib/server/data-privacy'
 import { dependencyOrder, relationshipsFor, repairDataset, type IntegrityReport } from '@/lib/server/data-integrity'
 
 // ─── Streaming Database Generation API ───
@@ -454,6 +455,14 @@ async function runGeneration(job: GenerationJob, fullReq: GenerationRequest, see
       emit(job, { type: 'progress', table: '', message: `Quality Analyst: ${describeFixes(report)}`, totalInserted: generatedThisRun, targetRows: totalTarget })
     }
     emit(job, { type: 'progress', table: '', message: 'Saving…', totalInserted: generatedThisRun, targetRows: totalTarget })
+  }
+
+  // ─── Privacy Officer: no values that could belong to real people ───
+  if (!job.cancelRequested && generatedThisRun > 0 && privacyMaskingEnabled()) {
+    const { data: masked, report: pr } = applyPrivacy(allTableData as Record<string, Record<string, unknown>[]>)
+    for (const t of req.schema) allTableData[t.name] = masked[t.name] || []
+    const parts = [pr.emails && `${pr.emails} real-provider email${pr.emails === 1 ? '' : 's'}`, pr.ssns && `${pr.ssns} SSN${pr.ssns === 1 ? '' : 's'}`, pr.cards && `${pr.cards} card number${pr.cards === 1 ? '' : 's'}`].filter(Boolean)
+    emit(job, { type: 'progress', table: '', message: parts.length ? `Privacy Officer: anonymised ${parts.join(', ')}` : 'Privacy Officer: no personal data patterns found', totalInserted: generatedThisRun, targetRows: totalTarget })
   }
 
   await persist(true)
