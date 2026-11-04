@@ -171,7 +171,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       rows: result.rows,
       columns: result.columns,
-      rowCount: result.rows.length,
+      rowCount: result.totalRows ?? result.rows.length,
+      truncated: result.truncated || undefined,
       affectedRows: result.affectedRows,
       executionTime,
       sql: trimmedSql,
@@ -194,6 +195,8 @@ interface SqlExecResult {
   dataAfter: Record<string, unknown[]>
   schemaAfter?: Array<{ name: string; columns: Array<{ name: string; type: string }> }>
   error?: string
+  totalRows?: number
+  truncated?: boolean
 }
 
 function executeSQLAgainstData(

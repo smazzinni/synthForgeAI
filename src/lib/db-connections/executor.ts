@@ -741,3 +741,64 @@ export async function executeSqlOnExternalConnection(userId: string, connectionI
   }
   return executeSql(conn, sql)
 }
+
+/**
+ * One page of a live table, with the exact total row count — used by the
+ * studio's Data tab so large tables are browsed server-side instead of being
+ * loaded into the browser.
+ */
+export async function fetchTablePage(
+  conn: DbConnectionRecord,
+  tableName: string,
+  opts: { offset?: number; limit?: number; sort?: string; dir?: 'asc' | 'desc' } = {},
+): Promise<{ rows: Record<string, unknown>[]; columns: string[]; total: number; offset: number; limit: number }> {
+  const offset = Math.max(0, Math.floor(opts.offset ?? 0))
+  const limit = Math.min(1000, Math.max(1, Math.floor(opts.limit ?? 100)))
+  const dir = opts.dir === 'desc' ? 'DESC' : 'ASC'
+  const entry = await getPool(conn)
+
+  if (entry.dialect === 'postgres') {
+    const q = (id: string) => `"${id.replace(/"/g, '""')}"`
+    const target = `${q(conn.schema || 'public')}.${q(tableName)}`
+    const order = opts.sort ? ` ORDER BY ${q(opts.sort)} ${dir} NULLS LAST` : ''
+    const pool = entry.pool as { query: (text: string, values?: unknown[]) => Promise<{ rows: Record<string, unknown>[]; fields?: Array<{ name: string }> }> }
+    const [page, count] = await Promise.all([
+      pool.query(`SELECT * FROM ${target}${order} LIMIT $1 OFFSET $2`, [limit, offset]),
+      pool.query(`SELECT COUNT(*)::bigint AS n FROM ${target}`),
+    ])
+    return {
+      rows: page.rows,
+      columns: page.fields?.map(f => f.name) ?? (page.rows[0] ? Object.keys(page.rows[0]) : []),
+      total: Number(count.rows[0]?.n ?? 0),
+      offset,
+      limit,
+    }
+  }
+
+  const q = (id: string) => '`' + id.replace(/`/g, '``') + '`'
+  const order = opts.sort ? ` ORDER BY ${q(opts.sort)} ${dir}` : ''
+  const pool = entry.pool as { query: (sql: string, values?: unknown[]) => Promise<unknown> }
+  const [pageRaw, countRaw] = await Promise.all([
+    pool.query(`SELECT * FROM ${q(tableName)}${order} LIMIT ? OFFSET ?`, [limit, offset]),
+    pool.query(`SELECT COUNT(*) AS n FROM ${q(tableName)}`),
+  ])
+  const rows = (Array.isArray(pageRaw) ? pageRaw[0] : pageRaw) as Record<string, unknown>[]
+  const fields = (Array.isArray(pageRaw) ? pageRaw[1] : []) as Array<{ name: string }>
+  const countRows = (Array.isArray(countRaw) ? countRaw[0] : countRaw) as Array<{ n: number | string }>
+  return {
+    rows,
+    columns: fields?.length ? fields.map(f => f.name) : (rows[0] ? Object.keys(rows[0]) : []),
+    total: Number(countRows[0]?.n ?? 0),
+    offset,
+    limit,
+  }
+}
+
+/** Exact row counts for up to `max` tables (−1 when a count fails). */
+export async function fetchTableCounts(conn: DbConnectionRecord, tables: string[], max = 100): Promise<Record<string, number>> {
+  const out: Record<string, number> = {}
+  await Promise.all(tables.slice(0, max).map(async t => {
+    try { out[t] = (await fetchTablePage(conn, t, { limit: 1 })).total } catch { out[t] = -1 }
+  }))
+  return out
+}

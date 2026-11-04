@@ -79,7 +79,15 @@ export async function GET(request: NextRequest) {
     if (id) {
       const database = await getDatabase(auth.userId, id)
       if (!database) return NextResponse.json({ error: 'Database not found' }, { status: 404 })
-      return NextResponse.json({ database }, { headers: { 'Cache-Control': 'no-store' } })
+      // ?preview=N trims each table to its first N rows (large datasets are then
+      // browsed page by page via /api/databases/:id/rows) and adds table_counts.
+      const preview = Number(request.nextUrl.searchParams.get('preview') || 0)
+      const tableCounts = Object.fromEntries(Object.entries(database.data_json || {}).map(([t, rows]) => [t, Array.isArray(rows) ? rows.length : 0]))
+      if (preview > 0) {
+        const trimmed = Object.fromEntries(Object.entries(database.data_json || {}).map(([t, rows]) => [t, Array.isArray(rows) ? rows.slice(0, preview) : []]))
+        return NextResponse.json({ database: { ...database, data_json: trimmed, table_counts: tableCounts, truncated: Object.values(tableCounts).some(n => n > preview) } }, { headers: { 'Cache-Control': 'no-store' } })
+      }
+      return NextResponse.json({ database: { ...database, table_counts: tableCounts } }, { headers: { 'Cache-Control': 'no-store' } })
     }
     const databases = await listDatabases(auth.userId)
     return NextResponse.json({ databases }, { headers: { 'Cache-Control': 'no-store' } })

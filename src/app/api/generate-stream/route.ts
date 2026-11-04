@@ -16,6 +16,7 @@ import {
   streamJob,
   type GenerationJob,
 } from '@/lib/server/generation-jobs'
+import { expandDataset } from '@/lib/server/data-expander'
 
 // ─── Streaming Database Generation API ───
 // POST   starts a generation job and streams its progress (SSE).
@@ -29,7 +30,7 @@ import {
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
-export const maxDuration = 800
+export const maxDuration = 300 // Vercel plan ceiling; Railway/Docker have no limit
 
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'
@@ -37,9 +38,11 @@ const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'
 const DEEPSEEK_MAX_TOKENS = Number.parseInt(process.env.DEEPSEEK_MAX_TOKENS || '', 10) || 32000
 
 const MAX_TABLES = 30
-const MAX_ROWS_PER_TABLE = 5000
-const MAX_TOTAL_ROWS = 20000
-const PERSIST_INTERVAL_MS = 2500     // write progress to storage at most this often
+const MAX_ROWS_PER_TABLE = 100_000
+const MAX_TOTAL_ROWS = 250_000
+/** Rows per table the AI writes itself; the rest are synthesised locally from them. */
+const SEED_ROWS_PER_TABLE = Number.parseInt(process.env.GENERATION_SEED_ROWS || '', 10) || 200
+const PERSIST_INTERVAL_MS = 2500     // write progress to storage at most this often (scaled up for big datasets)
 const PROGRESS_INTERVAL_MS = 300     // emit progress events at most this often
 const UPSTREAM_IDLE_TIMEOUT_MS = 120_000
 const MAX_CONTINUATION_ROUNDS = 3
@@ -246,15 +249,22 @@ async function streamCompletion(
 }
 
 // ─── The worker ───
-async function runGeneration(job: GenerationJob, req: GenerationRequest, seed: Record<string, unknown[]>): Promise<void> {
+async function runGeneration(job: GenerationJob, fullReq: GenerationRequest, seed: Record<string, unknown[]>): Promise<void> {
   const startTime = Date.now()
+  // Phase 1 asks the AI for at most SEED_ROWS_PER_TABLE rows per table;
+  // phase 2 scales each table up to the requested count locally.
+  const finalCounts = fullReq.rowCounts
+  const req: GenerationRequest = {
+    ...fullReq,
+    rowCounts: Object.fromEntries(Object.entries(finalCounts).map(([t, n]) => [t, Math.min(n, SEED_ROWS_PER_TABLE)])),
+  }
   const allTableData: Record<string, unknown[]> = {}
   for (const [t, rows] of Object.entries(seed)) if (Array.isArray(rows)) allTableData[t] = [...rows]
   const existingRowCount = countRows(allTableData)
   const baseline: Record<string, number> = Object.fromEntries(req.schema.map(t => [t.name, allTableData[t.name]?.length || 0]))
   const stillTrying = new Set(req.schema.map(t => t.name))
   const knownTables = new Set(req.schema.map(t => t.name))
-  const totalTarget = Object.values(req.rowCounts).reduce((s, n) => s + n, 0)
+  const totalTarget = Object.values(finalCounts).reduce((s, n) => s + n, 0)
 
   let currentTable = ''
   let generatedThisRun = 0
@@ -289,7 +299,9 @@ async function runGeneration(job: GenerationJob, req: GenerationRequest, seed: R
       targetRows: currentTable ? req.rowCounts[currentTable] || 0 : totalTarget,
       message,
     })
-    if (now - lastPersist >= PERSIST_INTERVAL_MS) {
+    // Persisting rewrites the whole dataset, so slow down for big ones.
+    const interval = PERSIST_INTERVAL_MS * Math.max(1, Math.ceil(generatedThisRun / 20_000))
+    if (now - lastPersist >= interval) {
       lastPersist = now
       void persist()
     }
@@ -381,6 +393,29 @@ async function runGeneration(job: GenerationJob, req: GenerationRequest, seed: R
         : (err instanceof Error ? err.message : 'Generation failed'))
       return
     }
+  }
+
+  // ─── Phase 2: scale up to the requested row counts ───
+  const needsExpansion = !job.cancelRequested && req.schema.some(t => generatedFor(t.name) > 0 && generatedFor(t.name) < finalCounts[t.name])
+  if (needsExpansion) {
+    const bigTarget = Object.values(finalCounts).reduce((s, n) => s + n, 0)
+    emit(job, { type: 'progress', table: '', message: `Scaling up to ${bigTarget.toLocaleString()} rows from the AI-generated sample…`, totalInserted: generatedThisRun, targetRows: totalTarget })
+    const newRows: Record<string, unknown[]> = {}
+    for (const t of req.schema) newRows[t.name] = (allTableData[t.name] || []).slice(baseline[t.name] || 0)
+    const expanded = expandDataset(
+      req.schema,
+      newRows as Record<string, Record<string, unknown>[]>,
+      Object.fromEntries(req.schema.map(t => [t.name, newRows[t.name].length > 0 ? finalCounts[t.name] : 0])),
+      { seed: startTime },
+    )
+    for (const t of req.schema) {
+      const before = generatedFor(t.name)
+      const existing = (allTableData[t.name] || []).slice(0, baseline[t.name] || 0)
+      allTableData[t.name] = [...existing, ...(expanded[t.name] || [])]
+      generatedThisRun += generatedFor(t.name) - before
+      emit(job, { type: 'table_complete', table: t.name, totalRows: allTableData[t.name].length })
+    }
+    emit(job, { type: 'progress', table: '', message: 'Saving…', totalInserted: generatedThisRun, targetRows: totalTarget })
   }
 
   await persist(true)
