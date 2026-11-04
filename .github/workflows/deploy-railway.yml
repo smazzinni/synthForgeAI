@@ -1,0 +1,43 @@
+name: Deploy to Railway
+
+# Deploys `main` to Railway after CI passes.
+# Setup (once): Railway → Project → Settings → Tokens → create a project token,
+# then in GitHub → Settings → Secrets and variables → Actions:
+#   secret   RAILWAY_TOKEN    = <project token>
+#   variable RAILWAY_SERVICE  = <service name or id>   (e.g. synthforge)
+# Alternatively connect the repo in Railway's UI for automatic deploys and
+# delete this workflow.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: railway-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+    steps:
+      - name: Check configuration
+        id: cfg
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "::warning::RAILWAY_TOKEN secret is not set — skipping deploy."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.cfg.outputs.skip != 'true'
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - name: Deploy
+        if: steps.cfg.outputs.skip != 'true'
+        run: npx --yes @railway/cli@latest up --ci --service "${{ vars.RAILWAY_SERVICE || 'synthforge' }}" -m "${{ github.sha }}"

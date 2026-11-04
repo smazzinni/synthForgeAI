@@ -34,7 +34,7 @@ let dbCounter = 0
 /** Strip Postgres/MySQL-isms AlaSQL doesn't understand but which don't change meaning. */
 export function normaliseDialect(sql: string): string {
   return sql
-    .replace(/::\s*[a-zA-Z_][\w ]*(\[\])?/g, '')                         // ::type casts
+    .replace(/::\s*(?:double\s+precision|character\s+varying|timestamp\s+with(?:out)?\s+time\s+zone|[a-zA-Z_]\w*)(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?(?:\[\])?/gi, '') // ::type casts
     .replace(/\bILIKE\b/gi, 'LIKE')
     .replace(/\bgen_random_uuid\(\)|\buuid_generate_v4\(\)/gi, 'NEWID()')
     .replace(/\bNOW\(\)|\bCURRENT_TIMESTAMP\b/gi, 'NOW()')

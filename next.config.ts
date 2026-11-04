@@ -9,6 +9,8 @@ const securityHeaders = [
 ];
 
 const nextConfig: NextConfig = {
+  // Self-contained server bundle for Docker / Railway (.next/standalone).
+  output: 'standalone',
   // Type errors now fail the build (the codebase type-checks cleanly).
   typescript: {
     ignoreBuildErrors: false,
