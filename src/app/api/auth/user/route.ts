@@ -1,105 +1,71 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import { db } from '@/lib/db'
+import { requireUser, extractSessionToken } from '@/lib/server/auth'
+import { hashPassword, passwordProblem, verifyPassword } from '@/lib/server/password'
+import { clearedSessionCookie, revokeAllSessions } from '@/lib/server/session'
+import { limited, publicUser, readJsonBody } from '@/lib/server/auth-http'
 
-// Lightweight user info endpoint — uses admin client with cookie-based token extraction
-// instead of the heavy SSR client approach that creates a new server instance per request.
-function extractAccessToken(request: NextRequest): string | null {
-  // Try multiple cookie name patterns that Supabase uses
-  const authCookies = request.cookies.getAll().filter(c =>
-    c.name.includes('auth-token') ||
-    c.name.startsWith('sb-') ||
-    c.name.includes('-auth-token')
-  )
-
-  for (const cookie of authCookies) {
-    try {
-      const cookieValue = decodeURIComponent(cookie.value)
-      // Try parsing as JSON first (newer Supabase format)
-      try {
-        const parsed = JSON.parse(cookieValue)
-        if (parsed?.access_token) return parsed.access_token
-      } catch {
-        // Not JSON - might be the access token directly
-        if (cookieValue.startsWith('eyJ')) return cookieValue
-      }
-    } catch {
-      continue
-    }
-  }
-  return null
+// GET    → { user }
+// PATCH  { name? } | { currentPassword, newPassword } → { user }
+//        (changing the password signs out all other sessions)
+// DELETE { password } → deletes the account and all its sessions
+async function signedIn(request: NextRequest) {
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+  if (!auth.authenticated) return NextResponse.json({ error: 'Sign in to manage your account' }, { status: 401 })
+  const user = await db.user.findUnique({ where: { id: auth.userId } })
+  if (!user) return NextResponse.json({ error: 'Account not found' }, { status: 404 })
+  return user
 }
 
 export async function GET(request: NextRequest) {
-  try {
-    const accessToken = extractAccessToken(request)
-
-    if (!accessToken) {
-      return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
-    }
-
-    const admin = getSupabaseAdmin()
-    if (!admin) {
-      return NextResponse.json({ error: 'Auth service not configured' }, { status: 503 })
-    }
-
-    // Verify the token with Supabase admin
-    const { data: { user }, error } = await admin.auth.getUser(accessToken)
-
-    if (error || !user) {
-      return NextResponse.json({ error: 'Invalid or expired token' }, { status: 401 })
-    }
-
-    return NextResponse.json({
-      user: {
-        id: user.id,
-        email: user.email,
-        full_name: user.user_metadata?.full_name || user.email?.split('@')[0],
-        role: 'owner',
-      },
-    })
-  } catch (err) {
-    console.error('[Auth User API] Error:', err)
-    return NextResponse.json({ error: 'Authentication failed' }, { status: 401 })
-  }
+  const user = await signedIn(request)
+  if (user instanceof Response) return user
+  return NextResponse.json({ user: publicUser(user) })
 }
 
 export async function PATCH(request: NextRequest) {
-  try {
-    const accessToken = extractAccessToken(request)
+  const user = await signedIn(request)
+  if (user instanceof Response) return user
+  const body = await readJsonBody(request)
+  if (!body) return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
 
-    if (!accessToken) {
-      return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
-    }
-
-    const admin = getSupabaseAdmin()
-    if (!admin) {
-      return NextResponse.json({ error: 'Auth service not configured' }, { status: 503 })
-    }
-
-    const { data: { user }, error } = await admin.auth.getUser(accessToken)
-    if (error || !user) {
-      return NextResponse.json({ error: 'Invalid or expired token' }, { status: 401 })
-    }
-
-    const body = await request.json() as { name?: string; avatarUrl?: string }
-
-    // Update user metadata
-    if (body.name) {
-      await admin.auth.admin.updateUserById(user.id, {
-        user_metadata: { full_name: body.name },
-      })
-    }
-
-    return NextResponse.json({
-      user: {
-        id: user.id,
-        email: user.email,
-        full_name: body.name || user.user_metadata?.full_name || user.email?.split('@')[0],
-        role: 'owner',
-      },
-    })
-  } catch (err) {
-    console.error('[Auth User PATCH] Error:', err)
-    return NextResponse.json({ error: 'Update failed' }, { status: 500 })
+  const data: { name?: string | null; passwordHash?: string } = {}
+  if (body.name !== undefined) {
+    if (body.name !== null && typeof body.name !== 'string') return NextResponse.json({ error: 'name must be a string' }, { status: 400 })
+    data.name = typeof body.name === 'string' ? body.name.trim().slice(0, 100) || null : null
   }
+  if (body.newPassword !== undefined) {
+    const tooMany = limited([[`pwchange:${user.id}`, 5, 15 * 60_000]])
+    if (tooMany) return tooMany
+    if (typeof body.currentPassword !== 'string' || !(await verifyPassword(body.currentPassword, user.passwordHash))) {
+      return NextResponse.json({ error: 'Current password is incorrect' }, { status: 400 })
+    }
+    const problem = passwordProblem(body.newPassword)
+    if (problem) return NextResponse.json({ error: problem }, { status: 400 })
+    data.passwordHash = await hashPassword(body.newPassword as string)
+  }
+  if (Object.keys(data).length === 0) return NextResponse.json({ error: 'Nothing to update' }, { status: 400 })
+
+  const updated = await db.user.update({ where: { id: user.id }, data })
+  if (data.passwordHash) await revokeAllSessions(user.id, extractSessionToken(request) ?? undefined)
+  return NextResponse.json({ user: publicUser(updated) })
+}
+
+export async function DELETE(request: NextRequest) {
+  const user = await signedIn(request)
+  if (user instanceof Response) return user
+  const body = await readJsonBody(request)
+  if (typeof body?.password !== 'string' || !(await verifyPassword(body.password, user.passwordHash))) {
+    return NextResponse.json({ error: 'Password is incorrect' }, { status: 400 })
+  }
+  await db.$transaction([
+    db.syntheticDatabase.deleteMany({ where: { userId: user.id } }),
+    db.conversation.deleteMany({ where: { userId: user.id } }),
+    db.dbConnection.deleteMany({ where: { userId: user.id } }),
+    db.user.delete({ where: { id: user.id } }),
+  ])
+  const res = NextResponse.json({ success: true })
+  res.cookies.set(clearedSessionCookie())
+  return res
 }

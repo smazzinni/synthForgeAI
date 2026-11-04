@@ -54,7 +54,7 @@ jobs:
           HOSTNAME: 127.0.0.1
 
   e2e-live-db:
-    name: E2E (live Postgres + MySQL connections)
+    name: E2E (auth, generation, live Postgres + MySQL)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     services:
@@ -93,6 +93,10 @@ jobs:
         env:
           PG_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
           MYSQL_ROOT_PWD: root
+      - name: Start mock AI
+        run: (node e2e/mock-ai.mjs > mock-ai.log 2>&1 &)
+        env:
+          MOCK_AI_PORT: 4600
       - name: Start server (auth required, private hosts allowed for the test DBs)
         run: |
           cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/
@@ -102,9 +106,15 @@ jobs:
           PORT: 3000
           HOSTNAME: 127.0.0.1
           AUTH_REQUIRED: "true"
-          SUPABASE_JWT_SECRET: e2e-secret
           CONNECTION_ENCRYPTION_KEY: e2e-key
           ALLOW_PRIVATE_DB_HOSTS: "true"
+          INSECURE_COOKIES: "true"
+          DEEPSEEK_API_KEY: test
+          DEEPSEEK_BASE_URL: http://127.0.0.1:4600
+      - name: Run generation edge cases (disconnects, stop, messy AI output, scale-up integrity)
+        run: node e2e/generation.mjs
+        env:
+          BASE: http://127.0.0.1:3000
       - name: Run live-DB scenarios
         run: node e2e/live-db.mjs
         env:
@@ -112,6 +122,40 @@ jobs:
       - name: Server log
         if: failure()
         run: tail -200 server.log
+
+  package-managers:
+    name: Install & test with ${{ matrix.pm }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        pm: [yarn, pnpm, bun]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        if: matrix.pm == 'bun'
+      - name: Enable yarn / pnpm
+        if: matrix.pm != 'bun'
+        run: npm install -g ${{ matrix.pm == 'yarn' && 'yarn@1' || 'pnpm@10' }}
+      - name: Install (without the npm lockfile)
+        run: |
+          rm -f package-lock.json
+          case "${{ matrix.pm }}" in
+            yarn) yarn install --non-interactive ;;
+            pnpm) pnpm install ;;
+            bun)  bun install ;;
+          esac
+      - name: Type-check and unit tests
+        run: |
+          case "${{ matrix.pm }}" in
+            yarn) yarn tsc --noEmit && yarn test ;;
+            pnpm) pnpm exec tsc --noEmit && pnpm test ;;
+            bun)  bunx tsc --noEmit && bun run test ;;
+          esac
 
   docker:
     runs-on: ubuntu-latest

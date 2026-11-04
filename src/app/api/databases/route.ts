@@ -10,6 +10,7 @@ import {
   updateDatabase,
   type SyntheticDatabasePatch,
 } from '@/lib/server/synthetic-store'
+import { getActiveJobForDatabase } from '@/lib/server/generation-jobs'
 
 // ─── Synthetic databases CRUD ───
 // GET    /api/databases            → { databases }   (list, without row data)
@@ -22,6 +23,7 @@ import {
 export const dynamic = 'force-dynamic'
 
 const MAX_BODY_CHARS = 5_000_000
+const STALE_GENERATION_MS = 5 * 60 * 1000
 const VALID_STATUS = new Set(['draft', 'generating', 'ready', 'error', 'archived'])
 
 async function readJson(request: NextRequest): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; res: Response }> {
@@ -77,8 +79,16 @@ export async function GET(request: NextRequest) {
   const id = request.nextUrl.searchParams.get('id')
   try {
     if (id) {
-      const database = await getDatabase(auth.userId, id)
+      let database = await getDatabase(auth.userId, id)
       if (!database) return NextResponse.json({ error: 'Database not found' }, { status: 404 })
+      // A job that died with its server (crash, redeploy) leaves the record in
+      // 'generating' forever. Running jobs persist progress every few seconds,
+      // so no job here + no update for STALE_MS means it was interrupted:
+      // keep the rows saved so far and mark it ready.
+      if (database.status === 'generating' && !getActiveJobForDatabase(auth.userId, id) &&
+          Date.now() - Date.parse(database.updated_at) > STALE_GENERATION_MS) {
+        database = (await updateDatabase(auth.userId, id, { status: 'ready' }).then(() => getDatabase(auth.userId, id))) ?? database
+      }
       // ?preview=N trims each table to its first N rows (large datasets are then
       // browsed page by page via /api/databases/:id/rows) and adds table_counts.
       const preview = Number(request.nextUrl.searchParams.get('preview') || 0)

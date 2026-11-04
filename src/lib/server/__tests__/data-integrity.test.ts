@@ -94,3 +94,16 @@ describe('dependencyOrder', () => {
     expect(names.indexOf('products')).toBeLessThan(names.indexOf('order_items'))
   })
 })
+
+describe('repairDataset — null foreign keys', () => {
+  it('fills null non-self FKs but keeps null self-references (tree roots)', () => {
+    const t = [
+      { name: 'users', columns: [{ name: 'id', type: 'int' }] },
+      { name: 'orders', columns: [{ name: 'id', type: 'int' }, { name: 'user_id', type: 'int' }] },
+      { name: 'categories', columns: [{ name: 'id', type: 'int' }, { name: 'parent_id', type: 'int references categories(id)' }] },
+    ]
+    const { data } = repairDataset(t, { users: [{ id: 1 }, { id: 2 }], orders: [{ id: 1, user_id: null }], categories: [{ id: 1, parent_id: null }] })
+    expect([1, 2]).toContain(data.orders[0].user_id)
+    expect(data.categories[0].parent_id).toBeNull()
+  })
+})

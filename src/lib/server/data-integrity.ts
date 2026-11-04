@@ -197,8 +197,10 @@ export function repairDataset(
       let dangling = 0
       rows.forEach((r, i) => {
         const v = r[col]
-        if (v == null) return
-        if (!parentById.has(v)) {
+        // Self-references may be null (tree roots); other FKs in generated
+        // data must point at a parent.
+        if (v == null && parent === name) return
+        if (v == null || !parentById.has(v)) {
           dangling++
           const candidates = parent === name ? parentIds.filter(id => id !== r.id) : parentIds
           r[col] = candidates.length ? candidates[fnv1a(`${name}:${col}:${i}`) % candidates.length] : null

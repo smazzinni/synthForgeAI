@@ -271,6 +271,7 @@ async function runGeneration(job: GenerationJob, fullReq: GenerationRequest, see
   const baseline: Record<string, number> = Object.fromEntries(req.schema.map(t => [t.name, allTableData[t.name]?.length || 0]))
   const stillTrying = new Set(req.schema.map(t => t.name))
   const knownTables = new Set(req.schema.map(t => t.name))
+  const columnsByTable = new Map(req.schema.map(t => [t.name, t.columns.map(c => c.name)]))
   const totalTarget = Object.values(finalCounts).reduce((s, n) => s + n, 0)
 
   let currentTable = ''
@@ -335,11 +336,22 @@ async function runGeneration(job: GenerationJob, fullReq: GenerationRequest, see
       return
     }
     if (!currentTable) return
+    // Rows for tables that aren't in the schema are dropped (model drift).
+    if (!knownTables.has(currentTable)) return
     // Ignore surplus rows beyond what was requested for this table.
     if (generatedFor(currentTable) >= (req.rowCounts[currentTable] ?? Infinity)) return
     try {
-      const record = JSON.parse(line)
-      if (record && typeof record === 'object' && !Array.isArray(record)) {
+      const parsed = JSON.parse(line)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        // Keep exactly the table's declared columns; a row sharing none of
+        // them belongs to another table (model drift) and is dropped.
+        const cols = columnsByTable.get(currentTable) || []
+        let record: Record<string, unknown> = parsed
+        if (cols.length > 0) {
+          const overlap = cols.filter(c => c in parsed).length
+          if (overlap < Math.min(2, cols.length)) { malformed++; return }
+          record = Object.fromEntries(cols.map(c => [c, parsed[c] ?? null]))
+        }
         ;(allTableData[currentTable] ||= []).push(record)
         generatedThisRun++
         progress()
@@ -539,6 +551,7 @@ export async function DELETE(request: NextRequest) {
     ? getJob(auth.userId, jobId)
     : databaseId ? getActiveJobForDatabase(auth.userId, databaseId) : null
   if (!job) return json({ error: 'No running generation found' }, 404)
+  if (job.status !== 'running') return json({ error: `Generation already ${job.status}` }, 409)
   cancelJob(job)
   return json({ success: true })
 }

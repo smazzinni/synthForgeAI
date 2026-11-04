@@ -1,4 +1,4 @@
-// Mock data for dev mode when Supabase tables aren't set up yet
+// Mock data for dev mode when the database is not set up yet
 
 export const mockUser = {
   id: 'dev-user-id',

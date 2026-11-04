@@ -3,7 +3,7 @@
  *
  * A DbConnection represents a user-supplied external database that
  * SynthForge AI connects to LIVE (as opposed to the synthetic databases
- * stored in the app's own Supabase).
+ * stored in the app database).
  */
 
 export type DbDialect = 'postgres' | 'mysql'

@@ -2,8 +2,8 @@
 
 import { Suspense, useState, useEffect, useRef } from 'react'
 import Link from 'next/link'
-import { useRouter, useSearchParams } from 'next/navigation'
-import { useAuth } from '@/hooks/use-auth'
+import { useSearchParams } from 'next/navigation'
+import { useAuth, safeNext } from '@/hooks/use-auth'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -12,7 +12,6 @@ import { Zap, Loader2, AlertCircle, Eye, EyeOff } from 'lucide-react'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 
 function LoginForm() {
-  const router = useRouter()
   const searchParams = useSearchParams()
   const { signIn, user, loading: authLoading } = useAuth()
   const [email, setEmail] = useState('')
@@ -21,7 +20,7 @@ function LoginForm() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const hasRedirected = useRef(false)
-  const redirect = searchParams.get('redirect') || '/dashboard'
+  const redirect = safeNext(searchParams.get('next'))
 
   // If user is already authenticated, redirect once
   useEffect(() => {
@@ -39,33 +38,12 @@ function LoginForm() {
     setError(null)
 
     try {
-      const result = await signIn(email, password)
-      const error = result.error as { message?: string } | null
+      const { error } = await signIn(email, password)
       if (error) {
-        const message = error.message || String(error)
-        if (message.includes('Invalid login credentials')) {
-          setError('Invalid email or password. Please try again.')
-        } else if (message.includes('Email not confirmed')) {
-          setError('Please check your email and confirm your account before signing in.')
-        } else if (message.includes('Too many requests')) {
-          setError('Too many login attempts. Please wait a moment and try again.')
-        } else if (message.includes('rate limit')) {
-          setError('Too many login attempts. Please wait a moment and try again.')
-        } else {
-          setError(message)
-        }
+        setError(error.message)
         setLoading(false)
-      } else {
-        // Auth state will update, the useEffect will handle redirect
-        // But also do a hard redirect after a short delay as a fallback
-        // to ensure Supabase cookies are properly set
-        setTimeout(() => {
-          if (!hasRedirected.current) {
-            hasRedirected.current = true
-            window.location.href = redirect
-          }
-        }, 500)
       }
+      // On success the user state updates and the effect above redirects.
     } catch {
       setError('An unexpected error occurred. Please try again.')
       setLoading(false)

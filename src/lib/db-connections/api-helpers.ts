@@ -5,40 +5,6 @@ import type { DbConnectionInput, DbDialect } from './types'
 export const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
 
 /**
- * Extract the authenticated user's id from Supabase auth cookies.
- * Falls back to DEFAULT_USER_ID when no session is present (matches
- * the behaviour of /api/databases so the app works in local/dev mode
- * without auth).
- */
-export function getUserIdFromCookies(request: NextRequest): string {
-  try {
-    const supabaseCookies = request.cookies.getAll().filter(c => c.name.includes('-auth-token'))
-    for (const cookie of supabaseCookies) {
-      try {
-        const rawValue = decodeURIComponent(cookie.value)
-        let accessToken: string | null = null
-        try {
-          const parsed = JSON.parse(rawValue)
-          accessToken = parsed?.access_token || null
-        } catch {
-          accessToken = rawValue
-        }
-        if (!accessToken) continue
-        const parts = accessToken.split('.')
-        if (parts.length !== 3) continue
-        const payload = JSON.parse(atob(parts[1]))
-        if (payload?.sub) return payload.sub as string
-      } catch {
-        continue
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return DEFAULT_USER_ID
-}
-
-/**
  * Validate a connection input body. Returns either the validated input
  * or an error message suitable for returning to the client.
  */

@@ -1,18 +1,8 @@
 /**
  * Prisma-backed durable store for synthetic databases & conversations.
  *
- * This is the production-grade persistence layer. It uses Prisma + SQLite
- * (configured in prisma/schema.prisma) to survive server restarts — unlike
- * the in-memory store which resets when the process restarts.
- *
- * Strategy:
- *   1. Try Supabase (if configured) — for multi-instance production
- *   2. Try Prisma (always available — SQLite is bundled) — durable
- *   3. Fall back to in-memory (src/lib/in-memory-store.ts) — hot-reload safe
- *
- * This module is the Prisma layer. The route handlers in
- * /api/databases and /api/conversations call these functions when Supabase
- * is not available.
+ * Durable persistence layer (Prisma + PostgreSQL). The in-memory store
+ * (src/lib/in-memory-store.ts) is the fallback when Prisma is unavailable.
  */
 
 import { db } from '@/lib/db'

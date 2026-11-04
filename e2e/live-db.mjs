@@ -1,12 +1,16 @@
-import { createHmac } from 'node:crypto'
 const B = process.env.BASE || 'http://localhost:3142'
-const b64 = o => Buffer.from(JSON.stringify(o)).toString('base64url')
-const tok = sub => { const h = b64({ alg: 'HS256', typ: 'JWT' }), p = b64({ sub, email: sub + '@t.io', exp: Math.floor(Date.now() / 1000) + 3600 }); return `${h}.${p}.${createHmac('sha256', 'e2e-secret').update(`${h}.${p}`).digest('base64url')}` }
-const ALICE = tok('11111111-1111-1111-1111-111111111111'), BOB = tok('22222222-2222-2222-2222-222222222222')
+const RUN = Date.now()
+const PW = 'e2e-password-1'
+async function register(tag, password = PW) {
+  const r = await fetch(B + '/api/auth/register', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: `e2e-${tag}-${RUN}@example.com`, password, name: tag }) })
+  const m = (r.headers.getSetCookie?.() || []).join(';').match(/sf_session=([^;]+)/)
+  return { status: r.status, email: `e2e-${tag}-${RUN}@example.com`, token: m ? m[1] : null }
+}
+const ALICE = (await register('alice')).token, BOB = (await register('bob')).token
 let pass = 0, fail = 0
 const check = (name, ok, extra = '') => { ok ? pass++ : fail++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok ? '' : '  ' + extra}`) }
 async function api(method, path, body, token = ALICE) {
-  const r = await fetch(B + path, { method, headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: body === undefined ? undefined : (typeof body === 'string' ? body : JSON.stringify(body)) })
+  const r = await fetch(B + path, { method, headers: { 'content-type': 'application/json', ...(token ? { cookie: `sf_session=${token}` } : {}) }, body: body === undefined ? undefined : (typeof body === 'string' ? body : JSON.stringify(body)) })
   const text = await r.text(); let json; try { json = JSON.parse(text) } catch { json = text }
   return { status: r.status, json, headers: r.headers }
 }
@@ -19,7 +23,37 @@ const engines = [
 
 // ─── auth ───
 check('no token → 401', (await api('GET', '/api/connections', undefined, null)).status === 401)
-check('forged token → 401', (await api('GET', '/api/connections', undefined, ALICE.slice(0, -3) + 'abc')).status === 401)
+check('forged token → 401', (await api('GET', '/api/connections', undefined, Math.random().toString(36).slice(2).repeat(6))).status === 401)
+
+// ─── auth scenarios ───
+{
+  const post = (path, body, token) => api('POST', path, body, token)
+  const em = `e2e-auth-${RUN}@example.com`
+  check('register: bad email → 400', (await post('/api/auth/register', { email: 'nope', password: PW })).status === 400)
+  check('register: short password → 400', (await post('/api/auth/register', { email: em, password: 'short' })).status === 400)
+  const reg = await post('/api/auth/register', { email: em, password: PW })
+  check('register: ok → 201', reg.status === 201 && reg.json.user?.email === em, JSON.stringify(reg.json))
+  check('register: duplicate email → 409', (await post('/api/auth/register', { email: em, password: PW })).status === 409)
+  check('login: wrong password → 401', (await post('/api/auth/login', { email: em, password: 'wrong-password' })).status === 401)
+  const l1 = await post('/api/auth/login', { email: em, password: PW })
+  const t1 = l1.json.token
+  check('login: ok returns token', l1.status === 200 && !!t1, JSON.stringify(l1.json))
+  const sess = await api('GET', '/api/auth/session', undefined, t1)
+  check('session: authenticated', sess.json.authenticated === true && sess.json.user?.email === em, JSON.stringify(sess.json))
+  const t2 = (await post('/api/auth/login', { email: em, password: PW })).json.token
+  check('logout: ok', (await post('/api/auth/logout', {}, t1)).status === 200)
+  check('logout: old token rejected', (await api('GET', '/api/connections', undefined, t1)).status === 401)
+  check('logout: other session still valid', (await api('GET', '/api/connections', undefined, t2)).status === 200)
+  const t3 = (await post('/api/auth/login', { email: em, password: PW })).json.token
+  const NEWPW = 'e2e-password-2'
+  const ch = await api('PATCH', '/api/auth/user', { currentPassword: PW, newPassword: NEWPW }, t2)
+  check('password change: ok', ch.status === 200, JSON.stringify(ch.json))
+  check('password change: other session signed out', (await api('GET', '/api/connections', undefined, t3)).status === 401)
+  check('password change: current session kept', (await api('GET', '/api/connections', undefined, t2)).status === 200)
+  check('password change: new password logs in', (await post('/api/auth/login', { email: em, password: NEWPW })).status === 200)
+  check('forgot-password: unknown email → ok', (await post('/api/auth/forgot-password', { email: `nobody-${RUN}@example.com` })).json.ok === true)
+  check('reset-password: bad token → 400', (await post('/api/auth/reset-password', { token: 'bogus-token', password: 'whatever-123' })).status === 400)
+}
 
 for (const e of engines) {
   const D = e.dialect
@@ -95,7 +129,7 @@ for (const e of engines) {
 
   // ─── export live DB ───
   for (const format of ['sql', 'csv', 'json', 'xlsx']) {
-    const r = await fetch(B + '/api/export', { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${ALICE}` }, body: JSON.stringify({ connectionId: id, format }) })
+    const r = await fetch(B + '/api/export', { method: 'POST', headers: { 'content-type': 'application/json', cookie: `sf_session=${ALICE}` }, body: JSON.stringify({ connectionId: id, format }) })
     const t = await r.text()
     const ok = r.status === 200 && (format === 'sql' ? /CREATE TABLE IF NOT EXISTS "customers"/.test(t) && /INSERT INTO "orders"/.test(t)
       : format === 'json' ? JSON.parse(t).customers?.length >= 2

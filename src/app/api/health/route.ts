@@ -1,5 +1,4 @@
 import { NextResponse } from 'next/server'
-import { getSupabaseAdmin } from '@/lib/supabase/admin'
 import { db } from '@/lib/db'
 import { isAuthRequired } from '@/lib/server/auth'
 
@@ -16,16 +15,7 @@ async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return Promise.race([p, new Promise<T>((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))])
 }
 
-async function checkStorage(): Promise<{ backend: 'supabase' | 'prisma'; status: Check }> {
-  const admin = getSupabaseAdmin()
-  if (admin) {
-    try {
-      const { error } = await withTimeout(Promise.resolve(admin.from('synthetic_databases').select('id').limit(1)), 3000)
-      return { backend: 'supabase', status: error ? 'error' : 'ok' }
-    } catch {
-      return { backend: 'supabase', status: 'error' }
-    }
-  }
+async function checkStorage(): Promise<{ backend: 'prisma'; status: Check }> {
   try {
     await withTimeout(db.$queryRawUnsafe('SELECT 1'), 3000)
     return { backend: 'prisma', status: 'ok' }
@@ -37,11 +27,9 @@ async function checkStorage(): Promise<{ backend: 'supabase' | 'prisma'; status:
 export async function GET() {
   const storage = await checkStorage()
   const ai: Check = process.env.DEEPSEEK_API_KEY ? 'ok' : 'not_configured'
-  const auth: Check = isAuthRequired()
-    ? (process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? 'ok' : 'error')
-    : 'not_configured'
+  const auth: Check = isAuthRequired() ? 'ok' : 'not_configured'
 
-  const status = storage.status === 'error' || auth === 'error'
+  const status = storage.status === 'error'
     ? 'unhealthy'
     : ai !== 'ok' ? 'degraded' : 'healthy'
 

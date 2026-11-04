@@ -2,14 +2,13 @@ import { NextRequest, NextResponse } from 'next/server'
 import { requireUser } from '@/lib/server/auth'
 import { getDatabase, updateDatabase, countRows } from '@/lib/server/synthetic-store'
 import { runSyntheticSql } from '@/lib/server/synthetic-sql'
-import { getSupabaseAdmin } from '@/lib/supabase/admin'
 import { executeSqlOnExternalConnection } from '@/lib/db-connections/executor'
 import { isDestructiveSQL, stripSqlComments } from '@/lib/ai-agents'
 import { needsConfirmation } from '@/lib/db-connections/confirm'
 
 // ─── SQL Execution API ───
 // Executes SQL against either:
-//   (a) the app's synthetic database record stored in Supabase, OR
+//   (a) the app's synthetic database record stored in the app database, OR
 //   (b) a live external Postgres/MySQL connection the user has saved, OR
 //   (c) client-side in-memory data (when no DB id or connection is supplied)
 //
@@ -241,7 +240,7 @@ function executeSQLAgainstData(
       columns: ['message', 'type'],
       affectedRows: result.affectedRows,
       // BUGFIX (BUG-32): only mark as mutated if rows actually changed,
-      // otherwise we persist an identical data_json back to Supabase.
+      // otherwise we persist an identical data_json back to the store.
       mutated: result.affectedRows > 0,
       dataAfter: dataCopy,
       schemaAfter: schema,

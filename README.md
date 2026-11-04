@@ -38,7 +38,7 @@ that asks good questions before it acts.
 | **Live databases** | Connect PostgreSQL- or MySQL-compatible databases (Supabase, Neon, RDS/Aurora, Railway, Render, CockroachDB, PlanetScale, MariaDB, TiDB…). Run **every** statement type from the SQL tab or the AI chat; destructive statements ask for confirmation first; multi-statement SQL runs in one transaction and rolls back on error. |
 | **Data & Explorer tabs** | Server-side paging, sorting and filtering for tables with millions of rows; exact row counts; ER diagram of tables and relationships. |
 | **Export** | SQL dump, CSV, JSON or Excel — for generated databases *and* connected live databases, whole database or a single table. |
-| **Accounts** | Supabase Auth (email/password); every record is scoped to its owner. A single-user demo mode works with zero setup. |
+| **Accounts** | Built-in email/password accounts (sessions in PostgreSQL, httpOnly cookie, password reset by email); every record is scoped to its owner. A single-user demo mode works with zero setup. |
 | **Mobile** | Responsive layout with a drawer sidebar and a Chat / Data toggle in the studio. |
 
 ## How it works
@@ -54,7 +54,7 @@ Next.js API routes (Node runtime)
   ├─ /api/sql/execute ──────► AlaSQL engine over the stored JSON dataset
   ├─ /api/connections/* ────► pg / mysql2 pools ─► YOUR database (transactions, confirmation)
   ├─ /api/export ───────────► SQL / CSV / JSON / Excel
-  └─ storage: Supabase  →  Prisma (PostgreSQL)  →  in-memory (dev fallback)
+  └─ storage: Prisma (PostgreSQL)  →  in-memory (dev fallback)
 ```
 
 ## Quick start (local)
@@ -74,6 +74,20 @@ npm run dev                     # http://localhost:3000
 Without `DATABASE_URL` the app still runs (in-memory storage), and without `DEEPSEEK_API_KEY`
 everything except AI chat/generation works.
 
+### Package managers
+
+The repo ships an npm lockfile, but works with any of them — CI installs and tests with yarn, pnpm and bun too:
+
+| | install | dev server | tests | migrations |
+|---|---|---|---|---|
+| npm / npx | `npm ci` | `npm run dev` | `npm test` | `npx prisma migrate deploy` |
+| yarn | `yarn install` | `yarn dev` | `yarn test` | `yarn prisma migrate deploy` |
+| pnpm | `pnpm install` | `pnpm dev` | `pnpm test` | `pnpm prisma migrate deploy` |
+| bun | `bun install` | `bun run dev` | `bun run test` | `bunx prisma migrate deploy` |
+
+`package.json` lists the dependencies allowed to run install scripts (`trustedDependencies` for bun,
+`pnpm.onlyBuiltDependencies` for pnpm) so the Prisma engines install everywhere.
+
 ## Configuration
 
 All settings are environment variables (see [`.env.example`](.env.example)).
@@ -86,11 +100,10 @@ All settings are environment variables (see [`.env.example`](.env.example)).
 | `DEEPSEEK_BASE_URL` | no | Override the API base URL (OpenAI-compatible endpoints). |
 | `DEEPSEEK_MAX_TOKENS` | no | Max tokens per AI call (default 32000). |
 | `CONNECTION_ENCRYPTION_KEY` | **production** | Encrypts saved external-database passwords (AES-256-GCM). `openssl rand -base64 32`. |
-| `NEXT_PUBLIC_AUTH_ENABLED` | for accounts | `true` turns on Supabase login in the UI. Build-time value. |
-| `AUTH_REQUIRED` | no | Runtime switch for the API (`true`/`false`); overrides the build-time flag on the server. |
-| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` | for accounts | Supabase project (browser login). |
-| `SUPABASE_SERVICE_KEY` | optional | Use Supabase tables as storage instead of Prisma. |
-| `SUPABASE_JWT_SECRET` | recommended with auth | Verifies session tokens locally (no network round-trip). |
+| `AUTH_REQUIRED` | no | Runtime switch (`true`/`false`). Unset: login required in production, single-user demo mode in development. |
+| `NEXT_PUBLIC_APP_URL` | for reset emails | Public URL of the app; used to build password-reset links. |
+| `SMTP_URL`, `MAIL_FROM` | for reset emails | SMTP server and from-address for password-reset emails. Without SMTP the link is only logged (and returned in development). |
+| `INSECURE_COOKIES` | no | `true` only for http-only staging; drops the `Secure` flag from the session cookie. |
 | `GENERATION_SEED_ROWS` | no | Rows per table the AI writes before the expander takes over (default 200). |
 | `DB_SSL_REJECT_UNAUTHORIZED` | no | `true` to verify TLS certificates of external databases. |
 | `ALLOW_PRIVATE_DB_HOSTS` | no | `true` to allow connections to private/internal addresses in production (blocked by default). |
@@ -107,9 +120,11 @@ Everything — the app **and** its PostgreSQL database — runs on Railway.
    DATABASE_URL=${{Postgres.DATABASE_URL}}
    CONNECTION_ENCRYPTION_KEY=<openssl rand -base64 32>
    DEEPSEEK_API_KEY=<your key>
-   # optional accounts:
-   NEXT_PUBLIC_AUTH_ENABLED=true
-   NEXT_PUBLIC_SUPABASE_URL=…  NEXT_PUBLIC_SUPABASE_ANON_KEY=…  SUPABASE_JWT_SECRET=…
+   AUTH_REQUIRED=true
+   NEXT_PUBLIC_APP_URL=https://<your-domain>
+   # optional, for password-reset emails:
+   SMTP_URL=smtps://user:pass@smtp.example.com:465
+   MAIL_FROM="SynthForge <no-reply@example.com>"
    ```
 4. *Settings* → *Networking* → **Generate Domain** (port 3000).
 
@@ -130,6 +145,33 @@ docker compose up --build
 
 **Vercel** works for the UI and APIs, but serverless time limits (≤300 s) cap how long a single
 generation job can run; very large generations and long-lived DB pools are better on Railway/Docker.
+
+## How data stays correct across tables
+
+Every generation goes through the same pipeline, so related tables always line up:
+
+1. **Dependency order** — tables are sorted parents-first from their foreign keys (`orders.user_id → users`),
+   and the AI is told each relationship explicitly.
+2. **Strict parsing** — rows for tables that aren't in the schema, rows whose columns don't match the
+   table, broken JSON lines and markdown noise are dropped; each row is reduced to the declared columns.
+3. **Quality Analyst repair** ([`data-integrity.ts`](src/lib/server/data-integrity.ts)) — before and after
+   scaling up:
+   - missing/duplicate primary keys get new ids;
+   - foreign keys that point nowhere (or are empty) are re-pointed to an existing parent row;
+     self-references (e.g. `categories.parent_id`) may stay empty for root rows;
+   - child timestamps are moved after their parent's `created_at`;
+   - numbers / booleans / dates are coerced to their declared types;
+   - unique-looking columns (email, username, slug, sku…) are de-duplicated case-insensitively.
+   The share of cells that needed no fix becomes the database's **quality score**.
+4. **Scale-up** ([`data-expander.ts`](src/lib/server/data-expander.ts)) — parents are expanded before
+   children and every new child references a real parent; names are recombined from the AI's sample (so
+   the locale it chose is kept), phone/postcode formats are preserved, and [Faker](https://fakerjs.dev)
+   fills well-known columns when the sample is too small.
+
+Similar open-source tools, for comparison: [SDV](https://github.com/sdv-dev/SDV) (Python, statistical
+multi-table models, Business Source License), [synthdb](https://docs.rs/synthdb) (Rust Postgres seeder),
+[Faker](https://github.com/faker-js/faker) (values only, no relationships). SynthForge combines an LLM for
+domain realism with deterministic integrity rules like those tools.
 
 ## Working with large data
 
@@ -163,7 +205,7 @@ Add a connection from **DB Connections** (fill the form or paste a connection st
 
 ## API reference
 
-All endpoints require a Supabase session (cookie or `Authorization: Bearer <token>`) when auth is
+All endpoints require a session (`sf_session` cookie or `Authorization: Bearer <token>`) when auth is
 enabled, and are scoped to the caller.
 
 | Method & path | Description |
@@ -200,7 +242,8 @@ GitHub Actions ([`ci.yml`](.github/workflows/ci.yml)) runs on every push and PR:
 
 ## Security
 
-- Every API route verifies the Supabase JWT signature (HS256 locally or via Supabase Auth); there
+- Accounts use salted password hashes and server-side sessions stored in PostgreSQL (httpOnly,
+  SameSite cookie; login is rate limited). Every API route resolves the user from the session; there
   is no trust in client-supplied user ids. Records are owner-scoped in every storage backend.
 - External database passwords are encrypted at rest and never returned to the browser.
 - Connections to private/internal network addresses are blocked in production (SSRF guard).
@@ -232,5 +275,5 @@ Dockerfile, railway.json, docker-compose.yml, .github/workflows/
 | AI chat says the service is not configured | Set `DEEPSEEK_API_KEY`. |
 | "Connections to private or internal network addresses are not allowed" | Expected in production; set `ALLOW_PRIVATE_DB_HOSTS=true` only for trusted self-hosted setups. |
 | Supabase connection: "tenant/user not found" | Pooler user must be `postgres.<project-ref>` and the region must match. |
-| Everyone shares the same data | Auth is off (demo mode). Set `NEXT_PUBLIC_AUTH_ENABLED=true` + Supabase keys (or `AUTH_REQUIRED=true`). |
+| Everyone shares the same data | Auth is off (demo mode). Set `AUTH_REQUIRED=true`. |
 | Prisma: "URL must start with file:" | Stale client — run `npx prisma generate`. |
