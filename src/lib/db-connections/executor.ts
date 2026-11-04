@@ -499,7 +499,8 @@ export async function fetchSampleRows(conn: DbConnectionRecord, tableName: strin
   if (entry.dialect === 'postgres') {
     // Postgres uses double quotes for identifiers. Escape any embedded
     // double quotes by doubling them.
-    const quoted = `"${tableName.replace(/"/g, '""')}"`
+    const schemaName = conn.schema || 'public'
+    const quoted = `"${schemaName.replace(/"/g, '""')}"."${tableName.replace(/"/g, '""')}"`
     const pool = entry.pool as { query: (text: string, values?: unknown[]) => Promise<{ rows: Record<string, unknown>[] }> }
     const { rows } = await pool.query(`SELECT * FROM ${quoted} LIMIT $1`, [limit])
     const columns = rows.length > 0 ? Object.keys(rows[0]) : []

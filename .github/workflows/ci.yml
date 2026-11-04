@@ -53,6 +53,66 @@ jobs:
           PORT: 3000
           HOSTNAME: 127.0.0.1
 
+  e2e-live-db:
+    name: E2E (live Postgres + MySQL connections)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: synthforge
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/synthforge
+      NEXT_TELEMETRY_DISABLED: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate && npx prisma migrate deploy
+      - run: npm run build
+      - name: Seed external test databases
+        run: ./e2e/seed.sh
+        env:
+          PG_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+          MYSQL_ROOT_PWD: root
+      - name: Start server (auth required, private hosts allowed for the test DBs)
+        run: |
+          cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/
+          (cd .next/standalone && node server.js > ../../server.log 2>&1 &)
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:3000/api/health && break; sleep 1; done
+        env:
+          PORT: 3000
+          HOSTNAME: 127.0.0.1
+          AUTH_REQUIRED: "true"
+          SUPABASE_JWT_SECRET: e2e-secret
+          CONNECTION_ENCRYPTION_KEY: e2e-key
+          ALLOW_PRIVATE_DB_HOSTS: "true"
+      - name: Run live-DB scenarios
+        run: node e2e/live-db.mjs
+        env:
+          BASE: http://127.0.0.1:3000
+      - name: Server log
+        if: failure()
+        run: tail -200 server.log
+
   docker:
     runs-on: ubuntu-latest
     timeout-minutes: 25

@@ -287,7 +287,7 @@ export function parseBeginGeneration(content: string): BeginGenerationSignal | n
         schema: parsed.schema,
         rowCounts: parsed.rowCounts || {},
         instructions: parsed.instructions || undefined,
-        databaseName: parsed.databaseName || undefined,
+        databaseName: parsed.databaseName || parsed.database_name || undefined,
       }
     }
   } catch {

@@ -99,6 +99,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
+import { downloadExport, type ExportFormat } from '../export-download'
 import { useIsMobile } from '@/hooks/use-mobile'
 import { apiPost, apiPatch, apiDelete, apiGet, invalidateCache } from '@/lib/api-client'
 import {
@@ -1647,11 +1648,15 @@ function StudioPageInner({
     }
     if (!sql.trim()) return
 
-    if (!skipConfirm && isDestructiveSQL(sql)) {
-      const ok = window.confirm(
-        `⚠️  This SQL will modify or destroy data on your LIVE database "${activeConnectionName}":\n\n${sql.slice(0, 200)}${sql.length > 200 ? '...' : ''}\n\nAre you sure you want to execute this?`,
-      )
-      if (!ok) return
+    const askConfirm = () => window.confirm(
+      `⚠️  This SQL will modify or destroy data on your LIVE database "${activeConnectionName}":\n\n${sql.slice(0, 200)}${sql.length > 200 ? '...' : ''}\n\nAre you sure you want to execute this?`,
+    )
+    // Once the user has confirmed (or the caller pre-confirmed), tell the
+    // server to skip its own dangerous-statement check.
+    let confirmed = skipConfirm
+    if (!confirmed && isDestructiveSQL(sql)) {
+      if (!askConfirm()) return
+      confirmed = true
     }
 
     // Helper to update ONLY this specific SQL block's state in sqlBlockStates.
@@ -1670,18 +1675,30 @@ function StudioPageInner({
     updateBlockState(true, null)
 
     try {
-      const result = await apiPost<{
+      type BlockExecResponse = {
         rows?: Record<string, unknown>[]
         columns?: string[]
         error?: string
         executionTime?: number
         rowCount?: number
         affectedRows?: number
-      }>('/api/connections/execute', {
+        requiresConfirmation?: boolean
+      }
+      const run = (skipDangerousCheck: boolean) => apiPost<BlockExecResponse>('/api/connections/execute', {
         connectionId: activeConnectionId,
         sql,
-        skipDangerousCheck: skipConfirm,
+        skipDangerousCheck,
       }, { timeout: 60000 })
+      let result = await run(confirmed)
+
+      if (result.requiresConfirmation) {
+        if (!askConfirm()) {
+          updateBlockState(false, { ok: false, message: 'Cancelled — not executed', rowCount: 0, affectedRows: 0 })
+          return
+        }
+        confirmed = true
+        result = await run(true)
+      }
 
       if (result.error) {
         const errResult: SqlBlockResult = { ok: false, message: result.error!, rowCount: 0, affectedRows: 0 }
@@ -1761,6 +1778,16 @@ function StudioPageInner({
   useEffect(() => {
     executeSqlBlockRef.current = executeSqlBlock
   }, [executeSqlBlock, activeConnectionId, activeConnectionName, activeConnectionDialect])
+
+  // ─── Export live connection (whole DB or one table) ───
+  const exportLive = (format: ExportFormat, tableName?: string) => {
+    if (!activeConnectionId) return
+    return downloadExport(
+      { connectionId: activeConnectionId, ...(tableName ? { tableName } : {}) },
+      format,
+      tableName || activeConnectionName || 'database',
+    )
+  }
 
   // ─── SQL Execution ───
   const executeSQL = async (sql: string, skipConfirm = false) => {
@@ -3216,10 +3243,33 @@ function StudioPageInner({
             )}
           </div>
           <div className="flex items-center gap-1.5">
+            {isLiveDbMode && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="outline" size="sm" className="h-6 text-[10px] gap-1">
+                    <Download className="h-2.5 w-2.5" />
+                    Export
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  {(['sql', 'csv', 'json', 'xlsx'] as ExportFormat[]).map(f => (
+                    <DropdownMenuItem key={f} onClick={() => exportLive(f)}>
+                      {{ sql: 'SQL dump (.sql)', csv: 'CSV (.csv)', json: 'JSON (.json)', xlsx: 'Excel (.xls)' }[f]}
+                    </DropdownMenuItem>
+                  ))}
+                  {selectedTable && <DropdownMenuSeparator />}
+                  {selectedTable && (['sql', 'csv', 'json', 'xlsx'] as ExportFormat[]).map(f => (
+                    <DropdownMenuItem key={`t-${f}`} onClick={() => exportLive(f, selectedTable)}>
+                      Export &quot;{selectedTable}&quot; as {f === 'xlsx' ? 'Excel' : f.toUpperCase()}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
             {hasGeneratedData && (
               <>
-                {/* Export Dropdown */}
-                <DropdownMenu>
+                {/* Export Dropdown (synthetic data; live DBs use the server-side export above) */}
+                {!isLiveDbMode && <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button variant="outline" size="sm" className="h-6 text-[10px] gap-1">
                       <Download className="h-2.5 w-2.5" />
@@ -3253,7 +3303,7 @@ function StudioPageInner({
                       JSON (.json)
                     </DropdownMenuItem>
                   </DropdownMenuContent>
-                </DropdownMenu>
+                </DropdownMenu>}
 
                 <Button
                   variant="outline"

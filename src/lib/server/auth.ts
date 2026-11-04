@@ -21,7 +21,15 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 
 export const DEMO_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
 
+/**
+ * NEXT_PUBLIC_* values are inlined at BUILD time, so a server built without
+ * them would silently run with auth off. AUTH_REQUIRED is read at runtime and
+ * lets a deployment force auth on regardless of the build.
+ */
 export function isAuthRequired(): boolean {
+  const runtime = process.env['AUTH_REQUIRED']
+  if (runtime === 'true') return true
+  if (runtime === 'false') return false
   return process.env.NEXT_PUBLIC_AUTH_ENABLED === 'true'
 }
 

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
 import { db } from '@/lib/db'
+import { isAuthRequired } from '@/lib/server/auth'
 
 // ─── Health check ───
 // Public endpoint for uptime monitors / load balancers. It reports only
@@ -36,7 +37,7 @@ async function checkStorage(): Promise<{ backend: 'supabase' | 'prisma'; status:
 export async function GET() {
   const storage = await checkStorage()
   const ai: Check = process.env.DEEPSEEK_API_KEY ? 'ok' : 'not_configured'
-  const auth: Check = process.env.NEXT_PUBLIC_AUTH_ENABLED === 'true'
+  const auth: Check = isAuthRequired()
     ? (process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? 'ok' : 'error')
     : 'not_configured'
 

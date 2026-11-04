@@ -34,7 +34,10 @@ import {
   RefreshCw,
   Lightbulb,
   Sparkles,
+  Download,
 } from 'lucide-react'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
+import { downloadExport, type ExportFormat } from '../export-download'
 import { toast } from 'sonner'
 import { apiGet, apiPost, apiPatch, apiDelete, invalidateCache } from '@/lib/api-client'
 
@@ -385,6 +388,15 @@ export default function DatabaseConnectionsPage() {
   // Re-test an existing connection (PATCH with test=true) without re-entering
   // credentials. Useful after the user fixes network/credentials issues.
   const [retesting, setRetesting] = useState<string | null>(null)
+  const [exportingConn, setExportingConn] = useState<string | null>(null)
+  const handleExportConn = async (id: string, name: string, format: ExportFormat) => {
+    setExportingConn(id)
+    try {
+      await downloadExport({ connectionId: id }, format, name)
+    } finally {
+      setExportingConn(null)
+    }
+  }
   const handleRetest = async (conn: SafeDbConnection) => {
     setRetesting(conn.id)
     try {
@@ -795,6 +807,19 @@ export default function DatabaseConnectionsPage() {
                   >
                     {retesting === conn.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
                   </Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="ghost" size="sm" className="h-7 w-7 p-0" disabled={exportingConn === conn.id} title="Export">
+                        {exportingConn === conn.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Download className="h-3 w-3" />}
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem onClick={() => handleExportConn(conn.id, conn.name, 'sql')}>SQL dump (.sql)</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => handleExportConn(conn.id, conn.name, 'csv')}>CSV (.csv)</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => handleExportConn(conn.id, conn.name, 'json')}>JSON (.json)</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => handleExportConn(conn.id, conn.name, 'xlsx')}>Excel (.xls)</DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                   <Button
                     variant="ghost"
                     size="sm"

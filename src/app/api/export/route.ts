@@ -2,14 +2,20 @@ import { NextRequest, NextResponse } from 'next/server'
 import { requireUser } from '@/lib/server/auth'
 import { enforceRateLimit } from '@/lib/server/rate-limit'
 import { getDatabase } from '@/lib/server/synthetic-store'
+import { getConnection } from '@/lib/db-connections/store'
+import { fetchExternalSchema, fetchSampleRows } from '@/lib/db-connections/executor'
 
 // ─── Export a synthetic database ───
-// POST { databaseId, format: 'sql' | 'csv' | 'json' | 'xlsx', tableName? }
+// POST { databaseId | connectionId, format: 'sql' | 'csv' | 'json' | 'xlsx', tableName? }
+// connectionId exports a LIVE external database (up to MAX_LIVE_ROWS per table).
 // Returns the file as an attachment. Owner-scoped.
 
 export const dynamic = 'force-dynamic'
 
 type Row = Record<string, unknown>
+
+const MAX_LIVE_ROWS = 50_000
+const MAX_LIVE_TABLES = 200
 type TableSchema = { name: string; columns: Array<{ name: string; type: string }> }
 
 const SQL_TYPES = /^[A-Z][A-Z0-9_ ]*(\(\s*\d+(\s*,\s*\d+)?\s*\))?(\[\])?$/
@@ -101,28 +107,51 @@ export async function POST(request: NextRequest) {
   const limited = enforceRateLimit(auth.userId, 'export', 30)
   if (limited) return limited
 
-  let body: { databaseId?: unknown; format?: unknown; tableName?: unknown }
+  let body: { databaseId?: unknown; connectionId?: unknown; format?: unknown; tableName?: unknown }
   try {
     body = await request.json()
   } catch {
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
   }
   const databaseId = typeof body.databaseId === 'string' ? body.databaseId : ''
+  const connectionId = typeof body.connectionId === 'string' ? body.connectionId : ''
   const format = String(body.format || '')
   const tableName = typeof body.tableName === 'string' && body.tableName ? body.tableName : undefined
-  if (!databaseId) return NextResponse.json({ error: 'databaseId is required' }, { status: 400 })
+  if (!databaseId && !connectionId) return NextResponse.json({ error: 'databaseId or connectionId is required' }, { status: 400 })
   if (!['sql', 'csv', 'json', 'xlsx'].includes(format)) {
     return NextResponse.json({ error: 'format must be one of sql, csv, json, xlsx' }, { status: 400 })
   }
 
-  let db
-  try {
-    db = await getDatabase(auth.userId, databaseId)
-  } catch (err) {
-    console.error('[api/export] storage error:', err)
-    return NextResponse.json({ error: 'Storage temporarily unavailable' }, { status: 503 })
+  let db: { name: string; data_json: unknown; schema_json: unknown } | null
+  if (connectionId) {
+    // ─── Live external database ───
+    const conn = await getConnection(auth.userId, connectionId)
+    if (!conn) return NextResponse.json({ error: 'Connection not found' }, { status: 404 })
+    try {
+      const liveSchema = (await fetchExternalSchema(conn)).slice(0, MAX_LIVE_TABLES)
+      const wanted = tableName ? liveSchema.filter(t => t.name === tableName) : liveSchema
+      const data: Record<string, Row[]> = {}
+      for (const t of wanted) {
+        data[t.name] = (await fetchSampleRows(conn, t.name, MAX_LIVE_ROWS)).rows
+      }
+      db = {
+        name: conn.database || conn.name,
+        data_json: data,
+        schema_json: liveSchema.map(t => ({ name: t.name, columns: t.columns.map(c => ({ name: c.name, type: c.type })) })),
+      }
+    } catch (err) {
+      console.error('[api/export] live export failed:', err)
+      return NextResponse.json({ error: `Could not read from the database: ${err instanceof Error ? err.message : 'unknown error'}` }, { status: 502 })
+    }
+  } else {
+    try {
+      db = await getDatabase(auth.userId, databaseId)
+    } catch (err) {
+      console.error('[api/export] storage error:', err)
+      return NextResponse.json({ error: 'Storage temporarily unavailable' }, { status: 503 })
+    }
+    if (!db) return NextResponse.json({ error: 'Database not found' }, { status: 404 })
   }
-  if (!db) return NextResponse.json({ error: 'Database not found' }, { status: 404 })
 
   const all = (db.data_json || {}) as Record<string, Row[]>
   const schema = (Array.isArray(db.schema_json) ? db.schema_json : []) as TableSchema[]

@@ -41,6 +41,7 @@ import {
   Eye,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import { downloadExport, type ExportFormat } from '../../export-download'
 import { apiGet, apiDelete, invalidateCache } from '@/lib/api-client'
 
 interface SchemaColumn {
@@ -64,7 +65,6 @@ interface DatabaseDetail {
   created_at?: string
 }
 
-type ExportFormat = 'json' | 'csv' | 'sql'
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -452,24 +452,7 @@ export default function DatabaseDetailPage() {
     if (!db) return
     setExporting(true)
     try {
-      const resp = await fetch('/api/export', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ databaseId: db.id, format }),
-      })
-      if (!resp.ok) throw new Error('Export failed')
-      const blob = await resp.blob()
-      const url = URL.createObjectURL(blob)
-      const a = window.document.createElement('a')
-      a.href = url
-      a.download = `${db.name}.${format}`
-      window.document.body.appendChild(a)
-      a.click()
-      window.document.body.removeChild(a)
-      URL.revokeObjectURL(url)
-      toast.success(`Exported "${db.name}" as ${format.toUpperCase()}`)
-    } catch {
-      toast.error(`Failed to export "${db.name}"`)
+      await downloadExport({ databaseId: db.id }, format, db.name)
     } finally {
       setExporting(false)
     }
@@ -615,6 +598,10 @@ export default function DatabaseDetailPage() {
                 <DropdownMenuItem onClick={() => handleExport('sql')}>
                   <FileCode className="mr-2 h-4 w-4 text-rose-600" />
                   Export as SQL
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => handleExport('xlsx')}>
+                  <FileCode className="mr-2 h-4 w-4 text-rose-600" />
+                  Export as Excel
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
