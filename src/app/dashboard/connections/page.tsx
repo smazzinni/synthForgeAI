@@ -38,6 +38,7 @@ import {
 } from 'lucide-react'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { downloadExport, type ExportFormat } from '../export-download'
+import { parseConnectionString } from './parse-connection-string'
 import { toast } from 'sonner'
 import { apiGet, apiPost, apiPatch, apiDelete, invalidateCache } from '@/lib/api-client'
 
@@ -231,6 +232,29 @@ export default function DatabaseConnectionsPage() {
   const [saving, setSaving] = useState(false)
   const [deleting, setDeleting] = useState<string | null>(null)
 
+  const [connString, setConnString] = useState('')
+  const [connStringError, setConnStringError] = useState<string | null>(null)
+
+  const applyConnectionString = (value: string) => {
+    setConnString(value)
+    if (!value.trim()) { setConnStringError(null); return }
+    const res = parseConnectionString(value)
+    if (!res.ok) { setConnStringError(res.error); return }
+    setConnStringError(null)
+    const v = res.value
+    setForm(prev => ({
+      ...prev,
+      dialect: v.dialect,
+      host: v.host,
+      port: v.port,
+      username: v.username,
+      password: v.password,
+      database: v.database,
+      schema: v.dialect === 'postgres' ? (v.schema || 'public') : '',
+      ssl: v.ssl,
+    }))
+  }
+
   // Form state
   const [form, setForm] = useState({
     name: '',
@@ -260,6 +284,8 @@ export default function DatabaseConnectionsPage() {
   }, [loadConnections])
 
   const openNewDialog = () => {
+    setConnString('')
+    setConnStringError(null)
     setEditingId(null)
     setForm({
       name: '',
@@ -276,6 +302,8 @@ export default function DatabaseConnectionsPage() {
   }
 
   const openEditDialog = (conn: SafeDbConnection) => {
+    setConnString('')
+    setConnStringError(null)
     setEditingId(conn.id)
     setForm({
       name: conn.name,
@@ -474,6 +502,23 @@ export default function DatabaseConnectionsPage() {
             </DialogHeader>
 
             <div className="space-y-3 max-h-[60vh] overflow-y-auto py-2">
+              {/* Paste connection string */}
+              <div className="space-y-1.5">
+                <Label htmlFor="conn-string" className="text-sm">Paste connection string</Label>
+                <Input
+                  id="conn-string"
+                  value={connString}
+                  onChange={(e) => applyConnectionString(e.target.value)}
+                  placeholder="postgresql://user:password@host:5432/database?sslmode=require"
+                  className="font-mono text-xs"
+                  autoComplete="off"
+                />
+                {connStringError && <p className="text-xs text-destructive">{connStringError}</p>}
+                <p className="text-[10px] text-muted-foreground leading-snug">
+                  PostgreSQL-compatible: Supabase, Neon, AWS RDS/Aurora, Railway, Render, CockroachDB, Timescale.
+                  MySQL-compatible: MariaDB, PlanetScale, TiDB, AWS RDS MySQL.
+                </p>
+              </div>
               {/* Quick Connect presets */}
               <div className="space-y-2.5">
                 <div className="flex items-center gap-2">

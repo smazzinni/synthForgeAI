@@ -18,6 +18,7 @@ export interface SqlBlockResult {
   ok: boolean
   message: string
   rowCount?: number
+  truncated?: boolean
   affectedRows?: number
   rows?: Record<string, unknown>[]
   columns?: string[]

@@ -181,6 +181,11 @@ export function SqlBlockCard({
               ))}
             </tbody>
           </table>
+          {result.truncated && (
+            <div className="px-2 py-1 text-[9px] text-amber-700 dark:text-amber-400 bg-amber-50/60 dark:bg-amber-950/30">
+              Showing first 1,000 of {(result.rowCount ?? result.rows.length).toLocaleString()} rows — add LIMIT/WHERE or export for the full result.
+            </div>
+          )}
           {result.rows.length > 20 && (
             <div className="px-2 py-1 text-[8px] text-muted-foreground bg-sky-50/50 dark:bg-sky-950/30">
               + {result.rows.length - 20} more row(s)
