@@ -52,7 +52,7 @@ export interface Message {
 
 export interface SchemaTable {
   name: string
-  columns: { name: string; type: string }[]
+  columns: { name: string; type: string; is_nullable?: boolean; is_primary?: boolean; references?: string | null }[]
 }
 
 export interface StudioPageProps {

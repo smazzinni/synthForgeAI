@@ -328,12 +328,6 @@ export function extractAllSqlBlocks(content: string): string[] {
   return blocks
 }
 
-// Backwards-compat: returns the FIRST sql block (or null).
-export function extractSqlBlock(content: string): string | null {
-  const blocks = extractAllSqlBlocks(content)
-  return blocks.length > 0 ? blocks[0] : null
-}
-
 // ─── Generate CREATE TABLE SQL from a schema ───
 
 export function generateSchemaSQL(schema: SchemaTable[], databaseName?: string): string {

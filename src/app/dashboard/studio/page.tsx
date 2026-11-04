@@ -104,7 +104,6 @@ import { useIsMobile } from '@/hooks/use-mobile'
 import { apiPost, apiPatch, apiDelete, apiGet, invalidateCache } from '@/lib/api-client'
 import {
   parseAgentStatus,
-  parseInteractiveOptions,
   parseAllInteractiveOptions,
   parseBeginGeneration,
   cleanDisplayText,
@@ -125,7 +124,6 @@ import {
   parseAIResponse,
   extractSchema,
   extractAllSqlBlocks,
-  extractSqlBlock,
   generateSchemaSQL as generateSchemaSQLHelper,
   computeERLayout as computeERLayoutHelper,
   getDataColumnKind,
@@ -145,6 +143,13 @@ import { SqlBlockCard, type SqlBlockResult } from './_components/sql-block-card'
 const CONVERSATION_STORAGE_KEY = 'synthforge_conversations'
 const MAX_CONVERSATIONS = 50
 const MAX_AUTO_TURNS = 5
+const CANCELLED_MSG = 'Cancelled — not executed'
+const CANCELLED_RESULT: SqlBlockResult = { ok: false, message: CANCELLED_MSG, rowCount: 0, affectedRows: 0 }
+// Full SQL for history labels: trimmed, whitespace collapsed, capped at 2000 chars.
+const sqlLabel = (sql: string) => {
+  const t = sql.trim().replace(/\s+/g, ' ')
+  return t.length > 2000 ? t.slice(0, 2000) + '…' : t
+}
 const ACTIVE_GENERATION_KEY = 'synthforge:activeGeneration'
 
 function clearActiveGeneration() {
@@ -488,6 +493,8 @@ function StudioPageInner({
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const pendingTimeoutsRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set())
   const autoTurnsRef = useRef(0)
+  // The single pending automatic follow-up (truncated-continue / SQL-continue).
+  const autoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const chatEndRef = useRef<HTMLDivElement>(null)
   const chatContainerRef = useRef<HTMLDivElement>(null)
@@ -499,7 +506,7 @@ function StudioPageInner({
   // above `executeSqlBlock`) needs to call it for auto-execution of SELECT
   // queries in live-DB mode, but `const` declarations aren't hoisted. The
   // ref lets `sendMessage` reach the latest version without a TDZ error.
-  const executeSqlBlockRef = useRef<(messageId: string, sql: string, skipConfirm?: boolean) => void>(() => {})
+  const executeSqlBlockRef = useRef<(messageId: string, sql: string, skipConfirm?: boolean) => Promise<SqlBlockResult | undefined>>(async () => undefined)
 
   // Keep messagesRef in sync
   useEffect(() => {
@@ -672,6 +679,7 @@ function StudioPageInner({
   useEffect(() => {
     const timeouts = pendingTimeoutsRef.current
     return () => {
+      if (autoTimerRef.current) clearTimeout(autoTimerRef.current)
       abortRef.current?.abort()
       generationAbortRef.current?.abort()
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
@@ -830,11 +838,31 @@ function StudioPageInner({
   const sendMessage = useCallback(async (messageText?: string, isAuto = false) => {
     const textToSend = messageText || input
     if (!textToSend.trim() || loadingRef.current) return
+    if (autoTimerRef.current) {
+      clearTimeout(autoTimerRef.current)
+      autoTimerRef.current = null
+    }
     if (isAuto === true) autoTurnsRef.current += 1
     else autoTurnsRef.current = 0
 
     if (abortRef.current) {
       abortRef.current.abort()
+    }
+
+    // At most ONE pending automatic follow-up; scheduling replaces the old one.
+    const scheduleAutoFollowUp = (text: string, delay: number) => {
+      if (autoTimerRef.current) clearTimeout(autoTimerRef.current)
+      autoTimerRef.current = setTimeout(() => {
+        autoTimerRef.current = null
+        const lastMsg = messagesRef.current[messagesRef.current.length - 1]
+        if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isStreaming && !loadingRef.current) {
+          if (autoTurnsRef.current >= MAX_AUTO_TURNS) {
+            toast.info('Paused automatic follow-ups — send a message to continue.')
+            return
+          }
+          sendMessage(text, true)
+        }
+      }, delay)
     }
 
     const userMessage: Message = {
@@ -884,12 +912,15 @@ function StudioPageInner({
           if (m.role === 'assistant' && m.sqlBlockStates) {
             for (const [sql, state] of Object.entries(m.sqlBlockStates)) {
               if (state.result) {
-                if (state.result.ok && state.result.rows && state.result.rows.length > 0) {
-                  content += `\n\n[SQL RESULT for "${sql.slice(0, 80)}...": ${state.result.message}]\n${JSON.stringify(state.result.rows.slice(0, 20), null, 2)}${state.result.rows.length > 20 ? `\n... +${state.result.rows.length - 20} more rows` : ''}`
+                const label = sqlLabel(sql)
+                if (!state.result.ok && state.result.message === CANCELLED_MSG) {
+                  content += `\n\n[SQL CANCELLED for "${label}": user declined]`
+                } else if (state.result.ok && state.result.rows && state.result.rows.length > 0) {
+                  content += `\n\n[SQL RESULT for "${label}": ${state.result.message}]\n${JSON.stringify(state.result.rows.slice(0, 20), null, 2)}${state.result.rows.length > 20 ? `\n... +${state.result.rows.length - 20} more rows` : ''}`
                 } else if (state.result.ok) {
-                  content += `\n\n[SQL RESULT for "${sql.slice(0, 80)}...": ${state.result.message}]`
-                } else if (!state.result.ok) {
-                  content += `\n\n[SQL ERROR for "${sql.slice(0, 80)}...": ${state.result.message}]`
+                  content += `\n\n[SQL RESULT for "${label}": ${state.result.message}]`
+                } else {
+                  content += `\n\n[SQL ERROR for "${label}": ${state.result.message}]`
                 }
               }
             }
@@ -930,6 +961,7 @@ function StudioPageInner({
             connectionDialect: activeConnectionDialect,
           } : {}),
           currentSchema: generatedSchema,
+          tableCounts,
           currentData: dataToSend,
           history,
         }),
@@ -1049,18 +1081,7 @@ function StudioPageInner({
                   : m
               ))
               // Auto-continue after 2 seconds (capped)
-              const t = setTimeout(() => {
-                pendingTimeoutsRef.current.delete(t)
-                const lastMsg = messagesRef.current[messagesRef.current.length - 1]
-                if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isStreaming) {
-                  if (autoTurnsRef.current >= MAX_AUTO_TURNS) {
-                    toast.info('Paused automatic follow-ups — send a message to continue.')
-                    return
-                  }
-                  sendMessage('[Auto-continue: Your previous response was cut off. Please continue from where you left off, completing any SQL blocks that were truncated.]', true)
-                }
-              }, 2000)
-              pendingTimeoutsRef.current.add(t)
+              scheduleAutoFollowUp('[Auto-continue: Your previous response was cut off. Please continue from where you left off, completing any SQL blocks that were truncated.]', 2000)
             } else if (parsed.type === 'error') {
               console.error('[Studio] Stream error:', parsed.content)
               // Surface the mid-stream error to the user and stop the
@@ -1171,8 +1192,7 @@ function StudioPageInner({
           // (CREATE TABLE users → INSERT INTO users → CREATE TABLE orders
           // referencing users) resolve in order.
           const runSequentially = async () => {
-            let hadReadOnlyQueries = false
-            let hadMutations = false
+            const outcomes: Array<SqlBlockResult | undefined> = []
             for (let idx = 0; idx < sqlBlocks.length; idx++) {
               const block = sqlBlocks[idx]
               const stripped = stripSqlComments(block).trim()
@@ -1192,47 +1212,28 @@ function StudioPageInner({
 
               if (allReadOnly && !isDestructive) {
                 // Read-only queries: auto-execute, no confirmation
-                hadReadOnlyQueries = true
-                await executeSqlBlockRef.current(assistantId, block, true)
+                outcomes.push(await executeSqlBlockRef.current(assistantId, block, true))
               } else if (!isDestructive) {
                 // Non-destructive mutations (INSERT, CREATE TABLE, UPDATE with WHERE):
                 // Auto-execute WITHOUT confirmation — the AI is generating data and
                 // should be able to insert it directly. The user asked for data
                 // generation, so confirming every INSERT would be annoying.
-                hadMutations = true
-                await executeSqlBlockRef.current(assistantId, block, true) // skipConfirm=true
+                outcomes.push(await executeSqlBlockRef.current(assistantId, block, true))
               } else {
                 // Destructive operations (DROP, TRUNCATE, DELETE without WHERE):
                 // ALWAYS require confirmation, even in auto-execute mode.
-                await executeSqlBlockRef.current(assistantId, block, false)
+                outcomes.push(await executeSqlBlockRef.current(assistantId, block, false))
               }
             }
 
-            // Auto-continue after read-only queries OR mutations so the AI
-            // can see the results and proceed with the next step.
-            // BUGFIX (auto-continue broken): Previously `!isStreaming` referenced
-            // a variable that did NOT exist in this scope (the only `isStreaming`
-            // is a local const inside a different useEffect). This threw a
-            // ReferenceError which was silently caught by the .catch() below,
-            // so the auto-continue NEVER fired — meaning the AI executed the
-            // first SQL block but never received the results, stalling the
-            // multi-step "introspect → insert → verify" loop. Fix: use
-            // `loadingRef.current` (the authoritative loading flag), which is
-            // false at this point because the stream already finished.
-            if ((hadReadOnlyQueries || hadMutations) && !loadingRef.current) {
-              const t = setTimeout(() => {
-                pendingTimeoutsRef.current.delete(t)
-                const lastMsg = messagesRef.current[messagesRef.current.length - 1]
-                if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.isStreaming && !loadingRef.current) {
-                  if (autoTurnsRef.current >= MAX_AUTO_TURNS) {
-                    toast.info('Paused automatic follow-ups — send a message to continue.')
-                    return
-                  }
-                  sendMessage('[Auto-continue: SQL executed successfully. Results are in conversation history. Proceed with the next step.]', true)
-                }
-              }, 1500)
-              pendingTimeoutsRef.current.add(t)
-            }
+            // Auto-continue from the REAL outcomes of this reply's blocks.
+            const isCancelled = (o?: SqlBlockResult) => !!o && !o.ok && o.message === CANCELLED_MSG
+            if (outcomes.length === 0 || outcomes.every(isCancelled) || loadingRef.current) return
+            const failed = outcomes.some(o => !o || !o.ok)
+            const msg = failed
+              ? `[Auto-continue] Results of the SQL you just emitted:\n${outcomes.map((o, i) => `${i + 1}. ${isCancelled(o) ? 'CANCELLED — user declined' : o?.ok ? `OK — ${o.message}` : `ERROR — ${o?.message ?? 'not executed'}`}`).join('\n')}\nFix the failed statement (retry once) or continue with the next step.`
+              : `[Auto-continue] All ${outcomes.length} statement(s) succeeded. Proceed with the next step, or reply "Done" with a short summary if the task is complete.`
+            scheduleAutoFollowUp(msg, 1500)
           }
           runSequentially().catch(err => {
             console.error('[Studio] Auto-execution sequence failed:', err)
@@ -1662,24 +1663,16 @@ function StudioPageInner({
   // sqlBlockStates (keyed by the SQL string). We NO LONGER update the legacy
   // sqlBlockExecuting/sqlBlockResult fields, which were shared across ALL
   // blocks in the same message and caused every button to show the same result.
-  const executeSqlBlock = async (messageId: string, sql: string, skipConfirm = false) => {
+  const executeSqlBlock = async (messageId: string, sql: string, skipConfirm = false): Promise<SqlBlockResult | undefined> => {
     if (!activeConnectionId) {
       toast.error('No active DB connection')
-      return
+      return { ok: false, message: 'No active DB connection', rowCount: 0, affectedRows: 0 }
     }
     if (!sql.trim()) return
 
     const askConfirm = () => window.confirm(
       `⚠️  This SQL will modify or destroy data on your LIVE database "${activeConnectionName}":\n\n${sql.slice(0, 200)}${sql.length > 200 ? '...' : ''}\n\nAre you sure you want to execute this?`,
     )
-    // Once the user has confirmed (or the caller pre-confirmed), tell the
-    // server to skip its own dangerous-statement check.
-    let confirmed = skipConfirm
-    if (!confirmed && isDestructiveSQL(sql)) {
-      if (!askConfirm()) return
-      confirmed = true
-    }
-
     // Helper to update ONLY this specific SQL block's state in sqlBlockStates.
     // This is the KEY FIX: we do NOT touch sqlBlockExecuting/sqlBlockResult
     // (the legacy shared fields) — only sqlBlockStates[sql].
@@ -1690,6 +1683,17 @@ function StudioPageInner({
         states[sql] = { executing, result }
         return { ...m, sqlBlockStates: states }
       }))
+    }
+
+    // Once the user has confirmed (or the caller pre-confirmed), tell the
+    // server to skip its own dangerous-statement check.
+    let confirmed = skipConfirm
+    if (!confirmed && isDestructiveSQL(sql)) {
+      if (!askConfirm()) {
+        updateBlockState(false, CANCELLED_RESULT)
+        return CANCELLED_RESULT
+      }
+      confirmed = true
     }
 
     // Set executing state for THIS specific block only
@@ -1715,8 +1719,8 @@ function StudioPageInner({
 
       if (result.requiresConfirmation) {
         if (!askConfirm()) {
-          updateBlockState(false, { ok: false, message: 'Cancelled — not executed', rowCount: 0, affectedRows: 0 })
-          return
+          updateBlockState(false, CANCELLED_RESULT)
+          return CANCELLED_RESULT
         }
         confirmed = true
         result = await run(true)
@@ -1732,7 +1736,7 @@ function StudioPageInner({
           setActiveConnectionDialect(undefined)
           router.push('/dashboard/connections')
         }
-        return
+        return errResult
       }
 
       const stripped = stripSqlComments(sql).trim()
@@ -1788,11 +1792,13 @@ function StudioPageInner({
           }
         }
       }
+      return okResult
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Execution failed'
       const errResult: SqlBlockResult = { ok: false, message: msg, rowCount: 0, affectedRows: 0 }
       updateBlockState(false, errResult)
       toast.error(msg)
+      return errResult
     }
   }
 

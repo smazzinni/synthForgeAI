@@ -39,7 +39,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms))
   check('AI gets REAL foreign keys from the catalog', /customer_id [^,]*FK→customers\.id/.test(first.system), (first.system.match(/- orders[^\n]*/) || [''])[0])
   check('AI gets exact row counts', /- customers \(2 rows\)/.test(first.system), (first.system.match(/- customers[^\n]*/) || [''])[0])
   check('table list shown in chat', await page.getByText('Order Details').count() > 0)
-  check('agent status shown', await page.getByText(/introspecting/i).count() > 0)
+  check('agent shown on the reply (Schema Architect)', await page.getByText('Schema Architect').count() > 0)
 
   // 2. question → answer → insert
   await send('add some customers')
@@ -48,7 +48,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms))
   check('AI asks a question with choices', await choice.count() > 0)
   await choice.first().click(); await sleep(5000)
   check('INSERT ran after answering (2 → 5 customers)', q('select count(*) from customers') === '5')
-  const afterInsert = (await allReqs()).find(r => /^\[Auto-continue\]/.test(r.last))
+  const afterInsert = (await allReqs()).find(r => /^\[Auto-continue\]/.test(r.last) && r.history.some(m => /INSERT INTO customers/.test(m.content)))
   check('follow-up tells AI the real outcome', !!afterInsert && /succeeded|OK/.test(afterInsert.last), afterInsert?.last)
   check('history carries the full SQL + result', (afterInsert?.history || []).some(m => /\[SQL RESULT for "[^"]*INSERT INTO customers \(name, email\) VALUES \('Dee'[^"]*'fay@example\.com'\)/.test(m.content)))
 

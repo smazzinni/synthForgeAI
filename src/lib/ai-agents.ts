@@ -135,40 +135,25 @@ export interface AgentStatus {
 }
 
 export function parseAgentStatus(content: string): AgentStatus | null {
-  // Try simple regex first (single-line, fast path)
-  const simpleMatch = content.match(/\{"type"\s*:\s*"agent_status"\s*,\s*"agent"\s*:\s*"([^"]+)"\s*,\s*"status"\s*:\s*"([^"]+)"\s*,\s*"progress"\s*:\s*(\d+)\s*\}/)
-  if (simpleMatch) {
-    return {
-      agent: simpleMatch[1],
-      status: simpleMatch[2],
-      progress: parseInt(simpleMatch[3], 10),
-    }
-  }
-
-  // Fallback: find {"type":"agent_status" and extract the full JSON object using bracket counting
-  const marker = '{"type":"agent_status"'
-  const markerLoose = '{"type": "agent_status"'
-  let idx = content.indexOf(marker)
-  if (idx === -1) idx = content.indexOf(markerLoose)
-  if (idx === -1) return null
-
-  const jsonStr = extractJsonObject(content, idx)
-  if (!jsonStr) return null
-
-  try {
-    const parsed = JSON.parse(jsonStr)
-    if (parsed?.type === 'agent_status' && parsed.agent && parsed.status) {
-      return {
-        agent: String(parsed.agent),
-        status: String(parsed.status),
-        progress: Number(parsed.progress) || 0,
+  // Return the LAST valid agent_status object (the most recent progress).
+  let last: AgentStatus | null = null
+  for (const m of content.matchAll(/\{\s*"type"\s*:\s*"agent_status"/g)) {
+    const jsonStr = extractJsonObject(content, m.index!)
+    if (!jsonStr) continue
+    try {
+      const parsed = JSON.parse(jsonStr)
+      if (parsed?.type === 'agent_status' && parsed.agent && parsed.status) {
+        last = {
+          agent: String(parsed.agent),
+          status: String(parsed.status),
+          progress: Number(parsed.progress) || 0,
+        }
       }
+    } catch {
+      // Not parseable
     }
-  } catch {
-    // Not parseable
   }
-
-  return null
+  return last
 }
 
 /**
@@ -244,11 +229,6 @@ export interface InteractiveOptions {
   question: string
   choices: OptionChoice[]
   multi: boolean
-}
-
-export function parseInteractiveOptions(content: string): InteractiveOptions | null {
-  const all = parseAllInteractiveOptions(content)
-  return all.length > 0 ? all[all.length - 1] : null
 }
 
 // ─── BEGIN_GENERATION signal types ───
