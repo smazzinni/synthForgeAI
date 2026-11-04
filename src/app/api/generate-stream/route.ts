@@ -17,6 +17,7 @@ import {
   type GenerationJob,
 } from '@/lib/server/generation-jobs'
 import { expandDataset } from '@/lib/server/data-expander'
+import { dependencyOrder, relationshipsFor, repairDataset, type IntegrityReport } from '@/lib/server/data-integrity'
 
 // ─── Streaming Database Generation API ───
 // POST   starts a generation job and streams its progress (SSE).
@@ -119,6 +120,9 @@ function buildGenerationPrompt(req: GenerationRequest): string {
   }).join('\n\n')
   const totalRows = Object.values(req.rowCounts).reduce((sum, n) => sum + n, 0)
   const tableOrder = req.schema.map(s => s.name).join(' → ')
+  const rel = relationshipsFor(req.schema, {})
+  const relLines = Object.entries(rel).flatMap(([child, cols]) =>
+    Object.entries(cols).map(([col, parent]) => `- ${child}.${col} → ${parent}.id (every value MUST be an id you already output for ${parent})`))
 
   return `You are a data generation engine. Generate realistic synthetic data for the following database schema.
 
@@ -128,6 +132,7 @@ SCHEMA (${req.schema.length} tables):
 ${tableDescriptions}
 
 ${req.instructions ? `ADDITIONAL INSTRUCTIONS:\n${req.instructions}\n` : ''}
+${relLines.length ? `RELATIONSHIPS (foreign keys):\n${relLines.join('\n')}\n- Child timestamps (created_at, order dates…) must be AFTER the parent row's created_at.\n- Spread children across many different parents with a realistic, uneven distribution.\n` : ''}
 CRITICAL REQUIREMENTS:
 1. Generate data for ALL ${req.schema.length} tables, in this order: ${tableOrder}
 2. After one table's records, IMMEDIATELY output the next ###TABLE:name### marker.
@@ -256,6 +261,8 @@ async function runGeneration(job: GenerationJob, fullReq: GenerationRequest, see
   const finalCounts = fullReq.rowCounts
   const req: GenerationRequest = {
     ...fullReq,
+    // Parents first, so children can reference ids that already exist.
+    schema: dependencyOrder(fullReq.schema),
     rowCounts: Object.fromEntries(Object.entries(finalCounts).map(([t, n]) => [t, Math.min(n, SEED_ROWS_PER_TABLE)])),
   }
   const allTableData: Record<string, unknown[]> = {}
@@ -275,13 +282,14 @@ async function runGeneration(job: GenerationJob, fullReq: GenerationRequest, see
 
   const generatedFor = (t: string) => (allTableData[t]?.length || 0) - (baseline[t] || 0)
 
+  let qualityScore: number | null = null
   const persist = (final = false) => {
     const snapshot = { ...allTableData }
     persistChain = persistChain.then(() =>
       updateDatabase(job.userId, job.databaseId, {
         data_json: snapshot,
         row_count: countRows(snapshot),
-        ...(final ? { status: 'ready', schema_json: req.schema, quality_score: 0.85 } : {}),
+        ...(final ? { status: 'ready', schema_json: req.schema, quality_score: qualityScore } : {}),
       }).catch(err => console.warn('[generate] persist failed:', err instanceof Error ? err.message : err)),
     )
     return persistChain
@@ -395,6 +403,18 @@ async function runGeneration(job: GenerationJob, fullReq: GenerationRequest, see
     }
   }
 
+  // ─── Quality Analyst: repair relational integrity of the AI sample ───
+  const describeFixes = (r: IntegrityReport) => {
+    const fixed = r.issues.filter(i => i.kind !== 'unknown_table').reduce((n, i) => n + i.count, 0)
+    return fixed === 0 ? 'no integrity problems found' : `fixed ${fixed} integrity problem${fixed === 1 ? '' : 's'} (${[...new Set(r.issues.map(i => i.kind.replace(/_/g, ' ')))].join(', ')})`
+  }
+  if (!job.cancelRequested && generatedThisRun > 0) {
+    const { data: repaired, report } = repairDataset(req.schema, allTableData as Record<string, Record<string, unknown>[]>)
+    for (const t of req.schema) allTableData[t.name] = repaired[t.name] || []
+    qualityScore = report.score
+    emit(job, { type: 'progress', table: '', message: `Quality Analyst: ${describeFixes(report)}`, totalInserted: generatedThisRun, targetRows: totalTarget })
+  }
+
   // ─── Phase 2: scale up to the requested row counts ───
   const needsExpansion = !job.cancelRequested && req.schema.some(t => generatedFor(t.name) > 0 && generatedFor(t.name) < finalCounts[t.name])
   if (needsExpansion) {
@@ -414,6 +434,12 @@ async function runGeneration(job: GenerationJob, fullReq: GenerationRequest, see
       allTableData[t.name] = [...existing, ...(expanded[t.name] || [])]
       generatedThisRun += generatedFor(t.name) - before
       emit(job, { type: 'table_complete', table: t.name, totalRows: allTableData[t.name].length })
+    }
+    // Final integrity pass over the full dataset (cheap, linear).
+    const { data: repaired, report } = repairDataset(req.schema, allTableData as Record<string, Record<string, unknown>[]>)
+    for (const t of req.schema) allTableData[t.name] = repaired[t.name] || []
+    if (report.issues.some(i => i.kind !== 'unknown_table')) {
+      emit(job, { type: 'progress', table: '', message: `Quality Analyst: ${describeFixes(report)}`, totalInserted: generatedThisRun, targetRows: totalTarget })
     }
     emit(job, { type: 'progress', table: '', message: 'Saving…', totalInserted: generatedThisRun, targetRows: totalTarget })
   }

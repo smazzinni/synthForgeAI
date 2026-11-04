@@ -58,3 +58,28 @@ describe('expandDataset', () => {
     expect(r.t.map(x => x.id)).toEqual([1, 2, 3, 4, 5])
   })
 })
+
+describe('expandDataset — realism', () => {
+  it('recombines seed person names (keeps locale) and keeps phone formats', () => {
+    const t = [{ name: 'people', columns: [{ name: 'id', type: 'uuid' }, { name: 'name', type: 'text' }, { name: 'phone', type: 'text' }] }]
+    const seed = { people: [
+      { id: 'a', name: 'Aarav Sharma', phone: '+91 98765 43210' },
+      { id: 'b', name: 'Priya Patel', phone: '+91 91234 56789' },
+      { id: 'c', name: 'Rohan Gupta', phone: '+91 99887 76655' },
+    ] }
+    const out = expandDataset(t, seed, { people: 200 }, { seed: 7 })
+    const firsts = new Set(['Aarav', 'Priya', 'Rohan'])
+    const lasts = new Set(['Sharma', 'Patel', 'Gupta'])
+    for (const p of out.people.slice(3)) {
+      const [f, l] = String(p.name).split(' ')
+      expect(firsts.has(f) && lasts.has(l)).toBe(true)
+      expect(String(p.phone)).toMatch(/^\+\d{2} \d{5} \d{5}$/)
+    }
+  })
+
+  it('falls back to Faker for well-known columns with a tiny seed', () => {
+    const t = [{ name: 'c', columns: [{ name: 'id', type: 'uuid' }, { name: 'company', type: 'text' }] }]
+    const out = expandDataset(t, { c: [{ id: 'x', company: 'Acme' }, { id: 'y', company: 'Globex' }] }, { c: 100 }, { seed: 3 })
+    expect(new Set(out.c.map(r => r.company)).size).toBeGreaterThan(20)
+  })
+})

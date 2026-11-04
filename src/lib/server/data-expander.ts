@@ -19,6 +19,8 @@
  * are stable.
  */
 
+import { Faker, en } from '@faker-js/faker'
+
 export type Row = Record<string, unknown>
 
 export interface ExpandTable {
@@ -40,6 +42,24 @@ function mulberry32(seed: number) {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/
 const EMAIL_RE = /^([^@\s]+)@([^@\s]+\.[^@\s]+)$/
+const PERSON_NAME_COL = /^(name|full_?name|customer_?name|user_?name_?full|contact_?name|employee_?name|author|patient_?name|student_?name|owner_?name|display_?name)$/i
+const FAKER_COLUMNS: Array<[RegExp, (f: Faker) => string]> = [
+  [/^first_?name$/i, f => f.person.firstName()],
+  [/^last_?name$|^surname$/i, f => f.person.lastName()],
+  [/^(full_?)?name$/i, f => f.person.fullName()],
+  [/company|organi[sz]ation|employer/i, f => f.company.name()],
+  [/phone|mobile|tel/i, f => f.phone.number()],
+  [/^(street|address|address_?line_?1)$/i, f => f.location.streetAddress()],
+  [/^city$/i, f => f.location.city()],
+  [/^(state|province|region)$/i, f => f.location.state()],
+  [/^country$/i, f => f.location.country()],
+  [/zip|postal|postcode/i, f => f.location.zipCode()],
+  [/job_?title|position|role_?title/i, f => f.person.jobTitle()],
+  [/product(_?name)?$|item_?name/i, f => f.commerce.productName()],
+  [/description|bio|summary|notes?$|comment/i, f => f.lorem.sentence()],
+  [/url|website|homepage/i, f => f.internet.url()],
+  [/^username$|^handle$|^login$/i, f => f.internet.username()],
+]
 const UNIQUE_HINT = /(^|_)(email|username|user_name|login|slug|handle|code|sku|key|token|phone|url)$/i
 
 function uuid(rand: () => number): string {
@@ -98,6 +118,9 @@ type ColumnModel =
   | { kind: 'category'; values: unknown[] }
   | { kind: 'email'; locals: string[]; domains: string[] }
   | { kind: 'text'; values: string[]; words: string[]; unique: boolean }
+  | { kind: 'person-name'; firsts: string[]; lasts: string[]; unique: boolean }
+  | { kind: 'digits-pattern'; patterns: string[]; unique: boolean }
+  | { kind: 'faker'; gen: (f: Faker) => string; unique: boolean }
   | { kind: 'json'; values: unknown[] }
   | { kind: 'null' }
 
@@ -148,19 +171,33 @@ function buildModel(col: string, seed: Row[], fk: string | undefined): ColumnMod
       domains: [...new Set(strings.map(s => s.split('@')[1]))],
     }
   }
+  const unique = UNIQUE_HINT.test(col)
+  // Person names: recombine first/last tokens from the seed (keeps the locale
+  // the AI chose — e.g. Indian or German names stay Indian or German).
+  if (PERSON_NAME_COL.test(col) && distinct.length >= 2 && strings.filter(s => s.trim().split(/\s+/).length >= 2).length >= strings.length * 0.8) {
+    const parts = strings.map(s => s.trim().split(/\s+/))
+    return { kind: 'person-name', firsts: parts.map(p => p[0]), lasts: parts.map(p => p.slice(1).join(' ')), unique }
+  }
+  // Phone numbers, postcodes, codes: keep the format, randomise the digits.
+  if (strings.every(s => /\d/.test(s) && s.replace(/[\d\s()+\-./#]/g, '').length <= 3)) {
+    return { kind: 'digits-pattern', patterns: distinct, unique: false }
+  }
+  // Few distinct seed values for a well-known column → fall back to Faker.
+  const fakerGen = FAKER_COLUMNS.find(([re]) => re.test(col))?.[1]
+  if (fakerGen && distinct.length < 5) return { kind: 'faker', gen: fakerGen, unique }
   // Low-cardinality → categorical (keep empirical distribution).
   if (distinct.length <= Math.max(2, Math.min(12, Math.ceil(strings.length * 0.3)))) {
     return { kind: 'category', values }
   }
   const words = [...new Set(strings.flatMap(s => s.split(/\s+/)).filter(Boolean))]
-  return { kind: 'text', values: distinct, words, unique: UNIQUE_HINT.test(col) }
+  return { kind: 'text', values: distinct, words, unique }
 }
 
 function pick<T>(arr: T[], rand: () => number): T {
   return arr[Math.floor(rand() * arr.length)]
 }
 
-function generateValue(m: ColumnModel, rand: () => number, serial: number, idsByTable: Record<string, unknown[]>): unknown {
+function generateValue(m: ColumnModel, rand: () => number, serial: number, idsByTable: Record<string, unknown[]>, faker: Faker): unknown {
   switch (m.kind) {
     case 'id-uuid': return uuid(rand)
     case 'id-int': return m.next++
@@ -194,6 +231,18 @@ function generateValue(m: ColumnModel, rand: () => number, serial: number, idsBy
       }
       return pick(m.values, rand)
     }
+    case 'person-name': {
+      const v = `${pick(m.firsts, rand)} ${pick(m.lasts, rand)}`.trim()
+      return m.unique ? `${v} ${serial}` : v
+    }
+    case 'digits-pattern': {
+      const v = pick(m.patterns, rand).replace(/\d/g, (d, i: number) => (i === 0 && d !== '0' ? String(1 + Math.floor(rand() * 9)) : String(Math.floor(rand() * 10))))
+      return m.unique ? `${v}${serial}` : v
+    }
+    case 'faker': {
+      const v = m.gen(faker)
+      return m.unique ? `${v}-${serial}` : v
+    }
     case 'json': return structuredClone(pick(m.values, rand))
     case 'null': return null
   }
@@ -210,6 +259,8 @@ export function expandDataset(
   opts: { seed?: number } = {},
 ): Record<string, Row[]> {
   const rand = mulberry32(opts.seed ?? 0x5eed)
+  const faker = new Faker({ locale: [en] })
+  faker.seed(opts.seed ?? 0x5eed)
   const out: Record<string, Row[]> = {}
   const idsByTable: Record<string, unknown[]> = {}
   for (const t of tables) {
@@ -242,7 +293,7 @@ export function expandDataset(
     const seedCount = rows.length
     for (let i = seedCount; i < target; i++) {
       const row: Row = {}
-      for (const c of columns) row[c] = generateValue(models[c], rand, i + 1, idsByTable)
+      for (const c of columns) row[c] = generateValue(models[c], rand, i + 1, idsByTable, faker)
       rows.push(row)
       if (row.id != null) idsByTable[name].push(row.id)
     }
