@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { requireUser } from '@/lib/server/auth'
 import {
   listConnections,
   createConnection,
@@ -6,7 +7,7 @@ import {
 } from '@/lib/db-connections/store'
 import { testConnection } from '@/lib/db-connections/executor'
 import { toSafeRecord } from '@/lib/db-connections/types'
-import { getUserIdFromCookies, validateInput } from '@/lib/db-connections/api-helpers'
+import { validateInput } from '@/lib/db-connections/api-helpers'
 
 // ─── Collection routes: /api/connections ───
 //
@@ -22,8 +23,11 @@ import { getUserIdFromCookies, validateInput } from '@/lib/db-connections/api-he
 
 // GET /api/connections — list current user's connections
 export async function GET(request: NextRequest) {
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+
   try {
-    const userId = getUserIdFromCookies(request)
+    const userId = auth.userId
     const list = await listConnections(userId)
     return NextResponse.json({ connections: list })
   } catch (err) {
@@ -38,8 +42,11 @@ export async function GET(request: NextRequest) {
 //   - On test failure the connection is still saved with status='failed'
 //     so the user can edit-and-retry.
 export async function POST(request: NextRequest) {
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+
   try {
-    const userId = getUserIdFromCookies(request)
+    const userId = auth.userId
     const body = await request.json().catch(() => null)
     const validation = validateInput(body)
     if (!validation.ok) {

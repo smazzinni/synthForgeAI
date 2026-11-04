@@ -72,14 +72,8 @@ export async function listDatabasesPrisma(userId: string): Promise<SyntheticData
 }
 
 export async function getDatabasePrisma(userId: string, id: string): Promise<SyntheticDatabaseRecord | null> {
-  const row = await db.syntheticDatabase.findUnique({ where: { id } })
-  if (!row) return null
-  // Security: scope by userId (but allow cross-user for the generate-stream
-  // route which may use a different user id)
-  if (row.userId !== userId && row.userId !== 'default') {
-    // still return it — the in-memory store allows cross-user lookups
-  }
-  return toDbRecord(row)
+  const row = await db.syntheticDatabase.findFirst({ where: { id, userId } })
+  return row ? toDbRecord(row) : null
 }
 
 export async function createDatabasePrisma(
@@ -116,11 +110,10 @@ export async function updateDatabasePrisma(
   if (patch.status !== undefined) data.status = patch.status
 
   try {
-    const row = await db.syntheticDatabase.update({
-      where: { id },
-      data,
-    })
-    return toDbRecord(row)
+    const res = await db.syntheticDatabase.updateMany({ where: { id, userId }, data })
+    if (res.count === 0) return null
+    const row = await db.syntheticDatabase.findFirst({ where: { id, userId } })
+    return row ? toDbRecord(row) : null
   } catch {
     return null
   }
@@ -128,8 +121,8 @@ export async function updateDatabasePrisma(
 
 export async function deleteDatabasePrisma(userId: string, id: string): Promise<boolean> {
   try {
-    await db.syntheticDatabase.delete({ where: { id } })
-    return true
+    const res = await db.syntheticDatabase.deleteMany({ where: { id, userId } })
+    return res.count > 0
   } catch {
     return false
   }
@@ -142,7 +135,7 @@ export async function listConversationsPrisma(userId: string): Promise<Conversat
     where: { userId },
     orderBy: { updatedAt: 'desc' },
     take: 50,
-    include: { messages: { orderBy: { createdAt: 'asc' } } },
+    include: { messages: { orderBy: { createdAt: 'asc' }, take: 500 } },
   })
   return rows.map(toConvRecord)
 }
@@ -155,7 +148,7 @@ export async function createConversationPrisma(
     data: {
       databaseId: input.database_id || null,
       title: input.title || 'New Conversation',
-      userId: input.user_id || userId,
+      userId,
       status: input.status || 'active',
       agentMode: input.agent_mode || 'orchestrator',
     },
@@ -171,21 +164,23 @@ export async function addMessagesPrisma(
 ): Promise<boolean> {
   try {
     // Verify the conversation exists
-    const conv = await db.conversation.findUnique({ where: { id: conversationId } })
+    const conv = await db.conversation.findFirst({ where: { id: conversationId, userId } })
     if (!conv) return false
 
-    await db.message.createMany({
+    await db.$transaction([
+      db.message.createMany({
       data: messages.map(m => ({
         conversationId,
         role: m.role,
         content: m.content,
         agentName: m.agentName || null,
       })),
-    })
-    await db.conversation.update({
-      where: { id: conversationId },
-      data: { updatedAt: new Date() },
-    })
+      }),
+      db.conversation.update({
+        where: { id: conversationId },
+        data: { updatedAt: new Date() },
+      }),
+    ])
     return true
   } catch {
     return false
@@ -194,8 +189,8 @@ export async function addMessagesPrisma(
 
 export async function deleteConversationPrisma(userId: string, id: string): Promise<boolean> {
   try {
-    await db.conversation.delete({ where: { id } })
-    return true
+    const res = await db.conversation.deleteMany({ where: { id, userId } })
+    return res.count > 0
   } catch {
     return false
   }

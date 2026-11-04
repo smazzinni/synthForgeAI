@@ -40,9 +40,8 @@ export type SafeDbConnectionRecord = Omit<DbConnectionRecord, 'password'> & {
 }
 
 export function maskPassword(password: string): string {
-  if (!password) return ''
-  if (password.length <= 4) return '****'
-  return password.slice(0, 2) + '*'.repeat(Math.max(4, password.length - 4)) + password.slice(-2)
+  // Never reveal any part of the secret (it may also be ciphertext).
+  return password ? '••••••••' : ''
 }
 
 export function toSafeRecord(rec: DbConnectionRecord): SafeDbConnectionRecord {
@@ -62,6 +61,10 @@ export interface ExecuteResult {
   affectedRows: number
   executionTime: number
   error?: string
+  /** True when more rows matched than were returned */
+  truncated?: boolean
+  /** Per-statement outcome for multi-statement SQL */
+  statements?: Array<{ sql: string; rowCount: number; affectedRows: number; error?: string }>
   /** Refreshed schema after a DDL mutation, if applicable */
   refreshedSchema?: SchemaTable[]
 }

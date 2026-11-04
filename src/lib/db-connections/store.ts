@@ -15,6 +15,17 @@ import { getSupabaseAdmin } from '@/lib/supabase/admin'
 import { db } from '@/lib/db'
 import type { DbConnectionInput, DbConnectionRecord, SafeDbConnectionRecord } from './types'
 import { toSafeRecord } from './types'
+import { encryptSecret, decryptSecret } from '@/lib/server/crypto'
+
+/** Decrypt the stored password so callers always see plaintext in memory. */
+function reveal(rec: DbConnectionRecord): DbConnectionRecord {
+  try {
+    return { ...rec, password: decryptSecret(rec.password || '') }
+  } catch (err) {
+    console.error('[db-connections/store] Failed to decrypt password for connection', rec.id, err)
+    return { ...rec, password: '' }
+  }
+}
 
 // In-memory fallback keyed by user_id.
 // Use globalThis so the store survives Next.js dev hot-reloads (Turbopack
@@ -81,9 +92,8 @@ async function prismaList(userId: string): Promise<DbConnectionRecord[]> {
 
 async function prismaGet(userId: string, id: string): Promise<DbConnectionRecord | null> {
   try {
-    // If userId is empty, search by id only (used by SQL executor)
-    const where = userId ? { id, userId } : { id }
-    const row = await db.dbConnection.findFirst({ where })
+    if (!userId) return null
+    const row = await db.dbConnection.findFirst({ where: { id, userId } })
     return row ? prismaToRecord(row) : null
   } catch (err) {
     console.warn('[db-connections/store] Prisma get failed:', err)
@@ -102,7 +112,7 @@ async function prismaCreate(record: DbConnectionRecord): Promise<DbConnectionRec
         host: record.host,
         port: record.port,
         username: record.username,
-        password: record.password,
+        password: encryptSecret(record.password),
         database: record.database,
         schema: record.schema || null,
         ssl: record.ssl,
@@ -130,7 +140,7 @@ async function prismaUpdate(
     if (patch.host !== undefined) data.host = patch.host
     if (patch.port !== undefined) data.port = patch.port
     if (patch.username !== undefined) data.username = patch.username
-    if (patch.password !== undefined) data.password = patch.password
+    if (patch.password !== undefined) data.password = encryptSecret(patch.password)
     if (patch.database !== undefined) data.database = patch.database
     if (patch.schema !== undefined) data.schema = patch.schema
     if (patch.ssl !== undefined) data.ssl = patch.ssl
@@ -141,11 +151,10 @@ async function prismaUpdate(
     }
     if (patch.error_message !== undefined) data.errorMessage = patch.error_message
 
-    const row = await db.dbConnection.update({
-      where: { id },
-      data,
-    })
-    return prismaToRecord(row)
+    const res = await db.dbConnection.updateMany({ where: { id, userId }, data })
+    if (res.count === 0) return null
+    const row = await db.dbConnection.findFirst({ where: { id, userId } })
+    return row ? prismaToRecord(row) : null
   } catch (err) {
     console.warn('[db-connections/store] Prisma update failed:', err)
     return null
@@ -154,8 +163,8 @@ async function prismaUpdate(
 
 async function prismaDelete(userId: string, id: string): Promise<boolean> {
   try {
-    await db.dbConnection.delete({ where: { id } })
-    return true
+    const res = await db.dbConnection.deleteMany({ where: { id, userId } })
+    return res.count > 0
   } catch {
     return false
   }
@@ -237,52 +246,23 @@ export async function listConnections(userId: string): Promise<SafeDbConnectionR
 }
 
 export async function getConnection(userId: string, id: string): Promise<DbConnectionRecord | null> {
-  if (!id) return null
+  // Connections are ALWAYS looked up by (id, owner). There is deliberately no
+  // id-only fallback: that would let any caller use another user's database.
+  if (!id || !userId) return null
   if (await trySupabase()) {
     const admin = getSupabaseAdmin()!
-    let query = admin
+    const { data, error } = await admin
       .from('db_connections')
       .select('*')
       .eq('id', id)
-    if (userId) {
-      query = query.eq('user_id', userId)
-    }
-    const { data, error } = await query.single()
-    if (!error && data) return data as DbConnectionRecord
-    // BUGFIX (disconnect): If the user-scoped lookup failed (e.g. the Supabase
-    // session expired so userId fell back to DEFAULT_USER_ID, but the
-    // connection was saved under the real logged-in user), retry with an
-    // id-only lookup. This prevents the AI chat from "disconnecting" mid-task
-    // when the auth cookie is momentarily unavailable. Connections are
-    // user-created and the execute route already gates on authentication, so
-    // an id-only fallback is safe here.
-    if (userId && error) {
-      const { data: fallback, error: fbErr } = await admin
-        .from('db_connections')
-        .select('*')
-        .eq('id', id)
-        .single()
-      if (!fbErr && fallback) return fallback as DbConnectionRecord
-    }
-    // Supabase failed — fall through to Prisma, then in-memory
+      .eq('user_id', userId)
+      .maybeSingle()
+    if (!error && data) return reveal(data as DbConnectionRecord)
   }
-  // Try Prisma (durable storage) — first user-scoped, then id-only fallback
   const prismaRecord = await prismaGet(userId, id)
-  if (prismaRecord) return prismaRecord
-  // BUGFIX (disconnect): id-only fallback in Prisma so a connection saved
-  // under one user_id is still found when the auth state changes.
-  if (userId) {
-    const fallback = await prismaGet('', id)
-    if (fallback) return fallback
-  }
-  // In-memory fallback
-  const userScoped = listRaw(userId).find(c => c.id === id)
-  if (userScoped) return userScoped
-  for (const list of inMemoryStore.values()) {
-    const found = list.find(c => c.id === id)
-    if (found) return found
-  }
-  return null
+  if (prismaRecord) return reveal(prismaRecord)
+  const mem = listRaw(userId).find(c => c.id === id)
+  return mem ? reveal(mem) : null
 }
 
 export async function createConnection(
@@ -309,6 +289,7 @@ export async function createConnection(
       .from('db_connections')
       .insert({
         ...input,
+        password: encryptSecret(input.password),
         user_id: userId,
         status,
         last_connected_at: record.last_connected_at,
@@ -316,7 +297,7 @@ export async function createConnection(
       })
       .select()
       .single()
-    if (!error && data) return data as DbConnectionRecord
+    if (!error && data) return reveal(data as DbConnectionRecord)
     // BUGFIX (BUG-25): distinguish "table doesn't exist" (fall through to
     // in-memory with a one-time warning) from real errors like RLS denial
     // or unique-constraint violation (which should NOT silently fall
@@ -348,7 +329,7 @@ export async function createConnection(
   // Supabase failed or not available — save to Prisma (durable) AND in-memory
   await prismaCreate(record)
   const list = listRaw(userId)
-  list.push(record)
+  list.push({ ...record, password: encryptSecret(record.password) })
   saveRaw(userId, list)
   return record
 }
@@ -367,7 +348,7 @@ export async function updateConnection(
     if (patch.host !== undefined) updatePayload.host = patch.host
     if (patch.port !== undefined) updatePayload.port = patch.port
     if (patch.username !== undefined) updatePayload.username = patch.username
-    if (patch.password !== undefined) updatePayload.password = patch.password
+    if (patch.password !== undefined) updatePayload.password = encryptSecret(patch.password)
     if (patch.database !== undefined) updatePayload.database = patch.database
     if (patch.ssl !== undefined) updatePayload.ssl = patch.ssl
     if (patch.schema !== undefined) updatePayload.schema = patch.schema
@@ -385,12 +366,12 @@ export async function updateConnection(
       .eq('user_id', userId)
       .select()
       .single()
-    if (!error && data) return data as DbConnectionRecord
+    if (!error && data) return reveal(data as DbConnectionRecord)
   }
 
   // Supabase failed or not available — try Prisma, then in-memory
   const prismaUpdated = await prismaUpdate(userId, id, patch)
-  if (prismaUpdated) return prismaUpdated
+  if (prismaUpdated) return reveal(prismaUpdated)
 
   const list = listRaw(userId)
   const idx = list.findIndex(c => c.id === id)
@@ -398,12 +379,13 @@ export async function updateConnection(
   const updated: DbConnectionRecord = {
     ...list[idx],
     ...patch,
+    ...(patch.password !== undefined ? { password: encryptSecret(patch.password) } : {}),
     updated_at: now,
     last_connected_at: patch.status === 'connected' ? now : list[idx].last_connected_at,
   }
   list[idx] = updated
   saveRaw(userId, list)
-  return updated
+  return reveal(updated)
 }
 
 export async function deleteConnection(userId: string, id: string): Promise<boolean> {

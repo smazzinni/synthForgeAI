@@ -76,13 +76,7 @@ export function listDatabasesInMemory(userId: string): SyntheticDatabaseRecord[]
 }
 
 export function getDatabaseInMemory(userId: string, id: string): SyntheticDatabaseRecord | null {
-  const list = dbStore.get(userId) || []
-  // Also check global (for cross-user lookups by the generate-stream route)
-  for (const arr of dbStore.values()) {
-    const found = arr.find(d => d.id === id)
-    if (found) return found
-  }
-  return list.find(d => d.id === id) || null
+  return (dbStore.get(userId) || []).find(d => d.id === id) || null
 }
 
 export function createDatabaseInMemory(
@@ -108,22 +102,6 @@ export function updateDatabaseInMemory(
   id: string,
   patch: Partial<SyntheticDatabaseRecord>
 ): SyntheticDatabaseRecord | null {
-  // Search across all users (generate-stream may use a different user id
-  // than the one that created the DB).
-  for (const [uid, list] of dbStore.entries()) {
-    const idx = list.findIndex(d => d.id === id)
-    if (idx !== -1) {
-      const updated: SyntheticDatabaseRecord = {
-        ...list[idx],
-        ...patch,
-        updated_at: new Date().toISOString(),
-      }
-      list[idx] = updated
-      dbStore.set(uid, list)
-      return updated
-    }
-  }
-  // Fallback to user-scoped
   const list = dbStore.get(userId) || []
   const idx = list.findIndex(d => d.id === id)
   if (idx === -1) return null
@@ -167,14 +145,14 @@ export function createConversationInMemory(
     id: generateId(),
     database_id: input.database_id || null,
     title: input.title || 'New Conversation',
-    user_id: input.user_id || userId,
+    user_id: userId,
     status: input.status || 'active',
     agent_mode: input.agent_mode || 'orchestrator',
     created_at: now,
     updated_at: now,
     messages: [],
   }
-  const uid = input.user_id || userId
+  const uid = userId
   const list = conversationStore.get(uid) || []
   list.push(record)
   conversationStore.set(uid, list)
@@ -186,9 +164,8 @@ export function addMessagesInMemory(
   conversationId: string,
   messages: Array<{ role: string; content: string; agentName?: string }>
 ): boolean {
-  // Search across all users (the conversation may have been created with a
-  // different user id than the one adding messages).
-  for (const [uid, list] of conversationStore.entries()) {
+  // Owner-scoped only.
+  for (const [uid, list] of [[userId, conversationStore.get(userId) || []] as const]) {
     const idx = list.findIndex(c => c.id === conversationId)
     if (idx !== -1) {
       const now = new Date().toISOString()

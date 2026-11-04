@@ -1,470 +1,161 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import { requireUser } from '@/lib/server/auth'
+import { enforceRateLimit } from '@/lib/server/rate-limit'
 import {
-  listDatabasesInMemory,
-  getDatabaseInMemory,
-  createDatabaseInMemory,
-  updateDatabaseInMemory,
-  deleteDatabaseInMemory,
-} from '@/lib/in-memory-store'
-import {
-  listDatabasesPrisma,
-  getDatabasePrisma,
-  createDatabasePrisma,
-  updateDatabasePrisma,
-  deleteDatabasePrisma,
-} from '@/lib/prisma-store'
+  countRows,
+  createDatabase,
+  deleteDatabase,
+  getDatabase,
+  listDatabases,
+  updateDatabase,
+  type SyntheticDatabasePatch,
+} from '@/lib/server/synthetic-store'
 
-// ─── Default user ID for fallback when auth is not available ───
-const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
+// ─── Synthetic databases CRUD ───
+// GET    /api/databases            → { databases }   (list, without row data)
+// GET    /api/databases?id=…       → { database }    (full record incl. data_json)
+// POST   /api/databases            → { database }
+// PATCH  /api/databases            → { database }    (body: { id, ...fields })
+// DELETE /api/databases?id=…       → { success: true }
+// All operations are scoped to the authenticated user.
 
-// ─── In-memory request cache with automatic cleanup ───
-const apiCache = new Map<string, { data: unknown; timestamp: number }>()
-const CACHE_TTL = 3000 // 3 seconds cache
+export const dynamic = 'force-dynamic'
 
-// ─── Rate limiter with automatic cleanup ───
-const rateLimiter = new Map<string, { count: number; resetAt: number }>()
-const RATE_LIMIT = 30
-const RATE_WINDOW = 60000 // 1 minute
+const MAX_BODY_CHARS = 5_000_000
+const VALID_STATUS = new Set(['draft', 'generating', 'ready', 'error', 'archived'])
 
-// ─── Periodic cleanup of stale entries (prevent memory leaks) ───
-let lastCleanup = Date.now()
-const CLEANUP_INTERVAL = 120000 // 2 minutes
-
-function cleanup() {
-  const now = Date.now()
-  if (now - lastCleanup < CLEANUP_INTERVAL) return
-  lastCleanup = now
-
-  // Clean up expired rate limiter entries
-  for (const [key, entry] of rateLimiter.entries()) {
-    if (now > entry.resetAt) {
-      rateLimiter.delete(key)
-    }
+async function readJson(request: NextRequest): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; res: Response }> {
+  const text = await request.text()
+  if (text.length > MAX_BODY_CHARS) {
+    return { ok: false, res: NextResponse.json({ error: 'Payload too large (max 5MB)' }, { status: 413 }) }
   }
-
-  // Clean up expired cache entries
-  for (const [key, entry] of apiCache.entries()) {
-    if (now - entry.timestamp > 30000) { // Remove entries older than 30s
-      apiCache.delete(key)
-    }
-  }
-}
-
-function getClientId(request: NextRequest): string {
-  const forwarded = request.headers.get('x-forwarded-for')
-  const ip = forwarded ? forwarded.split(',')[0] : 'unknown'
-  return ip
-}
-
-function checkRateLimit(clientId: string, endpoint: string): boolean {
-  const key = `${clientId}:${endpoint}`
-  const now = Date.now()
-  const entry = rateLimiter.get(key)
-
-  if (!entry || now > entry.resetAt) {
-    rateLimiter.set(key, { count: 1, resetAt: now + RATE_WINDOW })
-    return true
-  }
-
-  if (entry.count >= RATE_LIMIT) {
-    return false
-  }
-
-  entry.count++
-  return true
-}
-
-// Lightweight user extraction from cookies - decodes Supabase JWT
-function getUserIdFromCookies(request: NextRequest): string | null {
   try {
-    // Try to find Supabase auth cookie - the pattern is sb-{ref}-auth-token
-    const supabaseCookies = request.cookies.getAll().filter(c =>
-      c.name.includes('-auth-token')
-    )
-
-    for (const cookie of supabaseCookies) {
-      try {
-        const rawValue = decodeURIComponent(cookie.value)
-
-        // Supabase stores the session as JSON: {access_token, refresh_token, ...}
-        let accessToken: string | null = null
-
-        try {
-          const parsed = JSON.parse(rawValue)
-          accessToken = parsed?.access_token || null
-        } catch {
-          // Might be just the token directly
-          accessToken = rawValue
-        }
-
-        if (!accessToken) continue
-
-        // Decode JWT without verification (we trust the cookie since it came from our server)
-        const parts = accessToken.split('.')
-        if (parts.length !== 3) continue
-
-        const payload = JSON.parse(atob(parts[1]))
-        if (payload?.sub) return payload.sub
-      } catch {
-        continue
-      }
-    }
-
-    return null
+    const body = JSON.parse(text)
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('not an object')
+    return { ok: true, body }
   } catch {
-    return null
+    return { ok: false, res: NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 }) }
   }
+}
+
+function pickPatch(body: Record<string, unknown>): SyntheticDatabasePatch | string {
+  const patch: SyntheticDatabasePatch = {}
+  if (body.name !== undefined) {
+    if (typeof body.name !== 'string' || !body.name.trim()) return 'name must be a non-empty string'
+    patch.name = body.name.trim().slice(0, 200)
+  }
+  if (body.db_type !== undefined) patch.db_type = String(body.db_type)
+  if (body.schema_json !== undefined) {
+    if (!Array.isArray(body.schema_json)) return 'schema_json must be an array'
+    patch.schema_json = body.schema_json
+  }
+  if (body.data_json !== undefined) {
+    if (!body.data_json || typeof body.data_json !== 'object' || Array.isArray(body.data_json)) return 'data_json must be an object of table → rows'
+    patch.data_json = body.data_json as Record<string, unknown[]>
+    if (body.row_count === undefined) patch.row_count = countRows(patch.data_json)
+  }
+  if (body.row_count !== undefined) patch.row_count = Math.max(0, Math.floor(Number(body.row_count)) || 0)
+  if (body.quality_score !== undefined) patch.quality_score = body.quality_score === null ? null : Number(body.quality_score)
+  if (body.status !== undefined) {
+    if (!VALID_STATUS.has(String(body.status))) return `status must be one of ${[...VALID_STATUS].join(', ')}`
+    patch.status = String(body.status)
+  }
+  return patch
+}
+
+const serverError = (where: string, err: unknown) => {
+  console.error(`[api/databases] ${where} failed:`, err)
+  return NextResponse.json({ error: 'Database storage is temporarily unavailable. Please retry.' }, { status: 500 })
 }
 
 export async function GET(request: NextRequest) {
-  cleanup() // Periodic memory cleanup
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+  const limited = enforceRateLimit(auth.userId, 'databases:get', 240)
+  if (limited) return limited
 
-  const clientId = getClientId(request)
-
-  // Rate limit check
-  if (!checkRateLimit(clientId, 'databases:get')) {
-    return NextResponse.json(
-      { error: 'Too many requests. Please wait a moment.' },
-      { status: 429 }
-    )
-  }
-
+  const id = request.nextUrl.searchParams.get('id')
   try {
-    const { searchParams } = new URL(request.url)
-    const id = searchParams.get('id')
-    const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
-
-    const admin = getSupabaseAdmin()
-    if (!admin) {
-      // Prisma-backed durable storage (survives server restarts)
-      try {
-        if (id) {
-          const database = await getDatabasePrisma(userId, id)
-          return NextResponse.json({ database })
-        }
-        const databases = await listDatabasesPrisma(userId)
-        return NextResponse.json({ databases })
-      } catch (err) {
-        console.warn('[Databases API] Prisma failed, falling back to in-memory:', err)
-        if (id) {
-          const dbRecord = getDatabaseInMemory(userId, id)
-          return NextResponse.json({ database: dbRecord })
-        }
-        return NextResponse.json({ databases: listDatabasesInMemory(userId) })
-      }
-    }
-
-    // Check cache for list queries (not individual ID queries)
-    if (!id) {
-      const cacheKey = `databases:list:${userId || 'anon'}`
-      const cached = apiCache.get(cacheKey)
-      if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-        return NextResponse.json(cached.data)
-      }
-    }
-
-    // If requesting a specific database by ID
     if (id) {
-      const { data, error } = await admin
-        .from('synthetic_databases')
-        .select('*')
-        .eq('id', id)
-        .single()
-
-      if (error) {
-        console.warn('[Databases API] Query error:', error.message)
-        return NextResponse.json({ database: null })
-      }
-
-      return NextResponse.json({ database: data })
+      const database = await getDatabase(auth.userId, id)
+      if (!database) return NextResponse.json({ error: 'Database not found' }, { status: 404 })
+      return NextResponse.json({ database }, { headers: { 'Cache-Control': 'no-store' } })
     }
-
-    // List all databases
-    let query = admin
-      .from('synthetic_databases')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(50)
-
-    query = query.eq('user_id', userId)
-
-    const { data, error } = await query
-
-    if (error) {
-      console.warn('[Databases API] Query error:', error.message)
-      return NextResponse.json({ databases: [] })
-    }
-
-    const responseData = { databases: data || [] }
-
-    // Cache the result
-    const cacheKey = `databases:list:${userId || 'anon'}`
-    apiCache.set(cacheKey, { data: responseData, timestamp: Date.now() })
-
-    return NextResponse.json(responseData)
+    const databases = await listDatabases(auth.userId)
+    return NextResponse.json({ databases }, { headers: { 'Cache-Control': 'no-store' } })
   } catch (err) {
-    console.error('[Databases API] Error:', err)
-    return NextResponse.json({ databases: [] })
+    return serverError('GET', err)
   }
 }
 
 export async function POST(request: NextRequest) {
-  cleanup() // Periodic memory cleanup
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+  const limited = enforceRateLimit(auth.userId, 'databases:write', 60)
+  if (limited) return limited
 
-  const clientId = getClientId(request)
-
-  if (!checkRateLimit(clientId, 'databases:post')) {
-    return NextResponse.json(
-      { error: 'Too many requests. Please wait a moment.' },
-      { status: 429 }
-    )
+  const parsed = await readJson(request)
+  if (!parsed.ok) return parsed.res
+  const body = parsed.body
+  if (typeof body.name !== 'string' || !body.name.trim()) {
+    return NextResponse.json({ error: 'name is required' }, { status: 400 })
   }
+  const patch = pickPatch(body)
+  if (typeof patch === 'string') return NextResponse.json({ error: patch }, { status: 400 })
 
   try {
-    // Limit request body size to prevent OOM
-    const text = await request.text()
-    if (text.length > 5 * 1024 * 1024) { // 5MB limit
-      return NextResponse.json(
-        { error: 'Request body too large. Maximum size is 5MB.' },
-        { status: 413 }
-      )
-    }
-
-    const body = JSON.parse(text)
-    const { name, db_type = 'postgresql', schema_json = [], data_json = {}, row_count = 0, quality_score = null, status = 'draft' } = body
-
-    if (!name) {
-      return NextResponse.json(
-        { error: 'Name is required' },
-        { status: 400 }
-      )
-    }
-
-    const admin = getSupabaseAdmin()
-    const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
-
-    if (!admin) {
-      // Prisma-backed durable storage
-      try {
-        const record = await createDatabasePrisma(userId, {
-          name,
-          db_type,
-          status,
-          schema_json,
-          data_json,
-          row_count: row_count || 0,
-          quality_score,
-        })
-        return NextResponse.json({ database: record })
-      } catch (err) {
-        console.warn('[Databases API] Prisma create failed, falling back to in-memory:', err)
-        const record = createDatabaseInMemory(userId, {
-          name,
-          db_type,
-          status,
-          schema_json,
-          data_json,
-          row_count: row_count || 0,
-          quality_score,
-        })
-        return NextResponse.json({ database: record })
-      }
-    }
-
-    const insertData: Record<string, unknown> = {
-      name,
-      db_type,
-      status,
-      schema_json,
-      data_json,
-      row_count: row_count || 0,
-      quality_score,
-      user_id: userId,
-    }
-
-    const { data, error } = await admin
-      .from('synthetic_databases')
-      .insert(insertData)
-      .select()
-      .single()
-
-    if (error) {
-      console.error('[Databases API] Insert error:', error.message)
-      return NextResponse.json({ error: error.message }, { status: 500 })
-    }
-
-    // Invalidate all list caches after mutation
-    for (const key of apiCache.keys()) {
-      if (key.startsWith('databases:list:')) {
-        apiCache.delete(key)
-      }
-    }
-
-    return NextResponse.json({ database: data })
+    const data = patch.data_json || {}
+    const database = await createDatabase(auth.userId, {
+      name: patch.name!,
+      db_type: patch.db_type || 'postgresql',
+      schema_json: patch.schema_json ?? [],
+      data_json: data,
+      row_count: patch.row_count ?? countRows(data),
+      quality_score: patch.quality_score ?? null,
+      status: patch.status || 'draft',
+    })
+    return NextResponse.json({ database }, { status: 201 })
   } catch (err) {
-    console.error('[Databases API] Error:', err)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    return serverError('POST', err)
   }
 }
 
 export async function PATCH(request: NextRequest) {
-  cleanup()
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+  const limited = enforceRateLimit(auth.userId, 'databases:write', 60)
+  if (limited) return limited
 
-  const clientId = getClientId(request)
-
-  if (!checkRateLimit(clientId, 'databases:patch')) {
-    return NextResponse.json(
-      { error: 'Too many requests. Please wait a moment.' },
-      { status: 429 }
-    )
-  }
+  const parsed = await readJson(request)
+  if (!parsed.ok) return parsed.res
+  const id = parsed.body.id
+  if (typeof id !== 'string' || !id) return NextResponse.json({ error: 'id is required' }, { status: 400 })
+  const patch = pickPatch(parsed.body)
+  if (typeof patch === 'string') return NextResponse.json({ error: patch }, { status: 400 })
+  if (Object.keys(patch).length === 0) return NextResponse.json({ error: 'No fields to update' }, { status: 400 })
 
   try {
-    // Limit request body size
-    const text = await request.text()
-    if (text.length > 5 * 1024 * 1024) { // 5MB limit
-      return NextResponse.json(
-        { error: 'Request body too large. Maximum size is 5MB.' },
-        { status: 413 }
-      )
-    }
-
-    const body = JSON.parse(text)
-    const { id, data_json, schema_json, row_count, quality_score, status, name } = body
-
-    if (!id) {
-      return NextResponse.json({ error: 'Database ID is required' }, { status: 400 })
-    }
-
-    const admin = getSupabaseAdmin()
-    const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
-
-    if (!admin) {
-      // Prisma-backed durable storage
-      const patch: Partial<{ data_json: unknown; schema_json: unknown; row_count: number; quality_score: number | null; status: string; name: string; db_type: string }> = {}
-      if (data_json !== undefined) patch.data_json = data_json
-      if (schema_json !== undefined) patch.schema_json = schema_json
-      if (row_count !== undefined) patch.row_count = row_count
-      if (quality_score !== undefined) patch.quality_score = quality_score
-      if (status !== undefined) patch.status = status
-      if (name !== undefined) patch.name = name
-
-      try {
-        const updated = await updateDatabasePrisma(userId, id, patch)
-        if (!updated) {
-          return NextResponse.json({ error: 'Database not found' }, { status: 404 })
-        }
-        return NextResponse.json({ database: updated })
-      } catch (err) {
-        console.warn('[Databases API] Prisma patch failed, falling back to in-memory:', err)
-        const updatedInMem = updateDatabaseInMemory(userId, id, patch)
-        if (!updatedInMem) {
-          return NextResponse.json({ error: 'Database not found' }, { status: 404 })
-        }
-        return NextResponse.json({ database: updatedInMem })
-      }
-    }
-
-    const updateData: Record<string, unknown> = {}
-    if (data_json !== undefined) updateData.data_json = data_json
-    if (schema_json !== undefined) updateData.schema_json = schema_json
-    if (row_count !== undefined) updateData.row_count = row_count
-    if (quality_score !== undefined) updateData.quality_score = quality_score
-    if (status !== undefined) updateData.status = status
-    if (name !== undefined) updateData.name = name
-
-    const { data, error } = await admin
-      .from('synthetic_databases')
-      .update(updateData)
-      .eq('id', id)
-      .select()
-      .single()
-
-    if (error) {
-      console.error('[Databases API] Patch error:', error.message)
-      return NextResponse.json({ error: error.message }, { status: 500 })
-    }
-
-    // Invalidate caches
-    for (const key of apiCache.keys()) {
-      if (key.startsWith('databases:list:')) {
-        apiCache.delete(key)
-      }
-    }
-
-    return NextResponse.json({ database: data })
+    const database = await updateDatabase(auth.userId, id, patch)
+    if (!database) return NextResponse.json({ error: 'Database not found' }, { status: 404 })
+    return NextResponse.json({ database })
   } catch (err) {
-    console.error('[Databases API] Patch error:', err)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    return serverError('PATCH', err)
   }
 }
 
 export async function DELETE(request: NextRequest) {
-  cleanup()
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+  const limited = enforceRateLimit(auth.userId, 'databases:write', 60)
+  if (limited) return limited
 
-  const clientId = getClientId(request)
-
-  if (!checkRateLimit(clientId, 'databases:delete')) {
-    return NextResponse.json(
-      { error: 'Too many requests. Please wait a moment.' },
-      { status: 429 }
-    )
-  }
-
+  const id = request.nextUrl.searchParams.get('id')
+  if (!id) return NextResponse.json({ error: 'id is required' }, { status: 400 })
   try {
-    const { searchParams } = new URL(request.url)
-    const id = searchParams.get('id')
-
-    if (!id) {
-      return NextResponse.json({ error: 'Database ID is required' }, { status: 400 })
-    }
-
-    const admin = getSupabaseAdmin()
-    const userId = getUserIdFromCookies(request) || DEFAULT_USER_ID
-
-    if (!admin) {
-      // Prisma-backed durable storage
-      try {
-        const ok = await deleteDatabasePrisma(userId, id)
-        if (!ok) {
-          // Try in-memory as fallback
-          const okInMem = deleteDatabaseInMemory(userId, id)
-          if (!okInMem) {
-            return NextResponse.json({ error: 'Database not found' }, { status: 404 })
-          }
-        }
-        return NextResponse.json({ success: true })
-      } catch (err) {
-        console.warn('[Databases API] Prisma delete failed, falling back to in-memory:', err)
-        const okInMem = deleteDatabaseInMemory(userId, id)
-        if (!okInMem) {
-          return NextResponse.json({ error: 'Database not found' }, { status: 404 })
-        }
-        return NextResponse.json({ success: true })
-      }
-    }
-
-    const { error } = await admin
-      .from('synthetic_databases')
-      .delete()
-      .eq('id', id)
-
-    if (error) {
-      console.error('[Databases API] Delete error:', error.message)
-      return NextResponse.json({ error: error.message }, { status: 500 })
-    }
-
-    // Invalidate all list caches after mutation
-    for (const key of apiCache.keys()) {
-      if (key.startsWith('databases:list:')) {
-        apiCache.delete(key)
-      }
-    }
-
+    const deleted = await deleteDatabase(auth.userId, id)
+    if (!deleted) return NextResponse.json({ error: 'Database not found' }, { status: 404 })
     return NextResponse.json({ success: true })
   } catch (err) {
-    console.error('[Databases API] Delete error:', err)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    return serverError('DELETE', err)
   }
 }

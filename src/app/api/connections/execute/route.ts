@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { requireUser } from '@/lib/server/auth'
 import { executeSqlOnExternalConnection } from '@/lib/db-connections/executor'
 import { getConnection } from '@/lib/db-connections/store'
 import { isDestructiveSQL, stripSqlComments } from '@/lib/ai-agents'
@@ -12,39 +13,14 @@ import { isDestructiveSQL, stripSqlComments } from '@/lib/ai-agents'
 // connection active and asks the AI to perform CRUD ops (INSERT/UPDATE/
 // DELETE/DROP/CREATE/ALTER) or SELECT queries.
 
-const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
 
-function getUserIdFromCookies(request: NextRequest): string {
-  try {
-    const supabaseCookies = request.cookies.getAll().filter(c => c.name.includes('-auth-token'))
-    for (const cookie of supabaseCookies) {
-      try {
-        const rawValue = decodeURIComponent(cookie.value)
-        let accessToken: string | null = null
-        try {
-          const parsed = JSON.parse(rawValue)
-          accessToken = parsed?.access_token || null
-        } catch {
-          accessToken = rawValue
-        }
-        if (!accessToken) continue
-        const parts = accessToken.split('.')
-        if (parts.length !== 3) continue
-        const payload = JSON.parse(atob(parts[1]))
-        if (payload?.sub) return payload.sub as string
-      } catch {
-        continue
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return DEFAULT_USER_ID
-}
 
 const ALLOWED_STATEMENTS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'WITH', 'TRUNCATE', 'USE', 'SHOW', 'DESCRIBE', 'EXPLAIN']
 
 export async function POST(request: NextRequest) {
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+
   try {
     const body = await request.json().catch(() => null)
     if (!body || typeof body !== 'object') {
@@ -66,7 +42,7 @@ export async function POST(request: NextRequest) {
     // SECURITY: verify the authenticated user owns this connection BEFORE
     // executing any SQL. Without this check, any user who learned another
     // user's connectionId could execute arbitrary SQL on their database.
-    const userId = getUserIdFromCookies(request)
+    const userId = auth.userId
     const conn = await getConnection(userId, connectionId)
     if (!conn) {
       return NextResponse.json({ error: 'Connection not found or you do not have access to it' }, { status: 403 })
@@ -123,7 +99,7 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const result = await executeSqlOnExternalConnection(connectionId, trimmed)
+    const result = await executeSqlOnExternalConnection(auth.userId, connectionId, trimmed)
     return NextResponse.json(result, { status: result.error ? 400 : 200 })
   } catch (err) {
     console.error('[Connections Execute API] error:', err)

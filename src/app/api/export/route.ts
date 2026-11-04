@@ -1,184 +1,180 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import { requireUser } from '@/lib/server/auth'
+import { enforceRateLimit } from '@/lib/server/rate-limit'
+import { getDatabase } from '@/lib/server/synthetic-store'
 
-// ─── Export API ───
-// Exports database data in various formats: SQL, CSV, JSON, XLSX
+// ─── Export a synthetic database ───
+// POST { databaseId, format: 'sql' | 'csv' | 'json' | 'xlsx', tableName? }
+// Returns the file as an attachment. Owner-scoped.
+
+export const dynamic = 'force-dynamic'
+
+type Row = Record<string, unknown>
+type TableSchema = { name: string; columns: Array<{ name: string; type: string }> }
+
+const SQL_TYPES = /^[A-Z][A-Z0-9_ ]*(\(\s*\d+(\s*,\s*\d+)?\s*\))?(\[\])?$/
+
+function columnsFor(rows: Row[], schema?: TableSchema): string[] {
+  const cols = new Set<string>(schema?.columns.map(c => c.name) ?? [])
+  for (const r of rows) for (const k of Object.keys(r)) cols.add(k)
+  return [...cols]
+}
+
+const qi = (name: string) => `"${name.replace(/"/g, '""')}"`
+
+function sqlLiteral(v: unknown): string {
+  if (v === null || v === undefined) return 'NULL'
+  if (typeof v === 'number') return Number.isFinite(v) ? String(v) : 'NULL'
+  if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE'
+  const s = typeof v === 'object' ? JSON.stringify(v) : String(v)
+  return `'${s.replace(/'/g, "''")}'`
+}
+
+function toSql(tables: Record<string, Row[]>, schema: TableSchema[], dbName: string): string {
+  const out: string[] = [`-- SynthForge AI export: ${dbName}`, `-- Generated ${new Date().toISOString()}`, '']
+  for (const [name, rows] of Object.entries(tables)) {
+    const ts = schema.find(s => s.name === name)
+    const cols = columnsFor(rows, ts)
+    if (cols.length === 0) continue
+    const defs = cols.map(c => {
+      const declared = ts?.columns.find(x => x.name === c)?.type?.toUpperCase().trim() || 'TEXT'
+      const type = SQL_TYPES.test(declared) ? declared : 'TEXT'
+      return `  ${qi(c)} ${type}${c === 'id' ? ' PRIMARY KEY' : ''}`
+    })
+    out.push(`CREATE TABLE IF NOT EXISTS ${qi(name)} (\n${defs.join(',\n')}\n);`, '')
+    for (let i = 0; i < rows.length; i += 500) {
+      const chunk = rows.slice(i, i + 500)
+      const values = chunk.map(r => `  (${cols.map(c => sqlLiteral(r[c])).join(', ')})`).join(',\n')
+      out.push(`INSERT INTO ${qi(name)} (${cols.map(qi).join(', ')}) VALUES\n${values};`, '')
+    }
+  }
+  return out.join('\n')
+}
+
+function csvCell(v: unknown): string {
+  if (v === null || v === undefined) return ''
+  let s = typeof v === 'object' ? JSON.stringify(v) : String(v)
+  // Neutralise spreadsheet formula injection.
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
+
+function toCsv(rows: Row[], schema?: TableSchema): string {
+  const cols = columnsFor(rows, schema)
+  return '﻿' + [cols.map(csvCell).join(','), ...rows.map(r => cols.map(c => csvCell(r[c])).join(','))].join('\r\n')
+}
+
+const xmlEscape = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+  // eslint-disable-next-line no-control-regex
+  .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+
+/** Excel-native SpreadsheetML workbook (one worksheet per table). */
+function toSpreadsheetXml(tables: Record<string, Row[]>, schema: TableSchema[]): string {
+  const sheets = Object.entries(tables).map(([name, rows]) => {
+    const cols = columnsFor(rows, schema.find(s => s.name === name))
+    const cell = (v: unknown) => {
+      if (typeof v === 'number' && Number.isFinite(v)) return `<Cell><Data ss:Type="Number">${v}</Data></Cell>`
+      if (typeof v === 'boolean') return `<Cell><Data ss:Type="Boolean">${v ? 1 : 0}</Data></Cell>`
+      const s = v === null || v === undefined ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v)
+      return `<Cell><Data ss:Type="String">${xmlEscape(s)}</Data></Cell>`
+    }
+    const header = `<Row>${cols.map(c => `<Cell ss:StyleID="h"><Data ss:Type="String">${xmlEscape(c)}</Data></Cell>`).join('')}</Row>`
+    const body = rows.map(r => `<Row>${cols.map(c => cell(r[c])).join('')}</Row>`).join('')
+    const sheetName = xmlEscape(name.replace(/[\\/?*[\]:]/g, '_').slice(0, 31) || 'Sheet')
+    return `<Worksheet ss:Name="${sheetName}"><Table>${header}${body}</Table></Worksheet>`
+  })
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<?mso-application progid="Excel.Sheet"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+<Styles><Style ss:ID="h"><Font ss:Bold="1"/></Style></Styles>
+${sheets.join('\n')}
+</Workbook>`
+}
+
+function safeFilename(name: string): string {
+  return (name || 'export').replace(/[^\w.\- ]+/g, '_').trim().slice(0, 100) || 'export'
+}
 
 export async function POST(request: NextRequest) {
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+  const limited = enforceRateLimit(auth.userId, 'export', 30)
+  if (limited) return limited
+
+  let body: { databaseId?: unknown; format?: unknown; tableName?: unknown }
   try {
-    const body = await request.json()
-    const { databaseId, format, tableName } = body as {
-      databaseId: string
-      format: 'sql' | 'csv' | 'json' | 'xlsx'
-      tableName?: string
-    }
+    body = await request.json()
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+  }
+  const databaseId = typeof body.databaseId === 'string' ? body.databaseId : ''
+  const format = String(body.format || '')
+  const tableName = typeof body.tableName === 'string' && body.tableName ? body.tableName : undefined
+  if (!databaseId) return NextResponse.json({ error: 'databaseId is required' }, { status: 400 })
+  if (!['sql', 'csv', 'json', 'xlsx'].includes(format)) {
+    return NextResponse.json({ error: 'format must be one of sql, csv, json, xlsx' }, { status: 400 })
+  }
 
-    if (!databaseId) {
-      return NextResponse.json({ error: 'Database ID is required' }, { status: 400 })
-    }
-
-    if (!format || !['sql', 'csv', 'json', 'xlsx'].includes(format)) {
-      return NextResponse.json({ error: 'Format must be one of: sql, csv, json, xlsx' }, { status: 400 })
-    }
-
-    const admin = getSupabaseAdmin()
-    if (!admin) {
-      return NextResponse.json({ error: 'Database service not configured' }, { status: 503 })
-    }
-
-    // Fetch the database
-    const { data: db, error: dbError } = await admin
-      .from('synthetic_databases')
-      .select('name, data_json, schema_json')
-      .eq('id', databaseId)
-      .single()
-
-    if (dbError || !db) {
-      return NextResponse.json({ error: 'Database not found' }, { status: 404 })
-    }
-
-    const dataJson = (db.data_json as Record<string, unknown[]>) || {}
-    const schemaJson = db.schema_json as Array<{ name: string; columns: Array<{ name: string; type: string }> }> || []
-    const dbName = db.name || 'database'
-
-    // Filter by table name if specified
-    const tablesToExport = tableName && dataJson[tableName]
-      ? { [tableName]: dataJson[tableName] }
-      : dataJson
-
-    let content: string
-    let contentType: string
-    let filename: string
-
-    switch (format) {
-      case 'sql':
-        content = generateSQLDump(dbName, tablesToExport, schemaJson)
-        contentType = 'application/sql'
-        filename = `${dbName}.sql`
-        break
-
-      case 'csv':
-        content = generateCSV(tablesToExport, tableName)
-        contentType = 'text/csv'
-        filename = `${dbName}${tableName ? `_${tableName}` : ''}.csv`
-        break
-
-      case 'json':
-        content = JSON.stringify(tableName ? tablesToExport[tableName] : tablesToExport, null, 2)
-        contentType = 'application/json'
-        filename = `${dbName}${tableName ? `_${tableName}` : ''}.json`
-        break
-
-      case 'xlsx':
-        // For XLSX, we return CSV format (can be opened in Excel)
-        // A proper XLSX would require a library like exceljs
-        content = generateCSV(tablesToExport, tableName)
-        contentType = 'application/vnd.ms-excel'
-        filename = `${dbName}${tableName ? `_${tableName}` : ''}.xlsx`
-        break
-
-      default:
-        return NextResponse.json({ error: 'Invalid format' }, { status: 400 })
-    }
-
-    return new NextResponse(content, {
-      status: 200,
-      headers: {
-        'Content-Type': contentType,
-        'Content-Disposition': `attachment; filename="${filename}"`,
-        'Cache-Control': 'no-cache',
-      },
-    })
+  let db
+  try {
+    db = await getDatabase(auth.userId, databaseId)
   } catch (err) {
-    console.error('[Export API] Error:', err)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    console.error('[api/export] storage error:', err)
+    return NextResponse.json({ error: 'Storage temporarily unavailable' }, { status: 503 })
   }
-}
+  if (!db) return NextResponse.json({ error: 'Database not found' }, { status: 404 })
 
-function generateSQLDump(
-  dbName: string,
-  tables: Record<string, unknown[]>,
-  schema: Array<{ name: string; columns: Array<{ name: string; type: string }> }>
-): string {
-  let sql = `-- SynthForge AI Database Export\n-- Database: ${dbName}\n-- Generated: ${new Date().toISOString()}\n\n`
-
-  for (const [tableName, rows] of Object.entries(tables)) {
-    const tableSchema = schema.find(s => s.name === tableName)
-    const tableRows = rows as Record<string, unknown>[]
-
-    // CREATE TABLE
-    sql += `CREATE TABLE ${tableName} (\n`
-    if (tableSchema) {
-      const colDefs = tableSchema.columns.map(col => {
-        let def = `  ${col.name} ${col.type.toUpperCase()}`
-        if (col.name === 'id') def += ' PRIMARY KEY'
-        return def
-      })
-      sql += colDefs.join(',\n')
-    } else {
-      // Infer from data
-      if (tableRows.length > 0) {
-        const cols = Object.keys(tableRows[0]).map(key => {
-          let def = `  ${key} VARCHAR(255)`
-          if (key === 'id' || key.endsWith('_id')) def = `  ${key} UUID`
-          return def
-        })
-        sql += cols.join(',\n')
-      }
-    }
-    sql += '\n);\n\n'
-
-    // INSERT statements
-    if (tableRows.length > 0) {
-      const columns = Object.keys(tableRows[0])
-      for (const row of tableRows) {
-        const values = columns.map(col => {
-          const val = row[col]
-          if (val === null || val === undefined) return 'NULL'
-          if (typeof val === 'number') return String(val)
-          if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE'
-          return `'${String(val).replace(/'/g, "''")}'`
-        })
-        sql += `INSERT INTO ${tableName} (${columns.join(', ')}) VALUES (${values.join(', ')});\n`
-      }
-      sql += '\n'
-    }
+  const all = (db.data_json || {}) as Record<string, Row[]>
+  const schema = (Array.isArray(db.schema_json) ? db.schema_json : []) as TableSchema[]
+  if (tableName && !all[tableName]) {
+    return NextResponse.json({ error: `Table "${tableName}" not found` }, { status: 404 })
+  }
+  const tables: Record<string, Row[]> = tableName ? { [tableName]: all[tableName] } : all
+  if (Object.keys(tables).length === 0) {
+    return NextResponse.json({ error: 'This database has no data to export yet' }, { status: 400 })
   }
 
-  return sql
-}
+  const base = safeFilename(tableName ? `${db.name}_${tableName}` : db.name)
+  let content: string
+  let contentType: string
+  let filename: string
 
-function generateCSV(tables: Record<string, unknown[]>, singleTable?: string): string {
-  const parts: string[] = []
-
-  for (const [tableName, rows] of Object.entries(tables)) {
-    const tableRows = rows as Record<string, unknown>[]
-
-    // If single table export, skip table header
-    if (!singleTable && Object.keys(tables).length > 1) {
-      parts.push(`--- ${tableName} ---`)
-    }
-
-    if (tableRows.length > 0) {
-      const columns = Object.keys(tableRows[0])
-
-      // Header row
-      parts.push(columns.map(c => `"${c}"`).join(','))
-
-      // Data rows
-      for (const row of tableRows) {
-        const values = columns.map(col => {
-          const val = row[col]
-          if (val === null || val === undefined) return ''
-          if (typeof val === 'object') return `"${JSON.stringify(val).replace(/"/g, '""')}"`
-          return `"${String(val).replace(/"/g, '""')}"`
-        })
-        parts.push(values.join(','))
+  switch (format) {
+    case 'sql':
+      content = toSql(tables, schema, db.name)
+      contentType = 'application/sql; charset=utf-8'
+      filename = `${base}.sql`
+      break
+    case 'csv': {
+      const entries = Object.entries(tables)
+      if (entries.length === 1) {
+        content = toCsv(entries[0][1], schema.find(s => s.name === entries[0][0]))
+      } else {
+        // Multiple tables: concatenate with a header line per table.
+        content = entries.map(([n, rows]) => `# table: ${n}\r\n${toCsv(rows, schema.find(s => s.name === n)).replace(/^﻿/, '')}`).join('\r\n\r\n')
+        content = '﻿' + content
       }
+      contentType = 'text/csv; charset=utf-8'
+      filename = `${base}.csv`
+      break
     }
-
-    parts.push('') // Empty line between tables
+    case 'json':
+      content = JSON.stringify(tableName ? tables[tableName] : tables, null, 2)
+      contentType = 'application/json; charset=utf-8'
+      filename = `${base}.json`
+      break
+    default:
+      content = toSpreadsheetXml(tables, schema)
+      contentType = 'application/vnd.ms-excel'
+      filename = `${base}.xls`
   }
 
-  return parts.join('\n')
+  return new NextResponse(content, {
+    status: 200,
+    headers: {
+      'Content-Type': contentType,
+      'Content-Disposition': `attachment; filename="${filename}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+      'Cache-Control': 'no-store',
+    },
+  })
 }

@@ -1,31 +1,49 @@
-import { NextRequest } from 'next/server'
-import { getSupabaseAdmin } from '@/lib/supabase/admin'
+import { NextRequest, after } from 'next/server'
+import { requireUser } from '@/lib/server/auth'
 import {
-  createDatabaseInMemory,
-  updateDatabaseInMemory,
-} from '@/lib/in-memory-store'
+  countRows,
+  createDatabase,
+  getDatabase,
+  updateDatabase,
+} from '@/lib/server/synthetic-store'
 import {
-  createDatabasePrisma,
-  updateDatabasePrisma,
-} from '@/lib/prisma-store'
+  cancelJob,
+  createJob,
+  emit,
+  failJob,
+  getActiveJobForDatabase,
+  getJob,
+  streamJob,
+  type GenerationJob,
+} from '@/lib/server/generation-jobs'
 
 // ─── Streaming Database Generation API ───
-// Receives a generation signal (schema + row counts + instructions),
-// calls the DeepSeek v4 API to produce NDJSON records, parses them line-by-line,
-// batch-inserts into the database, and streams SSE progress to the frontend.
+// POST   starts a generation job and streams its progress (SSE).
+// GET    ?jobId=… | ?databaseId=…  re-attaches to a running job (SSE when
+//        Accept: text/event-stream) or returns its status JSON.
+// DELETE ?jobId=… | ?databaseId=…  cancels a running job (explicit "Stop").
+//
+// The job is decoupled from the HTTP connection: if the client disconnects,
+// generation continues, rows keep being persisted, and the database is marked
+// `ready` when done. `after()` keeps the serverless function alive until then.
 
-const DEFAULT_USER_ID = '5a784d48-945a-47d3-ae95-d2aa5d9abe8c'
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
+export const maxDuration = 800
 
-// ─── DeepSeek v4 API configuration ───
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'
-const DEEPSEEK_MAX_TOKENS = parseInt(process.env.DEEPSEEK_MAX_TOKENS || '32000', 10)
+const DEEPSEEK_MAX_TOKENS = Number.parseInt(process.env.DEEPSEEK_MAX_TOKENS || '', 10) || 32000
 
-const BATCH_SIZE = 200          // rows per batch insert
-const FLUSH_INTERVAL_MS = 300   // flush batch at least every 300ms
+const MAX_TABLES = 30
+const MAX_ROWS_PER_TABLE = 5000
+const MAX_TOTAL_ROWS = 20000
+const PERSIST_INTERVAL_MS = 2500     // write progress to storage at most this often
+const PROGRESS_INTERVAL_MS = 300     // emit progress events at most this often
+const UPSTREAM_IDLE_TIMEOUT_MS = 120_000
+const MAX_CONTINUATION_ROUNDS = 3
 
-// ─── Types ───
 interface GenerationSchema {
   name: string
   columns: Array<{ name: string; type: string }>
@@ -38,62 +56,64 @@ interface GenerationRequest {
   rowCounts: Record<string, number>
   instructions?: string
   conversationHistory?: Array<{ role: string; content: string }>
-  userId?: string
 }
 
-interface SSEEvent {
-  type: 'progress' | 'table_complete' | 'complete' | 'error' | 'database_created'
-  table?: string
-  rowsInserted?: number
-  totalInserted?: number
-  targetRows?: number
-  totalRows?: number
-  tablesGenerated?: number
-  durationMs?: number
-  message?: string
-  recoverable?: boolean
-  databaseId?: string
-}
+const json = (body: unknown, status = 200) => Response.json(body, { status })
 
-// ─── Lightweight user extraction ───
-function getUserIdFromCookies(request: NextRequest): string | null {
-  try {
-    const supabaseCookies = request.cookies.getAll().filter(c =>
-      c.name.includes('-auth-token')
-    )
-    for (const cookie of supabaseCookies) {
-      try {
-        const rawValue = decodeURIComponent(cookie.value)
-        let accessToken: string | null = null
-        try {
-          const parsed = JSON.parse(rawValue)
-          accessToken = parsed?.access_token || null
-        } catch {
-          accessToken = rawValue
-        }
-        if (!accessToken) continue
-        const parts = accessToken.split('.')
-        if (parts.length !== 3) continue
-        const payload = JSON.parse(atob(parts[1]))
-        if (payload?.sub) return payload.sub
-      } catch {
-        continue
-      }
+// ─── Validation ───
+function validate(raw: unknown): { ok: true; req: GenerationRequest } | { ok: false; error: string } {
+  if (!raw || typeof raw !== 'object') return { ok: false, error: 'Invalid request body' }
+  const b = raw as Record<string, unknown>
+  if (!Array.isArray(b.schema) || b.schema.length === 0) return { ok: false, error: 'Schema is required' }
+  if (b.schema.length > MAX_TABLES) return { ok: false, error: `At most ${MAX_TABLES} tables per generation` }
+
+  const schema: GenerationSchema[] = []
+  for (const t of b.schema as unknown[]) {
+    const tt = t as { name?: unknown; columns?: unknown }
+    if (typeof tt?.name !== 'string' || !tt.name.trim() || !Array.isArray(tt.columns)) {
+      return { ok: false, error: 'Each table needs a name and a columns array' }
     }
-    return null
-  } catch {
-    return null
+    schema.push({
+      name: tt.name.trim(),
+      columns: (tt.columns as Array<{ name?: unknown; type?: unknown }>)
+        .filter(c => typeof c?.name === 'string')
+        .map(c => ({ name: String(c.name), type: String(c.type ?? 'text') })),
+    })
+  }
+
+  const rowCounts: Record<string, number> = {}
+  const rc = (b.rowCounts && typeof b.rowCounts === 'object' ? b.rowCounts : {}) as Record<string, unknown>
+  for (const t of schema) {
+    const n = Math.floor(Number(rc[t.name] ?? 10))
+    rowCounts[t.name] = Math.min(Math.max(Number.isFinite(n) ? n : 10, 1), MAX_ROWS_PER_TABLE)
+  }
+  const total = Object.values(rowCounts).reduce((s, n) => s + n, 0)
+  if (total > MAX_TOTAL_ROWS) return { ok: false, error: `At most ${MAX_TOTAL_ROWS.toLocaleString()} rows per generation` }
+
+  return {
+    ok: true,
+    req: {
+      databaseId: typeof b.databaseId === 'string' && b.databaseId ? b.databaseId : undefined,
+      databaseName: typeof b.databaseName === 'string' ? b.databaseName.slice(0, 200) : undefined,
+      schema,
+      rowCounts,
+      instructions: typeof b.instructions === 'string' ? b.instructions.slice(0, 8000) : undefined,
+      conversationHistory: Array.isArray(b.conversationHistory)
+        ? (b.conversationHistory as Array<{ role?: unknown; content?: unknown }>)
+            .filter(m => (m?.role === 'user' || m?.role === 'assistant') && typeof m.content === 'string')
+            .slice(-6)
+            .map(m => ({ role: String(m.role), content: String(m.content).slice(0, 4000) }))
+        : undefined,
+    },
   }
 }
 
-// ─── Build NDJSON generation prompt ───
+// ─── Prompts ───
 function buildGenerationPrompt(req: GenerationRequest): string {
   const tableDescriptions = req.schema.map(table => {
     const colDefs = table.columns.map(c => `  ${c.name}: ${c.type}`).join('\n')
-    const rowCount = req.rowCounts[table.name] || 10
-    return `Table: ${table.name} (${rowCount} rows)\n${colDefs}`
+    return `Table: ${table.name} (${req.rowCounts[table.name]} rows)\n${colDefs}`
   }).join('\n\n')
-
   const totalRows = Object.values(req.rowCounts).reduce((sum, n) => sum + n, 0)
   const tableOrder = req.schema.map(s => s.name).join(' → ')
 
@@ -105,921 +125,359 @@ SCHEMA (${req.schema.length} tables):
 ${tableDescriptions}
 
 ${req.instructions ? `ADDITIONAL INSTRUCTIONS:\n${req.instructions}\n` : ''}
-
-═══════════════════════════════════════════════════════════
-CRITICAL REQUIREMENTS — READ CAREFULLY:
-═══════════════════════════════════════════════════════════
-1. You MUST generate data for ALL ${req.schema.length} tables listed above. Do NOT stop after the first table.
-2. Table generation order: ${tableOrder}
-3. After completing one table's records, IMMEDIATELY output the next ###TABLE:xxx### marker and continue with that table's records.
-4. Do NOT end your response until EVERY table has been generated.
-5. Total tables to generate: ${req.schema.length}
-6. Total records to generate: ${totalRows}
-═══════════════════════════════════════════════════════════
+CRITICAL REQUIREMENTS:
+1. Generate data for ALL ${req.schema.length} tables, in this order: ${tableOrder}
+2. After one table's records, IMMEDIATELY output the next ###TABLE:name### marker.
+3. Total records to generate: ${totalRows}. Do not stop early.
 
 OUTPUT FORMAT:
-- Output ONLY raw NDJSON — one JSON object per line.
-- No arrays. No wrapper keys like {"tables":...}. No markdown. No explanation. No code fences.
-- Each line must be a complete, valid JSON record for the CURRENT table.
-- Generate records for each table sequentially: first ALL records for the first table, then ALL for the next, etc.
-- Before each table's records, output a single marker line: ###TABLE:table_name###
-- After the last record of the final table, you may stop.
+- Output ONLY raw NDJSON — one complete JSON object per line.
+- No arrays, wrapper keys, markdown, code fences or explanations.
+- Before each table's records output a single marker line: ###TABLE:table_name###
 
 DATA QUALITY:
-- Use realistic values (real-looking names, emails, addresses, phone numbers, cities, companies).
-- Use proper data types (numbers for quantities, ISO 8601 dates for timestamps, UUIDs for IDs).
-- Always include an "id" column as a UUID string for each record.
-- Include timestamps (created_at, updated_at) as ISO 8601 strings.
-- Make data internally consistent (e.g., order dates after customer registration).
-- Maintain referential integrity between tables (foreign key values must reference existing primary keys).
-- For localized data, use appropriate names, phone formats, currencies, and addresses.
+- Realistic values (names, emails, addresses, phones, companies, cities).
+- Proper types: numbers for quantities, ISO 8601 for timestamps, UUID strings for ids.
+- Always include an "id" column (UUID string) and created_at/updated_at timestamps when relevant.
+- Internally consistent data and referential integrity (foreign keys reference existing primary keys).
 
-Begin immediately. Do not confirm or summarize first. Generate ALL ${req.schema.length} tables in this single response.
-
-Example output format (2-table example):
+Example:
 ###TABLE:users###
 {"id":"a1b2c3d4-5678-9012-abcd-ef1234567890","name":"Alice Johnson","email":"alice@example.com","created_at":"2024-01-15T10:30:00Z"}
-{"id":"b2c3d4e5-6789-0123-bcde-f12345678901","name":"Bob Smith","email":"bob@example.com","created_at":"2024-01-16T14:22:00Z"}
 ###TABLE:orders###
 {"id":"c3d4e5f6-7890-1234-cdef-123456789012","user_id":"a1b2c3d4-5678-9012-abcd-ef1234567890","total":99.99,"created_at":"2024-02-01T09:15:00Z"}
 
-REMINDER: You MUST generate ALL ${req.schema.length} tables. Do NOT stop early.
-
-Now generate the data. Start with ###TABLE:${req.schema[0]?.name || 'table1'}###`
+Start with ###TABLE:${req.schema[0]?.name}###`
 }
 
-// ─── Build a focused continuation prompt for a single table ───
 function buildContinuationPrompt(
-  tableName: string,
+  table: GenerationSchema,
   rowCount: number,
-  columns: Array<{ name: string; type: string }>,
+  existingSample: unknown[],
+  related: Record<string, unknown[]>,
 ): string {
-  const colDefs = columns.map(c => `  ${c.name}: ${c.type}`).join('\n')
-  return `Generate ${rowCount} realistic records for the "${tableName}" table.
+  const colDefs = table.columns.map(c => `  ${c.name}: ${c.type}`).join('\n')
+  const fkHints = Object.entries(related)
+    .filter(([, rows]) => rows.length > 0)
+    .map(([name, rows]) => {
+      const ids = rows.slice(0, 50).map(r => (r as { id?: unknown }).id).filter(Boolean)
+      return ids.length ? `- ${name}.id values you may reference: ${JSON.stringify(ids)}` : ''
+    })
+    .filter(Boolean)
+    .join('\n')
+  return `Generate ${rowCount} more realistic records for the "${table.name}" table.
 
 COLUMNS:
 ${colDefs}
-
+${existingSample.length ? `\nEXISTING RECORDS (do not repeat their ids):\n${existingSample.slice(0, 3).map(r => JSON.stringify(r)).join('\n')}\n` : ''}
+${fkHints ? `\nFOREIGN KEYS:\n${fkHints}\n` : ''}
 RULES:
-- Output ONLY raw NDJSON — one JSON object per line.
-- No arrays. No wrapper keys. No markdown. No explanation. No code fences.
-- Start with a single marker line: ###TABLE:${tableName}###
-- Each line after the marker must be a complete, valid JSON record.
-- Use realistic values. Include UUIDs for IDs and ISO 8601 timestamps.
-- Always include an "id" column as a UUID string for each record.
-- Generate exactly ${rowCount} records — no more, no less.
-- Do not output anything after the last record.
-
-Begin now:`
+- Output ONLY raw NDJSON, one complete JSON object per line, no markdown.
+- Start with a single marker line: ###TABLE:${table.name}###
+- Include a new UUID "id" for every record; ISO 8601 timestamps.
+- Generate exactly ${rowCount} records, then stop.`
 }
 
-export async function POST(request: NextRequest) {
+// ─── DeepSeek streaming → content lines ───
+async function streamCompletion(
+  job: GenerationJob,
+  messages: Array<{ role: string; content: string }>,
+  onLine: (line: string) => Promise<void>,
+): Promise<string> {
+  const ctrl = new AbortController()
+  const onJobAbort = () => ctrl.abort()
+  job.abort.signal.addEventListener('abort', onJobAbort)
+  let idleTimer: ReturnType<typeof setTimeout> | null = null
+  const resetIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer)
+    idleTimer = setTimeout(() => ctrl.abort(), UPSTREAM_IDLE_TIMEOUT_MS)
+  }
+
   try {
-    const text = await request.text()
-    if (text.length > 200000) {
-      return new Response(JSON.stringify({ error: 'Request too large' }), {
-        status: 413,
-        headers: { 'Content-Type': 'application/json' },
-      })
+    resetIdle()
+    const res = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+      body: JSON.stringify({ model: DEEPSEEK_MODEL, messages, stream: true, max_tokens: DEEPSEEK_MAX_TOKENS }),
+      signal: ctrl.signal,
+    })
+    if (!res.ok || !res.body) {
+      const text = await res.text().catch(() => '')
+      throw new Error(`AI service error (${res.status})${text ? `: ${text.slice(0, 200)}` : ''}`)
     }
 
-    const body: GenerationRequest = JSON.parse(text)
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let sseBuffer = ''
+    let content = ''
+    let finishReason = ''
 
-    if (!body.schema || body.schema.length === 0) {
-      return new Response(JSON.stringify({ error: 'Schema is required' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    }
-
-    const userId = getUserIdFromCookies(request) || body.userId || DEFAULT_USER_ID
-    const startTime = Date.now()
-
-    // ─── Ensure a database record exists ───
-    let databaseId = body.databaseId
-    const admin = getSupabaseAdmin()
-
-    if (!databaseId) {
-      const dbName = body.databaseName || body.schema[0]?.name || 'synthetic_db'
-      if (admin) {
-        const { data: newDb, error: dbError } = await admin
-          .from('synthetic_databases')
-          .insert({
-            name: dbName,
-            db_type: 'postgresql',
-            schema_json: body.schema,
-            data_json: {},
-            row_count: 0,
-            quality_score: 0.85,
-            status: 'generating',
-            user_id: userId,
-          })
-          .select()
-          .single()
-
-        if (!dbError && newDb) {
-          databaseId = newDb.id
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      resetIdle()
+      sseBuffer += decoder.decode(value, { stream: true })
+      const sseLines = sseBuffer.split('\n')
+      sseBuffer = sseLines.pop() || ''
+      for (const sseLine of sseLines) {
+        const t = sseLine.trim()
+        if (!t.startsWith('data: ')) continue
+        const payload = t.slice(6)
+        if (payload === '[DONE]') continue
+        let parsed: { choices?: Array<{ delta?: { content?: string }; finish_reason?: string | null }> }
+        try { parsed = JSON.parse(payload) } catch { continue }
+        const choice = parsed.choices?.[0]
+        if (!choice) continue
+        if (choice.delta?.content) {
+          content += choice.delta.content
+          const lines = content.split('\n')
+          content = lines.pop() || ''
+          for (const line of lines) await onLine(line)
         }
-      } else {
-        // Prisma-backed durable storage (survives server restarts)
-        try {
-          const newDb = await createDatabasePrisma(userId, {
-            name: dbName,
-            db_type: 'postgresql',
-            schema_json: body.schema,
-            data_json: {},
-            row_count: 0,
-            quality_score: 0.85,
-            status: 'generating',
-          })
-          databaseId = newDb.id
-        } catch (err) {
-          console.warn('[Generate-Stream] Prisma create failed, falling back to in-memory:', err)
-          const newDb = createDatabaseInMemory(userId, {
-            name: dbName,
-            db_type: 'postgresql',
-            schema_json: body.schema,
-            data_json: {},
-            row_count: 0,
-            quality_score: 0.85,
-            status: 'generating',
-          })
-          databaseId = newDb.id
-        }
-      }
-    } else if (databaseId) {
-      // Update existing database status
-      if (admin) {
-        await admin
-          .from('synthetic_databases')
-          .update({ status: 'generating' })
-          .eq('id', databaseId)
-      } else {
-        try {
-          await updateDatabasePrisma(userId, databaseId, { status: 'generating' })
-        } catch {
-          updateDatabaseInMemory(userId, databaseId, { status: 'generating' })
-        }
+        if (choice.finish_reason) finishReason = choice.finish_reason
       }
     }
+    if (content.trim()) await onLine(content)
+    return finishReason
+  } finally {
+    if (idleTimer) clearTimeout(idleTimer)
+    job.abort.signal.removeEventListener('abort', onJobAbort)
+  }
+}
 
-    // ─── Build messages for the AI ───
-    const generationPrompt = buildGenerationPrompt(body)
+// ─── The worker ───
+async function runGeneration(job: GenerationJob, req: GenerationRequest, seed: Record<string, unknown[]>): Promise<void> {
+  const startTime = Date.now()
+  const allTableData: Record<string, unknown[]> = {}
+  for (const [t, rows] of Object.entries(seed)) if (Array.isArray(rows)) allTableData[t] = [...rows]
+  const existingRowCount = countRows(allTableData)
+  const baseline: Record<string, number> = Object.fromEntries(req.schema.map(t => [t.name, allTableData[t.name]?.length || 0]))
+  const stillTrying = new Set(req.schema.map(t => t.name))
+  const knownTables = new Set(req.schema.map(t => t.name))
+  const totalTarget = Object.values(req.rowCounts).reduce((s, n) => s + n, 0)
 
-    const messages: Array<{ role: string; content: string }> = [
-      { role: 'system', content: generationPrompt },
-    ]
+  let currentTable = ''
+  let generatedThisRun = 0
+  let malformed = 0
+  let lastPersist = Date.now()
+  let lastProgress = 0
+  let persistChain: Promise<unknown> = Promise.resolve()
 
-    // Include relevant conversation history for context
-    if (body.conversationHistory && body.conversationHistory.length > 0) {
-      const recentHistory = body.conversationHistory.slice(-6)
-      for (const msg of recentHistory) {
-        if (msg.role === 'user' || msg.role === 'assistant') {
-          messages.push({ role: msg.role, content: msg.content })
-        }
-      }
+  const generatedFor = (t: string) => (allTableData[t]?.length || 0) - (baseline[t] || 0)
+
+  const persist = (final = false) => {
+    const snapshot = { ...allTableData }
+    persistChain = persistChain.then(() =>
+      updateDatabase(job.userId, job.databaseId, {
+        data_json: snapshot,
+        row_count: countRows(snapshot),
+        ...(final ? { status: 'ready', schema_json: req.schema, quality_score: 0.85 } : {}),
+      }).catch(err => console.warn('[generate] persist failed:', err instanceof Error ? err.message : err)),
+    )
+    return persistChain
+  }
+
+  const progress = (force = false, message?: string) => {
+    const now = Date.now()
+    if (!force && now - lastProgress < PROGRESS_INTERVAL_MS) return
+    lastProgress = now
+    emit(job, {
+      type: 'progress',
+      table: currentTable,
+      rowsInserted: currentTable ? generatedFor(currentTable) : 0,
+      totalInserted: generatedThisRun,
+      targetRows: currentTable ? req.rowCounts[currentTable] || 0 : totalTarget,
+      message,
+    })
+    if (now - lastPersist >= PERSIST_INTERVAL_MS) {
+      lastPersist = now
+      void persist()
     }
+  }
 
-    // Add the final generation instruction
-    const totalRows = Object.values(body.rowCounts).reduce((sum, n) => sum + n, 0)
+  const resolveTableName = (name: string): string => {
+    const trimmed = name.trim()
+    if (knownTables.has(trimmed)) return trimmed
+    const lower = trimmed.toLowerCase()
+    for (const t of knownTables) if (t.toLowerCase() === lower) return t
+    return trimmed
+  }
+
+  const onLine = async (rawLine: string) => {
+    if (job.cancelRequested) return
+    const line = rawLine.trim().replace(/,$/, '')
+    if (!line || line.startsWith('```')) return
+    const marker = line.match(/^#{2,3}\s*TABLE\s*:\s*(.+?)\s*#{2,3}$/i)
+    if (marker) {
+      if (currentTable) emit(job, { type: 'table_complete', table: currentTable, totalRows: allTableData[currentTable]?.length || 0 })
+      currentTable = resolveTableName(marker[1])
+      progress(true, `Streaming records into [${currentTable}]`)
+      return
+    }
+    if (!currentTable) return
+    // Ignore surplus rows beyond what was requested for this table.
+    if (generatedFor(currentTable) >= (req.rowCounts[currentTable] ?? Infinity)) return
+    try {
+      const record = JSON.parse(line)
+      if (record && typeof record === 'object' && !Array.isArray(record)) {
+        ;(allTableData[currentTable] ||= []).push(record)
+        generatedThisRun++
+        progress()
+      }
+    } catch {
+      if (++malformed <= 5) console.warn('[generate] malformed NDJSON line:', line.slice(0, 120))
+    }
+  }
+
+  try {
+    emit(job, { type: 'progress', table: '', message: 'Generating data…', rowsInserted: 0, totalInserted: 0, targetRows: totalTarget })
+
+    const messages: Array<{ role: string; content: string }> = [{ role: 'system', content: buildGenerationPrompt(req) }]
+    for (const m of req.conversationHistory || []) messages.push(m)
     messages.push({
       role: 'user',
-      content: `Generate the data now. ${totalRows} total rows across ${body.schema.length} tables. You MUST generate ALL ${body.schema.length} tables — do not stop after the first. Begin with ###TABLE:${body.schema[0]?.name}###`,
+      content: `Generate the data now: ${totalTarget} rows across ${req.schema.length} tables. Begin with ###TABLE:${req.schema[0].name}###`,
     })
+    await streamCompletion(job, messages, onLine)
+    if (currentTable) emit(job, { type: 'table_complete', table: currentTable, totalRows: allTableData[currentTable]?.length || 0 })
 
-    console.log(`[Generate-Stream] Starting generation: ${body.schema.length} tables, ${totalRows} total rows. Tables: [${body.schema.map(s => s.name).join(', ')}]`)
-
-    // ─── Call DeepSeek v4 API with TRUE streaming to generate NDJSON data ───
-    if (!DEEPSEEK_API_KEY) {
-      return new Response(JSON.stringify({ error: 'DeepSeek API key not configured' }), {
-        status: 503,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    }
-
-    const deepseekResponse = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: DEEPSEEK_MODEL,
-        messages: messages as Array<{ role: string; content: string }>,
-        stream: true,
-        max_tokens: DEEPSEEK_MAX_TOKENS,
-        stream_options: { include_usage: true },
-      }),
-    })
-
-    if (!deepseekResponse.ok) {
-      const errorText = await deepseekResponse.text().catch(() => 'Unknown error')
-      console.error('[Generate-Stream] DeepSeek error:', deepseekResponse.status, errorText)
-      return new Response(JSON.stringify({ error: 'AI service error' }), {
-        status: deepseekResponse.status,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    }
-
-    // ─── Set up SSE stream ───
-    const encoder = new TextEncoder()
-    const upstreamReader = deepseekResponse.body?.getReader()
-
-    if (!upstreamReader) {
-      return new Response(JSON.stringify({ error: 'No response stream' }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    }
-
-    // ─── Data accumulation state ───
-    // BUGFIX (BUG-60): Seed allTableData with existing data from the database
-    // so that "add more rows" APPENDS to existing data instead of replacing it.
-    // Without this, the final write overwrites the stored data with only the
-    // rows generated in THIS request, causing data loss on every edit.
-    const allTableData: Record<string, unknown[]> = {}
-    if (databaseId) {
-      try {
-        if (admin) {
-          const { data: existingDb } = await admin
-            .from('synthetic_databases')
-            .select('data_json')
-            .eq('id', databaseId)
-            .single()
-          const existingData = (existingDb?.data_json as Record<string, unknown[]>) || {}
-          if (existingData && typeof existingData === 'object') {
-            // Deep-clone existing data into allTableData so we don't mutate the original
-            for (const [table, rows] of Object.entries(existingData)) {
-              if (Array.isArray(rows)) {
-                allTableData[table] = [...rows]
-              }
-            }
-            console.log(`[Generate-Stream] Seeded allTableData with ${Object.keys(allTableData).length} existing table(s) (${Object.values(allTableData).reduce((s, r) => s + r.length, 0)} total rows)`)
-          }
-        } else {
-          // Prisma / in-memory fallback
-          const { getDatabasePrisma } = await import('@/lib/prisma-store')
-          const { getDatabaseInMemory: getInMemory } = await import('@/lib/in-memory-store')
-          let existing: { data_json?: Record<string, unknown[]> } | null = null
-          try {
-            existing = await getDatabasePrisma(userId, databaseId)
-          } catch {
-            existing = getInMemory(userId, databaseId)
-          }
-          if (existing?.data_json && typeof existing.data_json === 'object') {
-            for (const [table, rows] of Object.entries(existing.data_json)) {
-              if (Array.isArray(rows)) {
-                allTableData[table] = [...rows]
-              }
-            }
-            console.log(`[Generate-Stream] Seeded allTableData (Prisma/in-memory) with ${Object.keys(allTableData).length} existing table(s)`)
-          }
-        }
-      } catch (err) {
-        console.warn('[Generate-Stream] Failed to seed existing data (will start fresh):', err)
-      }
-    }
-    let currentTable = ''
-    let insertQueue: unknown[] = []
-    let totalInserted = 0
-    let currentTableInserted = 0
-    let lastFlushTime = Date.now()
-    let malformedLines = 0
-    let lastFinishReason = ''
-
-    // Track how many rows existed BEFORE this request (for accurate row_count)
-    const existingRowCount = Object.values(allTableData).reduce((sum, rows) => sum + rows.length, 0)
-
-    const sendSSE = (event: SSEEvent): Uint8Array => {
-      return encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
-    }
-
-    // ─── Flush batch insert ───
-    const flushBatch = async (tableName: string, records: unknown[]): Promise<void> => {
-      if (records.length === 0) return
-
-      // Add to in-memory data
-      if (!allTableData[tableName]) {
-        allTableData[tableName] = []
-      }
-      allTableData[tableName].push(...records)
-
-      // Update database record periodically
-      if (databaseId) {
-        if (admin) {
-          try {
-            const { data: db } = await admin
-              .from('synthetic_databases')
-              .select('data_json')
-              .eq('id', databaseId)
-              .single()
-
-            const existingData = (db?.data_json as Record<string, unknown[]>) || {}
-            if (!existingData[tableName]) {
-              existingData[tableName] = []
-            }
-            existingData[tableName] = [...existingData[tableName], ...records]
-
-            await admin
-              .from('synthetic_databases')
-              .update({
-                data_json: existingData,
-                row_count: existingRowCount + totalInserted,
-              })
-              .eq('id', databaseId)
-          } catch (err) {
-            console.warn('[Generate-Stream] DB update failed:', err)
-          }
-        } else {
-          // Prisma-backed durable storage (with in-memory fallback)
-          // BUGFIX (BUG-60): allTableData already contains existing data
-          // (seeded at the start), so we persist it directly — no need to
-          // re-fetch and merge. The row_count includes existing + new rows.
-          try {
-            const merged: Record<string, unknown[]> = {}
-            for (const [t, rows] of Object.entries(allTableData)) {
-              merged[t] = rows
-            }
-            try {
-              updateDatabasePrisma(userId, databaseId, {
-                data_json: merged,
-                row_count: existingRowCount + totalInserted,
-              }).catch(() => {})
-            } catch {
-              updateDatabaseInMemory(userId, databaseId, {
-                data_json: merged,
-                row_count: existingRowCount + totalInserted,
-              })
-            }
-          } catch (err) {
-            console.warn('[Generate-Stream] DB update failed:', err)
-          }
-        }
-      }
-
-      totalInserted += records.length
-      currentTableInserted += records.length
-    }
-
-    // ─── Create the SSE ReadableStream ───
-    // `clientCancelled` lives in the outer scope so the cancel() handler can
-    // signal the start() loop to stop processing.
-    let clientCancelled = false
-    const stream = new ReadableStream({
-      async start(controller) {
-        const safeEnqueue = (data: Uint8Array) => {
-          if (clientCancelled) return
-          try {
-            controller.enqueue(data)
-          } catch {
-            // controller already closed
-          }
-        }
-
-        // Send initial event with databaseId
-        safeEnqueue(sendSSE({
-          type: 'progress',
-          table: '',
-          message: `Generating database schema...`,
-          rowsInserted: 0,
-          totalInserted: 0,
-          targetRows: totalRows,
-        }))
-
-        // Send the databaseId so the frontend can track it
-        if (databaseId) {
-          safeEnqueue(encoder.encode(`data: ${JSON.stringify({ type: 'database_created', databaseId })}\n\n`))
-        }
-
+    // ─── Continuation: fill tables that are missing or short ───
+    for (let round = 0; round < MAX_CONTINUATION_ROUNDS && !job.cancelRequested; round++) {
+      const incomplete = req.schema.filter(t => stillTrying.has(t.name) && generatedFor(t.name) < req.rowCounts[t.name])
+      if (incomplete.length === 0) break
+      progress(true, `Continuing generation for ${incomplete.length} table${incomplete.length === 1 ? '' : 's'}…`)
+      for (const table of incomplete) {
+        if (job.cancelRequested) break
+        const remaining = req.rowCounts[table.name] - generatedFor(table.name)
+        if (remaining <= 0) continue
+        const before = generatedFor(table.name)
+        currentTable = table.name
+        const related = Object.fromEntries(Object.entries(allTableData).filter(([n]) => n !== table.name))
         try {
-          // ─── Stream NDJSON content line-by-line from DeepSeek ───
-          // DeepSeek returns a true SSE stream. We read it chunk by chunk,
-          // accumulate a content buffer, split on newlines, and process each
-          // complete line as either a table marker or an NDJSON record.
-          const decoder = new TextDecoder()
-          let aiBuffer = ''
-          let contentBuffer = ''
-
-          while (true) {
-            if (clientCancelled) break
-            const { done, value } = await upstreamReader.read()
-            if (done) break
-
-            aiBuffer += decoder.decode(value, { stream: true })
-            const aiLines = aiBuffer.split('\n')
-            aiBuffer = aiLines.pop() || ''
-
-            for (const aiLine of aiLines) {
-              const trimmedAiLine = aiLine.trim()
-              if (!trimmedAiLine || !trimmedAiLine.startsWith('data: ')) continue
-
-              const aiData = trimmedAiLine.slice(6)
-              if (aiData === '[DONE]') continue
-
-              try {
-                const parsed = JSON.parse(aiData)
-                const choice = parsed.choices?.[0]
-                if (!choice) continue
-
-                const delta = choice.delta
-                if (delta?.content) {
-                  contentBuffer += delta.content
-
-                  // Process complete lines from the content buffer
-                  const contentLines = contentBuffer.split('\n')
-                  contentBuffer = contentLines.pop() || ''
-
-                  for (const contentLine of contentLines) {
-                    if (clientCancelled) break
-                    const line = contentLine.trim()
-                    if (!line) continue
-
-                    // Check for table marker
-                    const tableMarker = line.match(/^###TABLE:(.+?)###$/)
-                    if (tableMarker) {
-                      // Flush any pending records for the previous table
-                      if (insertQueue.length > 0 && currentTable) {
-                        await flushBatch(currentTable, insertQueue.splice(0))
-                        safeEnqueue(sendSSE({
-                          type: 'progress',
-                          table: currentTable,
-                          rowsInserted: currentTableInserted,
-                          totalInserted,
-                          targetRows: body.rowCounts[currentTable] || 0,
-                        }))
-                      }
-
-                      // Switch to new table
-                      currentTable = tableMarker[1]
-                      currentTableInserted = (allTableData[currentTable]?.length) || 0
-                      safeEnqueue(sendSSE({
-                        type: 'progress',
-                        table: currentTable,
-                        rowsInserted: 0,
-                        totalInserted,
-                        targetRows: body.rowCounts[currentTable] || 0,
-                        message: `Streaming records into [${currentTable}]`,
-                      }))
-                      continue
-                    }
-
-                    // Try to parse as NDJSON record
-                    if (currentTable) {
-                      try {
-                        const record = JSON.parse(line)
-                        if (typeof record === 'object' && record !== null && !Array.isArray(record)) {
-                          insertQueue.push(record)
-
-                          // Flush if batch is full or interval elapsed
-                          const now = Date.now()
-                          if (insertQueue.length >= BATCH_SIZE || now - lastFlushTime >= FLUSH_INTERVAL_MS) {
-                            await flushBatch(currentTable, insertQueue.splice(0))
-                            lastFlushTime = now
-
-                            safeEnqueue(sendSSE({
-                              type: 'progress',
-                              table: currentTable,
-                              rowsInserted: currentTableInserted,
-                              totalInserted,
-                              targetRows: body.rowCounts[currentTable] || 0,
-                            }))
-                          }
-                        }
-                      } catch {
-                        // Malformed line — skip and continue
-                        malformedLines++
-                        if (malformedLines <= 5) {
-                          console.warn('[Generate-Stream] Malformed NDJSON line:', line.substring(0, 100))
-                        }
-                      }
-                    }
-                  }
-                }
-
-                // Handle finish reason
-                if (choice.finish_reason) {
-                  lastFinishReason = choice.finish_reason
-                  console.log(`[Generate-Stream] Main stream finished. Reason: ${choice.finish_reason}`)
-
-                  // Process any remaining content in the buffer
-                  if (contentBuffer.trim()) {
-                    const line = contentBuffer.trim()
-                    const tableMarker = line.match(/^###TABLE:(.+?)###$/)
-                    if (!tableMarker && currentTable) {
-                      try {
-                        const record = JSON.parse(line)
-                        if (typeof record === 'object' && record !== null && !Array.isArray(record)) {
-                          insertQueue.push(record)
-                        }
-                      } catch {
-                        // skip
-                      }
-                    }
-                    contentBuffer = ''
-                  }
-                }
-              } catch {
-                // Skip unparseable AI chunks
-              }
-            }
-          }
-
-          // Flush remaining records after processing all lines
-          if (insertQueue.length > 0 && currentTable) {
-            await flushBatch(currentTable, insertQueue.splice(0))
-          }
-
-          // Mark current table complete
-          if (currentTable) {
-            safeEnqueue(sendSSE({
-              type: 'table_complete',
-              table: currentTable,
-              totalRows: currentTableInserted,
-            }))
-          }
-
-          // ═══════════════════════════════════════════════════════════
-          // CONTINUATION MECHANISM (Fix 2)
-          // After the main stream ends, check if all expected tables got
-          // data. If any are missing OR got fewer rows than requested,
-          // make focused follow-up API calls for each incomplete table.
-          // ═══════════════════════════════════════════════════════════
-          if (!clientCancelled) {
-            const expectedTables = body.schema.map(s => s.name)
-            const generatedTables = Object.keys(allTableData)
-
-            // Check for both completely missing tables AND tables with
-            // fewer rows than requested (partial generation due to token limits)
-            const incompleteTables = expectedTables.filter(t => {
-              const generated = allTableData[t]?.length || 0
-              const requested = body.rowCounts[t] || 0
-              return generated === 0 || (requested > 0 && generated < requested)
-            })
-
-            console.log(`[Generate-Stream] Expected tables: [${expectedTables.join(', ')}]`)
-            console.log(`[Generate-Stream] Generated tables: [${generatedTables.join(', ')}] (rows: ${generatedTables.map(t => `${t}=${allTableData[t]?.length || 0}/${body.rowCounts[t] || 0}`).join(', ')})`)
-
-            if (incompleteTables.length > 0) {
-              console.warn(`[Generate-Stream] ⚠️ ${incompleteTables.length} table(s) need more data. Triggering continuation: [${incompleteTables.join(', ')}]`)
-
-              safeEnqueue(sendSSE({
-                type: 'progress',
-                table: '',
-                message: `Continuing generation for ${incompleteTables.length} table${incompleteTables.length === 1 ? '' : 's'} that need more rows...`,
-                totalInserted,
-                targetRows: totalRows,
-              }))
-
-              // Wrap the entire continuation phase in a top-level try/catch
-              // so a failure never propagates to the outer catch (best-effort).
-              try {
-                for (const incompleteTable of incompleteTables) {
-                  if (clientCancelled) break
-
-                  const tableSchema = body.schema.find(s => s.name === incompleteTable)
-                  if (!tableSchema) {
-                    console.warn(`[Generate-Stream] Continuation: schema not found for ${incompleteTable}, skipping.`)
-                    continue
-                  }
-
-                  const requestedRows = body.rowCounts[incompleteTable] || 10
-                  const alreadyGenerated = allTableData[incompleteTable]?.length || 0
-                  const remainingRows = Math.max(0, requestedRows - alreadyGenerated)
-                  console.log(`[Generate-Stream] Continuation: generating ${remainingRows} more rows for [${incompleteTable}] (${alreadyGenerated}/${requestedRows} already generated)`)
-
-                  const continuationPrompt = buildContinuationPrompt(
-                    incompleteTable,
-                    remainingRows,
-                    tableSchema.columns,
-                  )
-
-                  let contResponse: Response
-                  try {
-                    contResponse = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
-                      method: 'POST',
-                      headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
-                      },
-                      body: JSON.stringify({
-                        model: DEEPSEEK_MODEL,
-                        messages: [
-                          { role: 'system', content: continuationPrompt },
-                          { role: 'user', content: `Generate ${remainingRows} more records for ${incompleteTable} now.` },
-                        ],
-                        stream: true,
-                        max_tokens: DEEPSEEK_MAX_TOKENS,
-                        stream_options: { include_usage: true },
-                      }),
-                    })
-                  } catch (fetchErr) {
-                    console.warn(`[Generate-Stream] Continuation fetch failed for ${incompleteTable}:`, fetchErr)
-                    continue
-                  }
-
-                  if (!contResponse.ok) {
-                    const contErrText = await contResponse.text().catch(() => 'Unknown error')
-                    console.warn(`[Generate-Stream] Continuation HTTP ${contResponse.status} for ${incompleteTable}:`, contErrText)
-                    continue
-                  }
-
-                  const contReader = contResponse.body?.getReader()
-                  if (!contReader) {
-                    console.warn(`[Generate-Stream] Continuation: no response body for ${incompleteTable}`)
-                    continue
-                  }
-
-                  // Set currentTable to the missing table and reset counters
-                  currentTable = incompleteTable
-                  currentTableInserted = (allTableData[incompleteTable]?.length) || 0
-                  lastFlushTime = Date.now()
-
-                  safeEnqueue(sendSSE({
-                    type: 'progress',
-                    table: incompleteTable,
-                    message: `Streaming records into [${incompleteTable}]`,
-                    rowsInserted: 0,
-                    totalInserted,
-                    targetRows: rowCount,
-                  }))
-
-                  // Process the continuation stream (same NDJSON parsing logic)
-                  const contDecoder = new TextDecoder()
-                  let contAiBuffer = ''
-                  let contContentBuffer = ''
-                  let contFinishReason = ''
-
-                  try {
-                    while (true) {
-                      if (clientCancelled) break
-                      const { done: contDone, value: contValue } = await contReader.read()
-                      if (contDone) break
-
-                      contAiBuffer += contDecoder.decode(contValue, { stream: true })
-                      const contAiLines = contAiBuffer.split('\n')
-                      contAiBuffer = contAiLines.pop() || ''
-
-                      for (const contAiLine of contAiLines) {
-                        const trimmedCont = contAiLine.trim()
-                        if (!trimmedCont || !trimmedCont.startsWith('data: ')) continue
-                        const contData = trimmedCont.slice(6)
-                        if (contData === '[DONE]') continue
-
-                        try {
-                          const parsed = JSON.parse(contData)
-                          const choice = parsed.choices?.[0]
-                          if (!choice) continue
-                          const delta = choice.delta
-                          if (delta?.content) {
-                            contContentBuffer += delta.content
-                            const contentLines = contContentBuffer.split('\n')
-                            contContentBuffer = contentLines.pop() || ''
-
-                            for (const contentLine of contentLines) {
-                              if (clientCancelled) break
-                              const line = contentLine.trim()
-                              if (!line) continue
-
-                              const tableMarker = line.match(/^###TABLE:(.+?)###$/)
-                              if (tableMarker) {
-                                // Flush the current queue before switching tables
-                                if (insertQueue.length > 0 && currentTable) {
-                                  await flushBatch(currentTable, insertQueue.splice(0))
-                                  safeEnqueue(sendSSE({
-                                    type: 'progress',
-                                    table: currentTable,
-                                    rowsInserted: currentTableInserted,
-                                    totalInserted,
-                                    targetRows: rowCount,
-                                  }))
-                                }
-                                currentTable = tableMarker[1]
-                                currentTableInserted = (allTableData[currentTable]?.length) || 0
-                                continue
-                              }
-
-                              if (currentTable) {
-                                try {
-                                  const record = JSON.parse(line)
-                                  if (typeof record === 'object' && record !== null && !Array.isArray(record)) {
-                                    insertQueue.push(record)
-                                    const now = Date.now()
-                                    if (insertQueue.length >= BATCH_SIZE || now - lastFlushTime >= FLUSH_INTERVAL_MS) {
-                                      await flushBatch(currentTable, insertQueue.splice(0))
-                                      lastFlushTime = now
-                                      safeEnqueue(sendSSE({
-                                        type: 'progress',
-                                        table: currentTable,
-                                        rowsInserted: currentTableInserted,
-                                        totalInserted,
-                                        targetRows: rowCount,
-                                      }))
-                                    }
-                                  }
-                                } catch {
-                                  // skip malformed line in continuation
-                                }
-                              }
-                            }
-                          }
-
-                          if (choice.finish_reason) {
-                            contFinishReason = choice.finish_reason
-                            // Process any remaining content in the buffer
-                            if (contContentBuffer.trim()) {
-                              const line = contContentBuffer.trim()
-                              const tableMarker = line.match(/^###TABLE:(.+?)###$/)
-                              if (!tableMarker && currentTable) {
-                                try {
-                                  const record = JSON.parse(line)
-                                  if (typeof record === 'object' && record !== null && !Array.isArray(record)) {
-                                    insertQueue.push(record)
-                                  }
-                                } catch {
-                                  // skip
-                                }
-                              }
-                              contContentBuffer = ''
-                            }
-                          }
-                        } catch {
-                          // skip unparseable chunk
-                        }
-                      }
-                    }
-                  } catch (contErr) {
-                    console.warn(`[Generate-Stream] Continuation stream error for ${incompleteTable}:`, contErr)
-                  }
-
-                  // Flush any remaining records queued for this table
-                  if (insertQueue.length > 0 && currentTable) {
-                    try {
-                      await flushBatch(currentTable, insertQueue.splice(0))
-                    } catch {
-                      // best effort
-                    }
-                  }
-
-                  const finalCount = allTableData[incompleteTable]?.length || 0
-                  console.log(`[Generate-Stream] Continuation complete for [${incompleteTable}]: ${finalCount} rows (finish_reason: ${contFinishReason || 'n/a'})`)
-
-                  // Mark this continuation table complete
-                  safeEnqueue(sendSSE({
-                    type: 'table_complete',
-                    table: incompleteTable,
-                    totalRows: finalCount,
-                  }))
-
-                  try { contReader.cancel() } catch { /* already released */ }
-                  try { contReader.releaseLock() } catch { /* already released */ }
-                }
-
-                console.log(`[Generate-Stream] Continuation phase finished.`)
-              } catch (contOuterErr) {
-                console.warn('[Generate-Stream] Continuation phase encountered an error (continuing with what we have):', contOuterErr)
-              }
-            } else {
-              console.log(`[Generate-Stream] ✓ All ${expectedTables.length} table(s) generated in main pass — no continuation needed.`)
-            }
-          }
+          await streamCompletion(job, [
+            { role: 'system', content: buildContinuationPrompt(table, remaining, allTableData[table.name] || [], related) },
+            { role: 'user', content: `Generate ${remaining} more records for ${table.name} now.` },
+          ], async (line) => {
+            // All continuation output belongs to this table.
+            if (/^#{2,3}\s*TABLE/i.test(line.trim())) return
+            currentTable = table.name
+            await onLine(line)
+          })
         } catch (err) {
-          console.error('[Generate-Stream] Stream error:', err)
-
-          // Flush remaining records before reporting error
-          if (insertQueue.length > 0 && currentTable) {
-            try {
-              await flushBatch(currentTable, insertQueue.splice(0))
-            } catch {
-              // Best effort
-            }
-          }
-
-          safeEnqueue(sendSSE({
-            type: 'error',
-            message: err instanceof Error ? err.message : 'Stream interrupted',
-            recoverable: totalInserted > 0,
-          }))
-        } finally {
-          // ─── Final flush ───
-          if (insertQueue.length > 0 && currentTable) {
-            try {
-              await flushBatch(currentTable, insertQueue.splice(0))
-            } catch {
-              // Best effort
-            }
-          }
-
-          // ─── Update database status ───
-          // BUGFIX (BUG-60): allTableData was seeded with existing data at the
-          // start, so this write now correctly MERGES new data with existing data.
-          // The row_count includes both existing and newly-generated rows.
-          const finalRowCount = existingRowCount + totalInserted
-          if (databaseId) {
-            if (admin) {
-              try {
-                await admin
-                  .from('synthetic_databases')
-                  .update({
-                    status: 'ready',
-                    data_json: allTableData,
-                    schema_json: body.schema,
-                    row_count: finalRowCount,
-                    quality_score: 0.85,
-                  })
-                  .eq('id', databaseId)
-              } catch (err) {
-                console.warn('[Generate-Stream] Final DB update failed:', err)
-              }
-            } else {
-              // Prisma-backed durable storage — persist the final data so the
-              // studio can load it via /api/databases?id=... (with in-memory fallback)
-              try {
-                try {
-                  await updateDatabasePrisma(userId, databaseId, {
-                    status: 'ready',
-                    data_json: allTableData,
-                    schema_json: body.schema,
-                    row_count: finalRowCount,
-                    quality_score: 0.85,
-                  })
-                } catch {
-                  updateDatabaseInMemory(userId, databaseId, {
-                    status: 'ready',
-                    data_json: allTableData,
-                    schema_json: body.schema,
-                    row_count: finalRowCount,
-                    quality_score: 0.85,
-                  })
-                }
-              } catch (err) {
-                console.warn('[Generate-Stream] Final DB update failed:', err)
-              }
-            }
-          }
-
-          const durationMs = Date.now() - startTime
-          const tablesGenerated = Object.keys(allTableData).length
-
-          console.log(`[Generate-Stream] Generation complete: ${totalInserted} rows across ${tablesGenerated}/${body.schema.length} tables in ${(durationMs / 1000).toFixed(1)}s (finish_reason: ${lastFinishReason || 'n/a'})`)
-
-          // Mark any tables with data as complete (covers tables that were
-          // processed by the main stream but not explicitly marked above).
-          for (const tableName of Object.keys(allTableData)) {
-            if (tableName !== currentTable) {
-              safeEnqueue(sendSSE({
-                type: 'table_complete',
-                table: tableName,
-                totalRows: allTableData[tableName].length,
-              }))
-            }
-          }
-
-          safeEnqueue(sendSSE({
-            type: 'complete',
-            tablesGenerated,
-            totalRows: totalInserted,
-            durationMs,
-          }))
-
-          if (!clientCancelled) {
-            try {
-              controller.close()
-            } catch {
-              // Already closed
-            }
-          }
+          if (job.cancelRequested) break
+          console.warn(`[generate] continuation failed for ${table.name}:`, err instanceof Error ? err.message : err)
         }
-      },
-      // Cancel the upstream DeepSeek stream when the client disconnects so
-      // tokens don't keep being billed after navigation/tab close.
-      async cancel() {
-        clientCancelled = true
-        try {
-          await upstreamReader.cancel()
-        } catch {
-          // already released
-        }
-        try {
-          await upstreamReader.releaseLock()
-        } catch {
-          // already released
-        }
-      },
-    })
-
-    return new Response(stream, {
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache, no-transform',
-        'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no',
-      },
-    })
+        emit(job, { type: 'table_complete', table: table.name, totalRows: allTableData[table.name]?.length || 0 })
+        // No progress this round → the model is stuck; stop retrying this table.
+        if (generatedFor(table.name) === before) stillTrying.delete(table.name)
+      }
+    }
   } catch (err) {
-    console.error('[Generate-Stream] Unhandled error:', err)
-    return new Response(JSON.stringify({ error: 'Internal server error' }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    })
+    if (!job.cancelRequested) {
+      console.error('[generate] job failed:', err)
+      await persist(true)
+      failJob(job, generatedThisRun > 0
+        ? `Generation stopped early (${err instanceof Error ? err.message : 'stream interrupted'}). ${generatedThisRun} rows were saved.`
+        : (err instanceof Error ? err.message : 'Generation failed'))
+      return
+    }
   }
+
+  await persist(true)
+
+  if (job.cancelRequested) {
+    emit(job, { type: 'cancelled', message: `Stopped. ${generatedThisRun} rows were saved.`, totalRows: generatedThisRun })
+    return
+  }
+
+  const tablesGenerated = req.schema.filter(t => (allTableData[t.name]?.length || 0) > 0).length
+  console.log(`[generate] job ${job.id}: ${generatedThisRun} new rows (${existingRowCount} existing) across ${tablesGenerated}/${req.schema.length} tables in ${((Date.now() - startTime) / 1000).toFixed(1)}s`)
+  emit(job, { type: 'complete', tablesGenerated, totalRows: generatedThisRun, durationMs: Date.now() - startTime, databaseId: job.databaseId })
+}
+
+// ─── Handlers ───
+export async function POST(request: NextRequest) {
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+
+  const text = await request.text()
+  if (text.length > 200_000) return json({ error: 'Request too large' }, 413)
+  let raw: unknown
+  try { raw = JSON.parse(text) } catch { return json({ error: 'Invalid JSON body' }, 400) }
+  const v = validate(raw)
+  if (!v.ok) return json({ error: v.error }, 400)
+  const req = v.req
+
+  if (!DEEPSEEK_API_KEY) return json({ error: 'AI service is not configured (DEEPSEEK_API_KEY missing)' }, 503)
+
+  try {
+    // Ensure a database record exists (owner-scoped) and seed existing rows so
+    // "add more rows" appends instead of replacing.
+    let seed: Record<string, unknown[]> = {}
+    let databaseId = req.databaseId
+    if (databaseId) {
+      const existing = await getDatabase(auth.userId, databaseId)
+      if (!existing) return json({ error: 'Database not found' }, 404)
+      const running = getActiveJobForDatabase(auth.userId, databaseId)
+      if (running) return streamJob(running) // already generating → just attach
+      seed = existing.data_json || {}
+      await updateDatabase(auth.userId, databaseId, { status: 'generating' })
+    } else {
+      const created = await createDatabase(auth.userId, {
+        name: req.databaseName || req.schema[0]?.name || 'synthetic_db',
+        db_type: 'postgresql',
+        schema_json: req.schema,
+        data_json: {},
+        row_count: 0,
+        quality_score: null,
+        status: 'generating',
+      })
+      databaseId = created.id
+    }
+
+    const job = createJob(auth.userId, databaseId)
+    emit(job, { type: 'job_started', databaseId })
+    emit(job, { type: 'database_created', databaseId })
+
+    const work = runGeneration(job, req, seed).catch(async (err) => {
+      console.error('[generate] unexpected worker error:', err)
+      await updateDatabase(job.userId, job.databaseId, { status: 'ready' }).catch(() => {})
+      failJob(job, 'Generation failed unexpectedly')
+    })
+    // Keep the function alive until the job finishes, even after the client leaves.
+    after(() => work)
+
+    return streamJob(job)
+  } catch (err) {
+    console.error('[generate] failed to start:', err)
+    return json({ error: 'Failed to start generation' }, 500)
+  }
+}
+
+export async function GET(request: NextRequest) {
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+
+  const jobId = request.nextUrl.searchParams.get('jobId')
+  const databaseId = request.nextUrl.searchParams.get('databaseId')
+  const job = jobId
+    ? getJob(auth.userId, jobId)
+    : databaseId ? getActiveJobForDatabase(auth.userId, databaseId) : null
+
+  if (!job) return json({ status: 'none' })
+  if (request.headers.get('accept')?.includes('text/event-stream')) return streamJob(job)
+  return json({ status: job.status, jobId: job.id, databaseId: job.databaseId, startedAt: job.startedAt })
+}
+
+export async function DELETE(request: NextRequest) {
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+  const jobId = request.nextUrl.searchParams.get('jobId')
+  const databaseId = request.nextUrl.searchParams.get('databaseId')
+  const job = jobId
+    ? getJob(auth.userId, jobId)
+    : databaseId ? getActiveJobForDatabase(auth.userId, databaseId) : null
+  if (!job) return json({ error: 'No running generation found' }, 404)
+  cancelJob(job)
+  return json({ success: true })
 }

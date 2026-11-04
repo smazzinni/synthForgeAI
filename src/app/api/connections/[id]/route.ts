@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { requireUser } from '@/lib/server/auth'
 import {
   getConnection,
   updateConnection,
@@ -6,7 +7,6 @@ import {
 } from '@/lib/db-connections/store'
 import { evictPool, testConnection, fetchExternalSchema, fetchSampleRows } from '@/lib/db-connections/executor'
 import { toSafeRecord } from '@/lib/db-connections/types'
-import { getUserIdFromCookies } from '@/lib/db-connections/api-helpers'
 
 // ─── Per-item routes: /api/connections/[id] ───
 //
@@ -20,13 +20,16 @@ type Params = { params: Promise<{ id: string }> }
 
 // GET /api/connections/[id]
 export async function GET(request: NextRequest, { params }: Params) {
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+
   try {
     const { id } = await params
     if (!id) {
       return NextResponse.json({ error: 'id is required' }, { status: 400 })
     }
 
-    const userId = getUserIdFromCookies(request)
+    const userId = auth.userId
     const conn = await getConnection(userId, id)
     if (!conn) {
       return NextResponse.json({ error: 'Connection not found' }, { status: 404 })
@@ -73,13 +76,16 @@ export async function GET(request: NextRequest, { params }: Params) {
 // PATCH /api/connections/[id]
 //   body: { ...fields, test?: boolean }
 export async function PATCH(request: NextRequest, { params }: Params) {
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+
   try {
     const { id } = await params
     if (!id) {
       return NextResponse.json({ error: 'id is required' }, { status: 400 })
     }
 
-    const userId = getUserIdFromCookies(request)
+    const userId = auth.userId
     const body = await request.json().catch(() => null)
     if (!body || typeof body !== 'object') {
       return NextResponse.json({ error: 'Invalid body' }, { status: 400 })
@@ -128,13 +134,16 @@ export async function PATCH(request: NextRequest, { params }: Params) {
 
 // DELETE /api/connections/[id]
 export async function DELETE(request: NextRequest, { params }: Params) {
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+
   try {
     const { id } = await params
     if (!id) {
       return NextResponse.json({ error: 'id is required' }, { status: 400 })
     }
 
-    const userId = getUserIdFromCookies(request)
+    const userId = auth.userId
     const ok = await deleteConnection(userId, id)
     if (!ok) {
       return NextResponse.json({ error: 'Connection not found' }, { status: 404 })

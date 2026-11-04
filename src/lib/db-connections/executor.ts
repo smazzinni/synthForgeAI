@@ -9,6 +9,50 @@
 
 import type { DbConnectionRecord, ExecuteResult, SchemaTable } from './types'
 import { getConnection } from './store'
+import { lookup } from 'node:dns/promises'
+import { isIP } from 'node:net'
+
+/** Max rows returned to the client per statement. */
+const MAX_RESULT_ROWS = 1000
+
+/**
+ * TLS certificate verification for external databases. Off by default because
+ * most managed providers (Supabase pooler, shared hosts) use certs that are not
+ * in Node's CA store; set DB_SSL_REJECT_UNAUTHORIZED=true to enforce it.
+ */
+const SSL_REJECT_UNAUTHORIZED = process.env.DB_SSL_REJECT_UNAUTHORIZED === 'true'
+
+// ─── SSRF guard ───
+// Users supply arbitrary hosts. In production, refuse loopback / private /
+// link-local targets (cloud metadata endpoints, internal services) unless
+// explicitly allowed with ALLOW_PRIVATE_DB_HOSTS=true.
+function isPrivateAddress(ip: string): boolean {
+  if (ip.includes(':')) {
+    const v = ip.toLowerCase()
+    if (v === '::1' || v === '::') return true
+    if (v.startsWith('fc') || v.startsWith('fd') || v.startsWith('fe80')) return true
+    const mapped = v.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/)
+    return mapped ? isPrivateAddress(mapped[1]) : false
+  }
+  const [a, b] = ip.split('.').map(Number)
+  return a === 10 || a === 127 || a === 0 ||
+    (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127)
+}
+
+async function assertHostAllowed(host: string): Promise<void> {
+  const allowPrivate = process.env.ALLOW_PRIVATE_DB_HOSTS === 'true' || process.env.NODE_ENV !== 'production'
+  if (allowPrivate) return
+  const addresses = isIP(host) ? [host] : (await lookup(host, { all: true })).map(a => a.address)
+  if (addresses.some(isPrivateAddress)) {
+    throw new Error(`Connections to private or internal network addresses are not allowed (${host}).`)
+  }
+}
+
+/** Identifies the connection parameters a pool was built with. */
+function poolFingerprint(conn: DbConnectionRecord): string {
+  return [conn.dialect, conn.host, conn.port, conn.username, conn.password, conn.database, conn.ssl ? 1 : 0, conn.schema || ''].join('|')
+}
 
 // ─── Lazy driver imports (so the bundle doesn't try to ship pg/mysql2) ───
 async function getPostgresPool() {
@@ -30,6 +74,7 @@ interface PoolEntry {
   pool: unknown  // either pg.Pool or mysql2.Pool
   dialect: 'postgres' | 'mysql'
   lastUsedAt: number
+  fingerprint: string
   close: () => Promise<void>
 }
 const globalForPool = globalThis as unknown as {
@@ -131,21 +176,28 @@ function buildPostgresSslOptions(conn: DbConnectionRecord): false | { rejectUnau
     // can route the connection to the right tenant.
     const projectRef = extractSupabaseProjectRef(conn.username, conn.host)
     return {
-      rejectUnauthorized: false,
+      rejectUnauthorized: SSL_REJECT_UNAUTHORIZED,
       ...(projectRef ? { servername: `${projectRef}.supabase.com` } : {}),
     }
   }
   // Non-Supabase: respect the user's SSL toggle.
-  return conn.ssl ? { rejectUnauthorized: false } : false
+  return conn.ssl ? { rejectUnauthorized: SSL_REJECT_UNAUTHORIZED } : false
 }
 
 async function getPool(conn: DbConnectionRecord): Promise<PoolEntry> {
   evictExpired() // lazy cleanup of expired pools
+  const fingerprint = poolFingerprint(conn)
   const existing = poolCache.get(conn.id)
-  if (existing) {
+  if (existing && existing.fingerprint === fingerprint) {
     existing.lastUsedAt = Date.now()
     return existing
   }
+  if (existing) {
+    // Credentials/host changed since the pool was built — rebuild it.
+    existing.close().catch(() => {})
+    poolCache.delete(conn.id)
+  }
+  await assertHostAllowed(conn.host)
 
   if (conn.dialect === 'postgres') {
     const Pool = await getPostgresPool()
@@ -165,9 +217,16 @@ async function getPool(conn: DbConnectionRecord): Promise<PoolEntry> {
       // Allow longer query timeouts for AI-driven complex operations
       statement_timeout: 60000,
     })
+    // An idle client erroring (server restart, network blip) emits 'error' on
+    // the pool; without a listener Node treats it as an uncaught exception.
+    ;(pool as unknown as { on: (ev: string, cb: (err: Error) => void) => void }).on('error', (err) => {
+      console.warn(`[executor] Postgres pool error for connection ${conn.id}:`, err.message)
+      poolCache.delete(conn.id)
+    })
     const entry: PoolEntry = {
       pool,
       dialect: 'postgres',
+      fingerprint,
       lastUsedAt: Date.now(),
       close: async () => { await (pool as { end: () => Promise<void> }).end() },
     }
@@ -193,18 +252,18 @@ async function getPool(conn: DbConnectionRecord): Promise<PoolEntry> {
       user: conn.username,
       password: conn.password,
       database: conn.database,
-      ssl: conn.ssl ? { rejectUnauthorized: false } : undefined,
+      ssl: conn.ssl ? { rejectUnauthorized: SSL_REJECT_UNAUTHORIZED } : undefined,
       waitForConnections: true,
       connectionLimit: 5,
       queueLimit: 0,
       connectTimeout: 20000,
-      // Acquire timeout — how long to wait for a connection from the pool
-      // before giving up. AI-driven multi-statement flows can take a while.
-      acquireTimeout: 30000,
+      enableKeepAlive: true,
+      dateStrings: true,
     })
     const entry: PoolEntry = {
       pool,
       dialect: 'mysql',
+      fingerprint,
       lastUsedAt: Date.now(),
       close: async () => { await (pool as { end: () => Promise<void> }).end() },
     }
@@ -538,128 +597,131 @@ function splitSqlStatements(sql: string): string[] {
   return statements
 }
 
-/**
- * Execute a single SQL statement.
- */
-async function executeSingleStatement(
-  entry: PoolEntry,
-  sql: string,
-  start: number,
-): Promise<ExecuteResult> {
-  try {
-    if (entry.dialect === 'postgres') {
-      const pool = entry.pool as { query: (text: string) => Promise<{ rows: Record<string, unknown>[]; rowCount: number; command?: string }> }
-      const result = await pool.query(sql)
-      const columns = result.rows.length > 0 ? Object.keys(result.rows[0]) : []
-      const isMutation = !!result.command && result.command !== 'SELECT'
-      return {
-        rows: result.rows.slice(0, 1000),
-        columns,
-        rowCount: result.rows.length,
-        affectedRows: isMutation ? (result.rowCount || 0) : 0,
-        executionTime: Date.now() - start,
-      }
-    }
+type Runner = (sql: string) => Promise<unknown>
 
-    // MySQL
-    const pool = entry.pool as { query: (sql: string, values?: unknown) => Promise<unknown> }
-    const raw = await pool.query(sql)
-
-    const header = Array.isArray(raw) ? raw[0] : raw
-    const isResultSetHeader =
-      typeof header === 'object' && header !== null && !Array.isArray(header) && 'affectedRows' in header
-
-    let rows: Record<string, unknown>[]
-    let fields: Array<{ name: string }>
-    let affectedRows: number
-
-    if (isResultSetHeader) {
-      rows = []
-      fields = []
-      affectedRows = (header as { affectedRows?: number }).affectedRows || 0
-    } else {
-      rows = (Array.isArray(raw) && Array.isArray(raw[0]) ? raw[0] : raw) as Record<string, unknown>[]
-      fields = (Array.isArray(raw) && Array.isArray(raw[1]) ? raw[1] : []) as Array<{ name: string }>
-      affectedRows = 0
-    }
-
-    const columns = fields.length > 0 ? fields.map(f => f.name) : (rows.length > 0 ? Object.keys(rows[0]) : [])
-
+/** Normalise a driver result into ExecuteResult (without timing). */
+function normaliseResult(dialect: 'postgres' | 'mysql', raw: unknown): Omit<ExecuteResult, 'executionTime'> {
+  if (dialect === 'postgres') {
+    const results = (Array.isArray(raw) ? raw : [raw]) as Array<{ rows?: Record<string, unknown>[]; rowCount?: number | null; command?: string; fields?: Array<{ name: string }> }>
+    const last = results[results.length - 1] || {}
+    const rows = last.rows || []
+    const columns = last.fields?.map(f => f.name) ?? (rows.length > 0 ? Object.keys(rows[0]) : [])
+    const isMutation = !!last.command && last.command !== 'SELECT'
     return {
-      rows: rows.slice(0, 1000),
+      rows: rows.slice(0, MAX_RESULT_ROWS),
       columns,
       rowCount: rows.length,
-      affectedRows,
-      executionTime: Date.now() - start,
+      affectedRows: isMutation ? (last.rowCount || 0) : 0,
+      truncated: rows.length > MAX_RESULT_ROWS,
     }
-  } catch (err) {
-    return {
-      rows: [],
-      columns: [],
-      rowCount: 0,
-      affectedRows: 0,
-      executionTime: Date.now() - start,
-      error: err instanceof Error ? err.message : String(err),
-    }
+  }
+  const header = Array.isArray(raw) ? raw[0] : raw
+  if (typeof header === 'object' && header !== null && !Array.isArray(header) && 'affectedRows' in header) {
+    return { rows: [], columns: [], rowCount: 0, affectedRows: (header as { affectedRows?: number }).affectedRows || 0 }
+  }
+  const rows = (Array.isArray(raw) && Array.isArray(raw[0]) ? raw[0] : raw) as Record<string, unknown>[]
+  const fields = (Array.isArray(raw) && Array.isArray(raw[1]) ? raw[1] : []) as Array<{ name: string }>
+  const columns = fields.length > 0 ? fields.map(f => f.name) : (rows.length > 0 ? Object.keys(rows[0]) : [])
+  return {
+    rows: rows.slice(0, MAX_RESULT_ROWS),
+    columns,
+    rowCount: rows.length,
+    affectedRows: 0,
+    truncated: rows.length > MAX_RESULT_ROWS,
   }
 }
 
+// Statements Postgres/MySQL refuse to run inside an explicit transaction.
+const NON_TRANSACTIONAL = /^\s*(VACUUM|CREATE\s+DATABASE|DROP\s+DATABASE|CREATE\s+INDEX\s+CONCURRENTLY|DROP\s+INDEX\s+CONCURRENTLY|REINDEX\s+DATABASE|ALTER\s+SYSTEM|BEGIN|START\s+TRANSACTION|COMMIT|ROLLBACK)\b/i
+
 /**
- * Execute arbitrary SQL against the external DB. Supports multi-statement SQL
- * (multiple statements separated by semicolons). Each statement is executed
- * individually and results are aggregated.
+ * Execute arbitrary SQL against the external DB.
+ *
+ * Multiple statements run on ONE dedicated connection inside a transaction:
+ * if any statement fails, everything is rolled back and the error names the
+ * failing statement — the database is never left half-modified. (Statements
+ * that cannot run in a transaction, e.g. VACUUM, run without one.)
  */
 export async function executeSql(
   conn: DbConnectionRecord,
   sql: string,
 ): Promise<ExecuteResult> {
   const start = Date.now()
-  const entry = await getPool(conn)
+  const fail = (error: string, extra: Partial<ExecuteResult> = {}): ExecuteResult => ({
+    rows: [], columns: [], rowCount: 0, affectedRows: 0, executionTime: Date.now() - start, error, ...extra,
+  })
 
-  // Split multi-statement SQL into individual statements
   const statements = splitSqlStatements(sql)
+  if (statements.length === 0) return fail('No SQL statements to execute')
 
-  if (statements.length === 0) {
-    return {
-      rows: [], columns: [], rowCount: 0, affectedRows: 0,
-      executionTime: Date.now() - start,
-      error: 'No SQL statements to execute',
-    }
+  let entry: PoolEntry
+  try {
+    entry = await getPool(conn)
+  } catch (err) {
+    return fail(err instanceof Error ? err.message : String(err))
   }
 
-  // Single statement — execute directly
-  if (statements.length === 1) {
-    return executeSingleStatement(entry, statements[0], start)
-  }
+  const useTransaction = statements.length > 1 && !statements.some(st => NON_TRANSACTIONAL.test(st))
 
-  // Multiple statements — execute each, aggregate results
-  const allRows: Record<string, unknown>[] = []
-  let allColumns: string[] = []
-  let totalAffected = 0
-  let executedCount = 0
-  let lastError: string | undefined
-
-  for (const stmt of statements) {
-    const result = await executeSingleStatement(entry, stmt, start)
-    if (result.error) {
-      lastError = result.error
+  // Acquire a dedicated client so BEGIN/COMMIT apply to the same session.
+  let run: Runner
+  let release: () => void = () => {}
+  try {
+    if (entry.dialect === 'postgres') {
+      const client = await (entry.pool as { connect: () => Promise<{ query: Runner; release: () => void }> }).connect()
+      run = (q) => client.query(q)
+      release = () => client.release()
     } else {
-      executedCount++
+      const c = await (entry.pool as { getConnection: () => Promise<{ query: Runner; release: () => void }> }).getConnection()
+      run = (q) => c.query(q)
+      release = () => c.release()
     }
-    if (result.rows.length > 0) {
-      allRows.push(...result.rows)
-      if (allColumns.length === 0) allColumns = result.columns
-    }
-    totalAffected += result.affectedRows
+  } catch (err) {
+    return fail(err instanceof Error ? err.message : String(err))
   }
 
+  const statementResults: NonNullable<ExecuteResult['statements']> = []
+  let last: Omit<ExecuteResult, 'executionTime'> = { rows: [], columns: [], rowCount: 0, affectedRows: 0 }
+  let lastWithRows: typeof last | null = null
+  let totalAffected = 0
+
+  try {
+    if (useTransaction) await run(entry.dialect === 'postgres' ? 'BEGIN' : 'START TRANSACTION')
+    for (let i = 0; i < statements.length; i++) {
+      const stmt = statements[i]
+      try {
+        last = normaliseResult(entry.dialect, await run(stmt))
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        if (useTransaction) {
+          try { await run('ROLLBACK') } catch { /* connection may be gone */ }
+        }
+        statementResults.push({ sql: stmt, rowCount: 0, affectedRows: 0, error: message })
+        const prefix = statements.length > 1
+          ? `Statement ${i + 1} of ${statements.length} failed${useTransaction ? ' — all changes were rolled back' : ''}: `
+          : ''
+        return fail(prefix + message, { statements: statementResults, affectedRows: useTransaction ? 0 : totalAffected })
+      }
+      totalAffected += last.affectedRows
+      if (last.columns.length > 0) lastWithRows = last
+      statementResults.push({ sql: stmt, rowCount: last.rowCount, affectedRows: last.affectedRows })
+    }
+    if (useTransaction) await run('COMMIT')
+  } catch (err) {
+    if (useTransaction) {
+      try { await run('ROLLBACK') } catch { /* ignore */ }
+    }
+    return fail(err instanceof Error ? err.message : String(err), { statements: statementResults })
+  } finally {
+    release()
+  }
+
+  const shown = lastWithRows ?? last
   return {
-    rows: allRows.slice(0, 1000),
-    columns: allColumns,
-    rowCount: allRows.length,
+    ...shown,
     affectedRows: totalAffected,
     executionTime: Date.now() - start,
-    error: executedCount === 0 ? (lastError || 'All statements failed') : undefined,
+    statements: statements.length > 1 ? statementResults : undefined,
   }
 }
 
@@ -668,9 +730,8 @@ export async function executeSql(
  * Loads the connection record (regardless of user — the route is responsible
  * for authentication), then runs `executeSql`.
  */
-export async function executeSqlOnExternalConnection(connectionId: string, sql: string): Promise<ExecuteResult & { error?: string }> {
-  // Use empty user id — getConnection falls back to a global in-memory search.
-  const conn = await getConnection('', connectionId)
+export async function executeSqlOnExternalConnection(userId: string, connectionId: string, sql: string): Promise<ExecuteResult & { error?: string }> {
+  const conn = await getConnection(userId, connectionId)
   if (!conn) {
     return {
       rows: [], columns: [], rowCount: 0, affectedRows: 0, executionTime: 0,

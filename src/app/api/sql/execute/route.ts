@@ -1,4 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { requireUser } from '@/lib/server/auth'
+import { getDatabase, updateDatabase, countRows } from '@/lib/server/synthetic-store'
+import { runSyntheticSql } from '@/lib/server/synthetic-sql'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
 import { executeSqlOnExternalConnection } from '@/lib/db-connections/executor'
 import { isDestructiveSQL, stripSqlComments } from '@/lib/ai-agents'
@@ -20,8 +23,17 @@ const DANGEROUS_PATTERNS = [
 ]
 
 export async function POST(request: NextRequest) {
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+
+  let body: unknown
   try {
-    const body = await request.json()
+    body = await request.json()
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+  }
+
+  try {
     const {
       sql,
       databaseId,
@@ -90,36 +102,24 @@ export async function POST(request: NextRequest) {
     // If a connectionId is supplied, execute the SQL live against the
     // user-supplied external Postgres/MySQL database.
     if (connectionId) {
-      const result = await executeSqlOnExternalConnection(connectionId, trimmedSql)
+      const result = await executeSqlOnExternalConnection(auth.userId, connectionId, trimmedSql)
       return NextResponse.json(result, { status: result.error ? 400 : 200 })
     }
 
-    // ─── Synthetic DB path (existing behavior, enhanced) ───
-    const admin = getSupabaseAdmin()
-    if (!admin) {
-      return NextResponse.json({ error: 'Database service not configured' }, { status: 503 })
-    }
-
+    // ─── Synthetic DB path ───
     const startTime = Date.now()
 
     let dataJson: Record<string, unknown[]> = {}
     let schemaJson: Array<{ name: string; columns: Array<{ name: string; type: string }> }> = []
-    let liveDatabaseId: string | undefined = databaseId
 
     if (databaseId) {
-      const { data: db, error: dbError } = await admin
-        .from('synthetic_databases')
-        .select('data_json, schema_json')
-        .eq('id', databaseId)
-        .single()
-
-      if (dbError || !db) {
+      const db = await getDatabase(auth.userId, databaseId)
+      if (!db) {
         return NextResponse.json({ error: 'Database not found' }, { status: 404 })
       }
-
-      dataJson = (db.data_json as Record<string, unknown[]>) || {}
-      schemaJson = (db.schema_json as Array<{ name: string; columns: Array<{ name: string; type: string }> }>) || []
-    } else if (clientData && Object.keys(clientData).length > 0) {
+      dataJson = db.data_json || {}
+      schemaJson = (db.schema_json as typeof schemaJson) || []
+    } else if (clientData && typeof clientData === 'object' && Object.keys(clientData).length > 0) {
       dataJson = clientData
     } else {
       return NextResponse.json({
@@ -127,28 +127,31 @@ export async function POST(request: NextRequest) {
       }, { status: 400 })
     }
 
-    // Execute the SQL against the in-memory data
-    const result = executeSQLAgainstData(trimmedSql, dataJson, schemaJson)
+    // Execute against a working copy; only persist on success.
+    // Real SQL engine first (JOINs, aggregates, CTEs, multi-statement); fall
+    // back to the legacy pattern-based engine only if it cannot parse the SQL.
+    let result: SqlExecResult = runSyntheticSql(trimmedSql, dataJson, schemaJson)
+    if (result.error && (result as { parseError?: boolean }).parseError) {
+      const legacy = executeSQLAgainstData(stripSqlComments(trimmedSql).trim(), dataJson, schemaJson)
+      if (!legacy.error) result = legacy
+    }
     const executionTime = Date.now() - startTime
 
-    // If the statement mutated data, persist the updated data_json back to
-    // Supabase so subsequent reads see the new state. We also return the
-    // refreshed data so the client can update its local copy.
-    if (result.mutated && liveDatabaseId) {
+    if (result.error) {
+      return NextResponse.json({ error: result.error, rows: [], columns: [], rowCount: 0, affectedRows: 0, executionTime }, { status: 400 })
+    }
+
+    if (result.mutated && databaseId) {
+      const updatePayload: Parameters<typeof updateDatabase>[2] = {
+        data_json: result.dataAfter,
+        row_count: countRows(result.dataAfter),
+      }
+      if (result.schemaAfter) updatePayload.schema_json = result.schemaAfter
       try {
-        const updatePayload: Record<string, unknown> = {
-          data_json: result.dataAfter,
-          row_count: Object.values(result.dataAfter).reduce((sum, rows) => sum + (Array.isArray(rows) ? rows.length : 0), 0),
-        }
-        if (result.schemaAfter) {
-          updatePayload.schema_json = result.schemaAfter
-        }
-        await admin
-          .from('synthetic_databases')
-          .update(updatePayload)
-          .eq('id', liveDatabaseId)
+        await updateDatabase(auth.userId, databaseId, updatePayload)
       } catch (err) {
-        console.warn('[SQL Execute API] Failed to persist mutation:', err)
+        console.error('[SQL Execute API] Failed to persist mutation:', err)
+        return NextResponse.json({ error: 'The query ran but the change could not be saved. Please retry.' }, { status: 500 })
       }
     }
 
@@ -177,6 +180,7 @@ interface SqlExecResult {
   mutated: boolean
   dataAfter: Record<string, unknown[]>
   schemaAfter?: Array<{ name: string; columns: Array<{ name: string; type: string }> }>
+  error?: string
 }
 
 function executeSQLAgainstData(
@@ -268,8 +272,9 @@ function executeSQLAgainstData(
   }
 
   return {
-    rows: [{ message: 'Unsupported statement', type: 'error' }],
-    columns: ['message', 'type'],
+    rows: [],
+    columns: [],
+    error: 'Unsupported statement for synthetic data. Supported: SELECT, INSERT, UPDATE, DELETE, CREATE/ALTER/DROP TABLE, TRUNCATE.',
     affectedRows: 0,
     mutated: false,
     dataAfter: dataCopy,
@@ -580,10 +585,11 @@ function executeUpdate(
 
   let updated = 0
   const candidateRows = whereClause ? applyWhere([...tableData], whereClause) : tableData
-  const candidateIds = new Set(candidateRows.map(r => (r as { id?: unknown }).id))
+  // Match by row identity (not by `id`), so tables without an id column work.
+  const candidates = new Set<unknown>(candidateRows)
 
   for (const row of tableData) {
-    if (whereClause && !candidateIds.has((row as { id?: unknown }).id)) continue
+    if (whereClause && !candidates.has(row)) continue
     for (const a of assignments) (row as Record<string, unknown>)[a.col] = a.value
     updated++
   }
@@ -651,9 +657,10 @@ function executeDelete(
   // BUGFIX (BUG-26): applyWhere returns rows that MATCH the WHERE clause.
   // For DELETE we want to REMOVE those rows, not keep them. The previous
   // code inverted this logic and kept the matched rows.
-  const matchingIds = new Set(applyWhere([...tableData], whereClause).map(r => (r as { id?: unknown }).id))
+  // Match by row identity (not by `id`), so tables without an id column work.
+  const matching = new Set<unknown>(applyWhere([...tableData], whereClause))
   const before = tableData.length
-  data[tableName] = tableData.filter(r => !matchingIds.has((r as { id?: unknown }).id))
+  data[tableName] = tableData.filter(r => !matching.has(r))
   return { affectedRows: before - (data[tableName] as unknown[]).length }
 }
 

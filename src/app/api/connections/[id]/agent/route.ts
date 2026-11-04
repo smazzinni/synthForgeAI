@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { requireUser } from '@/lib/server/auth'
 import { getConnection } from '@/lib/db-connections/store'
 import { fetchExternalSchema, executeSql } from '@/lib/db-connections/executor'
-import { getUserIdFromCookies } from '@/lib/db-connections/api-helpers'
 
 // ─── Agent introspection + self-healing endpoint ───
 //
@@ -26,13 +26,16 @@ import { getUserIdFromCookies } from '@/lib/db-connections/api-helpers'
 type Params = { params: Promise<{ id: string }> }
 
 export async function POST(request: NextRequest, { params }: Params) {
+  const auth = await requireUser(request)
+  if (auth instanceof Response) return auth
+
   try {
     const { id } = await params
     if (!id) {
       return NextResponse.json({ error: 'id is required' }, { status: 400 })
     }
 
-    const userId = getUserIdFromCookies(request)
+    const userId = auth.userId
     const conn = await getConnection(userId, id)
     if (!conn) {
       return NextResponse.json({ error: 'Connection not found or you do not have access to it' }, { status: 403 })
