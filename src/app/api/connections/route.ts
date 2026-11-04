@@ -7,6 +7,7 @@ import {
 } from '@/lib/db-connections/store'
 import { testConnection } from '@/lib/db-connections/executor'
 import { toSafeRecord } from '@/lib/db-connections/types'
+import { enforceRateLimit } from '@/lib/server/rate-limit'
 import { validateInput } from '@/lib/db-connections/api-helpers'
 
 // ─── Collection routes: /api/connections ───
@@ -44,10 +45,17 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   const auth = await requireUser(request)
   if (auth instanceof Response) return auth
+  const limited = enforceRateLimit(auth.userId, 'connections:write', 30)
+  if (limited) return limited
 
   try {
     const userId = auth.userId
-    const body = await request.json().catch(() => null)
+    let body: unknown
+    try {
+      body = await request.json()
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+    }
     const validation = validateInput(body)
     if (!validation.ok) {
       return NextResponse.json({ error: validation.error }, { status: 400 })
@@ -80,7 +88,12 @@ export async function POST(request: NextRequest) {
         status = 'failed'
         errorMessage = testResult.error || 'Unknown error'
       }
-      const updated = await updateConnection(userId, saved.id, { status, error_message: errorMessage })
+      let updated: Awaited<ReturnType<typeof updateConnection>> = null
+      try {
+        updated = await updateConnection(userId, saved.id, { status, error_message: errorMessage })
+      } catch (err) {
+        console.error('[Connections API] POST status update failed:', err)
+      }
       return NextResponse.json({
         connection: updated ? toSafeRecord(updated) : toSafeRecord(saved),
         test: { ok: testResult.ok, error: testResult.error, hint: testResult.hint, latencyMs: testResult.latencyMs },

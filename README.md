@@ -51,6 +51,36 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000) in your browser.
 
+## Deploy on Railway
+
+1. Create a Railway project and add **PostgreSQL** (New → Database → PostgreSQL).
+2. Add a service from this GitHub repo. `railway.json` makes Railway build the `Dockerfile`
+   and health-check `/api/health`. Migrations run automatically on boot.
+3. Set service variables:
+   - `DATABASE_URL` = `${{Postgres.DATABASE_URL}}`
+   - `CONNECTION_ENCRYPTION_KEY` = long random string (`openssl rand -base64 32`)
+   - `DEEPSEEK_API_KEY` (and optionally `DEEPSEEK_MODEL`)
+   - For real user accounts: `NEXT_PUBLIC_AUTH_ENABLED=true`, `NEXT_PUBLIC_SUPABASE_URL`,
+     `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_KEY`, `SUPABASE_JWT_SECRET`
+4. Settings → Networking → Generate Domain (port 3000).
+
+### GitHub Actions
+
+- `.github/workflows/ci.yml` — lint, type-check, unit tests, build, smoke test against Postgres,
+  Docker build. Runs on every push to `main` and every PR.
+- `.github/workflows/deploy-railway.yml` — deploys `main` after CI passes. Needs repo secret
+  `RAILWAY_TOKEN` (Railway project token) and repo variable `RAILWAY_SERVICE` (service name).
+  Skip it if you connect the repo in Railway's UI instead (auto-deploys on push).
+
+### Local development
+
+```bash
+docker compose up -d db          # Postgres on :5432
+cp .env.example .env             # DATABASE_URL=postgresql://postgres:postgres@localhost:5432/synthforge
+npm ci && npm run db:deploy && npm run dev
+npm test                         # unit tests
+```
+
 ## Production checklist
 
 - Set `NEXT_PUBLIC_AUTH_ENABLED=true` and the Supabase keys. Every API route verifies the

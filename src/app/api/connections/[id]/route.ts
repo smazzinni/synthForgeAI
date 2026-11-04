@@ -62,7 +62,7 @@ export async function GET(request: NextRequest, { params }: Params) {
           schema: [],
           data: {},
           error: err instanceof Error ? err.message : 'Failed to introspect connection',
-        })
+        }, { status: 502 })
       }
     }
 
@@ -88,7 +88,7 @@ export async function PATCH(request: NextRequest, { params }: Params) {
     const userId = auth.userId
     const body = await request.json().catch(() => null)
     if (!body || typeof body !== 'object') {
-      return NextResponse.json({ error: 'Invalid body' }, { status: 400 })
+      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
     }
     const b = body as Record<string, unknown>
 
@@ -114,7 +114,12 @@ export async function PATCH(request: NextRequest, { params }: Params) {
     // Re-test if requested OR if connection parameters changed.
     const shouldTest = b.test === true || connectionParamsChanged
     if (shouldTest) {
-      const result = await testConnection(updated)
+      let result: Awaited<ReturnType<typeof testConnection>>
+      try {
+        result = await testConnection(updated)
+      } catch (err) {
+        result = { ok: false, error: err instanceof Error ? err.message : String(err) }
+      }
       const finalRecord = await updateConnection(userId, id, {
         status: result.ok ? 'connected' : 'failed',
         error_message: result.ok ? null : (result.error || 'Unknown error'),

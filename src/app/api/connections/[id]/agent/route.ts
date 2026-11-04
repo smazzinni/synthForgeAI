@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { requireUser } from '@/lib/server/auth'
 import { getConnection } from '@/lib/db-connections/store'
 import { fetchExternalSchema, executeSql } from '@/lib/db-connections/executor'
+import { needsConfirmation } from '@/lib/db-connections/confirm'
+import { stripSqlComments } from '@/lib/ai-agents'
 
 // ─── Agent introspection + self-healing endpoint ───
 //
@@ -38,14 +40,14 @@ export async function POST(request: NextRequest, { params }: Params) {
     const userId = auth.userId
     const conn = await getConnection(userId, id)
     if (!conn) {
-      return NextResponse.json({ error: 'Connection not found or you do not have access to it' }, { status: 403 })
+      return NextResponse.json({ error: 'Connection not found' }, { status: 404 })
     }
 
     const body = await request.json().catch(() => null)
     if (!body || typeof body !== 'object') {
       return NextResponse.json({ error: 'Invalid body' }, { status: 400 })
     }
-    const { action, sql } = body as { action?: string; sql?: string }
+    const { action, sql, skipDangerousCheck } = body as { action?: string; sql?: string; skipDangerousCheck?: boolean }
 
     if (action === 'introspect') {
       // Return the full schema + row counts so the agent can reason about
@@ -53,32 +55,28 @@ export async function POST(request: NextRequest, { params }: Params) {
       try {
         const schema = await fetchExternalSchema(conn)
         // For each table, fetch the row count (cheap aggregate)
-        const tableStats: Array<{ name: string; rowCount: number }> = []
-        for (const table of schema.slice(0, 50)) {
+        const quote = (n: string) => conn.dialect === 'mysql'
+          ? `\`${n.replace(/`/g, '``')}\``
+          : `"${n.replace(/"/g, '""')}"`
+        const tableStats = await Promise.all(schema.slice(0, 50).map(async (table) => {
           try {
-            // BUGFIX (MySQL introspect): Previously used Postgres-style double
-            // quotes (`FROM "table"`) which MySQL treats as a string literal
-            // by default (unless ANSI_QUOTES sql_mode is set), causing
-            // `SELECT COUNT(*) FROM "categories"` to fail with a syntax error.
-            // Now we quote identifiers correctly per dialect: backticks for
-            // MySQL, double quotes for Postgres.
-            const quotedName = conn.dialect === 'mysql'
-              ? `\`${table.name.replace(/`/g, '``')}\``
-              : `"${table.name.replace(/"/g, '""')}"`
-            const result = await executeSql(conn, `SELECT COUNT(*) AS cnt FROM ${quotedName}`)
+            const qualified = conn.dialect === 'mysql'
+              ? quote(table.name)
+              : `${quote(conn.schema || 'public')}.${quote(table.name)}`
+            const result = await executeSql(conn, `SELECT COUNT(*) AS cnt FROM ${qualified}`)
             const cnt = result.rows[0]?.cnt ?? result.rows[0]?.count ?? 0
-            tableStats.push({ name: table.name, rowCount: Number(cnt) || 0 })
+            return { name: table.name, rowCount: Number(cnt) || 0 }
           } catch {
-            tableStats.push({ name: table.name, rowCount: -1 }) // -1 = inaccessible
+            return { name: table.name, rowCount: -1 } // -1 = inaccessible
           }
-        }
+        }))
         return NextResponse.json({ schema, tableStats })
       } catch (err) {
         return NextResponse.json({
           error: err instanceof Error ? err.message : 'Introspection failed',
           schema: [],
           tableStats: [],
-        }, { status: 200 })
+        }, { status: 502 })
       }
     }
 
@@ -86,28 +84,27 @@ export async function POST(request: NextRequest, { params }: Params) {
       if (!sql || typeof sql !== 'string') {
         return NextResponse.json({ error: 'sql is required for execute/verify actions' }, { status: 400 })
       }
-      // BUGFIX (BUG-64): Gate destructive SQL behind requiresConfirmation,
-      // the same way /api/connections/execute does. Without this, the
-      // autonomous agent loop could run DROP TABLE / DELETE without
-      // confirmation on a real external database.
-      const { isDestructiveSQL, stripSqlComments } = await import('@/lib/ai-agents')
-      const strippedForCheck = stripSqlComments(sql.trim()).trim()
-      const firstWord = strippedForCheck.split(/\s+/)[0]?.toUpperCase() || ''
-      const isDestructive = isDestructiveSQL(strippedForCheck)
-      const destructivePatterns = ['DROP', 'TRUNCATE', 'DELETE']
-      const isDestructiveVerb = destructivePatterns.includes(firstWord)
-
-      if (isDestructive || isDestructiveVerb) {
+      const trimmed = sql.trim()
+      if (action === 'verify') {
+        const readOnly = stripSqlComments(trimmed)
+          .replace(/'(?:[^']|'')*'/g, "''")
+          .split(';')
+          .map(x => x.trim())
+          .filter(Boolean)
+          .every(x => /^(SELECT|WITH|SHOW|DESCRIBE|EXPLAIN)\b/i.test(x))
+        if (!readOnly) {
+          return NextResponse.json({ error: 'verify only accepts read-only SQL (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN)' }, { status: 400 })
+        }
+      }
+      if (skipDangerousCheck !== true && needsConfirmation(trimmed)) {
         return NextResponse.json({
-          error: 'This is a destructive operation. Confirm in the chat before executing.',
+          error: 'This statement can modify or delete data. Please confirm to run it.',
           requiresConfirmation: true,
-          sql: sql.trim(),
           destructive: true,
+          sql: trimmed,
         }, { status: 200 })
       }
 
-      // Execute the SQL. For 'verify' we expect a SELECT; for 'execute'
-      // we allow any non-destructive statement.
       const result = await executeSql(conn, sql)
       return NextResponse.json(result, { status: result.error ? 400 : 200 })
     }

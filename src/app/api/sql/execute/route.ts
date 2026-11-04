@@ -5,6 +5,7 @@ import { runSyntheticSql } from '@/lib/server/synthetic-sql'
 import { getSupabaseAdmin } from '@/lib/supabase/admin'
 import { executeSqlOnExternalConnection } from '@/lib/db-connections/executor'
 import { isDestructiveSQL, stripSqlComments } from '@/lib/ai-agents'
+import { needsConfirmation } from '@/lib/db-connections/confirm'
 
 // ─── SQL Execution API ───
 // Executes SQL against either:
@@ -65,36 +66,48 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'SQL query too long (max 100,000 characters)' }, { status: 400 })
     }
 
-    // Strip leading SQL line/block comments before classifying the statement.
     const strippedForCheck = stripSqlComments(trimmedSql)
-    const firstWord = strippedForCheck.split(/\s+/)[0]?.toUpperCase() || ''
-    if (!ALLOWED_STATEMENTS.includes(firstWord)) {
-      return NextResponse.json({ error: `Statement type "${firstWord}" is not allowed` }, { status: 400 })
-    }
 
-    // Check for catastrophic dangerous patterns (unless caller explicitly skips)
-    // Strip single-quoted string literals first so keywords inside string
-    // values don't trigger false positives.
-    if (!skipDangerousCheck) {
-      const literalStripped = strippedForCheck.replace(/'[^']*'/g, "''")
-      for (const pattern of DANGEROUS_PATTERNS) {
-        if (pattern.test(literalStripped)) {
-          return NextResponse.json({
-            error: 'This query contains a potentially destructive operation. Please confirm before executing.',
-            requiresConfirmation: true,
-            sql: trimmedSql,
-          }, { status: 200 })
-        }
-      }
-      // Also use the improved isDestructiveSQL which handles comments and
-      // multi-statement SQL — surfaces a confirmation dialog to the user.
-      if (isDestructiveSQL(strippedForCheck)) {
+    if (connectionId) {
+      // Live DB: all statement types allowed; destructive ones need confirmation.
+      if (!skipDangerousCheck && needsConfirmation(trimmedSql)) {
         return NextResponse.json({
-          error: 'This is a destructive operation. Please confirm before executing.',
+          error: 'This statement can modify or delete data. Please confirm to run it.',
           requiresConfirmation: true,
           destructive: true,
           sql: trimmedSql,
         }, { status: 200 })
+      }
+    } else {
+      const firstWord = strippedForCheck.split(/\s+/)[0]?.toUpperCase() || ''
+      if (!ALLOWED_STATEMENTS.includes(firstWord)) {
+        return NextResponse.json({ error: `Statement type "${firstWord}" is not allowed` }, { status: 400 })
+      }
+
+      // Check for catastrophic dangerous patterns (unless caller explicitly skips)
+      // Strip single-quoted string literals first so keywords inside string
+      // values don't trigger false positives.
+      if (!skipDangerousCheck) {
+        const literalStripped = strippedForCheck.replace(/'[^']*'/g, "''")
+        for (const pattern of DANGEROUS_PATTERNS) {
+          if (pattern.test(literalStripped)) {
+            return NextResponse.json({
+              error: 'This query contains a potentially destructive operation. Please confirm before executing.',
+              requiresConfirmation: true,
+              sql: trimmedSql,
+            }, { status: 200 })
+          }
+        }
+        // Also use the improved isDestructiveSQL which handles comments and
+        // multi-statement SQL — surfaces a confirmation dialog to the user.
+        if (isDestructiveSQL(strippedForCheck)) {
+          return NextResponse.json({
+            error: 'This is a destructive operation. Please confirm before executing.',
+            requiresConfirmation: true,
+            destructive: true,
+            sql: trimmedSql,
+          }, { status: 200 })
+        }
       }
     }
 
