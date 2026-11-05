@@ -61,3 +61,6 @@ server.log
 /tool-results/
 /mini-services/
 /db/
+
+# e2e screenshots
+e2e/*.png
