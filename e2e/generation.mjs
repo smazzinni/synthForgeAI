@@ -83,7 +83,7 @@ check('unknown databaseId → 404', (await api('POST', '/api/generate-stream', {
   check('nasty AI: FKs, PKs, unique emails, date order all valid', ig.fk && ig.pk && ig.emails && ig.dates, JSON.stringify(ig))
   check('nasty AI: numbers coerced', db.data_json.orders.every(o => o.total === null || typeof o.total === 'number'))
   check('nasty AI: real quality score (<1)', typeof db.quality_score === 'number' && db.quality_score < 1)
-  check('nasty AI: Quality Analyst reported fixes', r.events.some(e => /Quality Analyst: fixed/.test(e.message || '')))
+  check('nasty AI: Quality Analyst reported fixes', r.events.some(e => /Quality Analyst: repaired [0-9,]+ value/.test(e.message || '')))
 }
 
 // ─── scale-up keeps integrity ───
