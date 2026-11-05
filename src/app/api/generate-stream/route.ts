@@ -16,7 +16,7 @@ import {
   streamJob,
   type GenerationJob,
 } from '@/lib/server/generation-jobs'
-import { expandDataset } from '@/lib/server/data-expander'
+import { expandDataset, synthesizeTable } from '@/lib/server/data-expander'
 import { applyPrivacy, privacyMaskingEnabled } from '@/lib/server/data-privacy'
 import { dependencyOrder, relationshipsFor, repairDataset, type IntegrityReport } from '@/lib/server/data-integrity'
 
@@ -36,18 +36,34 @@ export const maxDuration = 300 // Vercel plan ceiling; Railway/Docker have no li
 
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com'
-const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'
-const DEEPSEEK_MAX_TOKENS = Number.parseInt(process.env.DEEPSEEK_MAX_TOKENS || '', 10) || 32000
+/**
+ * Model for data generation. Reasoning ("thinking") models are many times
+ * slower and add nothing to row generation, so they are never used here
+ * unless set explicitly via GENERATION_MODEL.
+ */
+const CONFIGURED_MODEL = process.env.GENERATION_MODEL ||
+  (process.env.DEEPSEEK_MODEL && !/reason|think|\br1\b/i.test(process.env.DEEPSEEK_MODEL) ? process.env.DEEPSEEK_MODEL : 'deepseek-chat')
+/** Tried in order when the API rejects a model name (providers rename models). */
+const MODEL_FALLBACKS = [CONFIGURED_MODEL, 'deepseek-chat', 'deepseek-flash', 'deepseek-v4-pro']
+  .filter((m, i, a) => a.indexOf(m) === i)
+/** Output budget per AI call; lowered automatically if the API reports a smaller limit. */
+const SEED_MAX_TOKENS = Number.parseInt(process.env.DEEPSEEK_MAX_TOKENS || '', 10) || 8000
 
 const MAX_TABLES = 30
 const MAX_ROWS_PER_TABLE = 100_000
 const MAX_TOTAL_ROWS = 250_000
 /** Rows per table the AI writes itself; the rest are synthesised locally from them. */
-const SEED_ROWS_PER_TABLE = Number.parseInt(process.env.GENERATION_SEED_ROWS || '', 10) || 200
+const SEED_ROWS_PER_TABLE = Math.max(5, Number.parseInt(process.env.GENERATION_SEED_ROWS || '', 10) || 25)
+/** Parallel AI calls (one per table). */
+const AI_CONCURRENCY = Math.max(1, Number.parseInt(process.env.GENERATION_CONCURRENCY || '', 10) || 6)
 const PERSIST_INTERVAL_MS = 2500     // write progress to storage at most this often (scaled up for big datasets)
 const PROGRESS_INTERVAL_MS = 300     // emit progress events at most this often
-const UPSTREAM_IDLE_TIMEOUT_MS = 120_000
-const MAX_CONTINUATION_ROUNDS = 3
+const UPSTREAM_IDLE_TIMEOUT_MS = 90_000
+const MAX_ATTEMPTS_PER_TABLE = 2
+
+// Learned at runtime: the model name and output limit the API accepts.
+let workingModel: string | null = null
+let workingMaxTokens = SEED_MAX_TOKENS
 
 interface GenerationSchema {
   name: string
@@ -114,84 +130,47 @@ function validate(raw: unknown): { ok: true; req: GenerationRequest } | { ok: fa
 }
 
 // ─── Prompts ───
-function buildGenerationPrompt(req: GenerationRequest): string {
-  const tableDescriptions = req.schema.map(table => {
-    const colDefs = table.columns.map(c => `  ${c.name}: ${c.type}`).join('\n')
-    return `Table: ${table.name} (${req.rowCounts[table.name]} rows)\n${colDefs}`
-  }).join('\n\n')
-  const totalRows = Object.values(req.rowCounts).reduce((sum, n) => sum + n, 0)
-  const tableOrder = req.schema.map(s => s.name).join(' → ')
-  const rel = relationshipsFor(req.schema, {})
-  const relLines = Object.entries(rel).flatMap(([child, cols]) =>
-    Object.entries(cols).map(([col, parent]) => `- ${child}.${col} → ${parent}.id (every value MUST be an id you already output for ${parent})`))
-
-  return `You are a data generation engine. Generate realistic synthetic data for the following database schema.
-
-DATABASE: ${req.databaseName || 'synthetic_db'}
-
-SCHEMA (${req.schema.length} tables):
-${tableDescriptions}
-
-${req.instructions ? `ADDITIONAL INSTRUCTIONS:\n${req.instructions}\n` : ''}
-${relLines.length ? `RELATIONSHIPS (foreign keys):\n${relLines.join('\n')}\n- Child timestamps (created_at, order dates…) must be AFTER the parent row's created_at.\n- Spread children across many different parents with a realistic, uneven distribution.\n` : ''}
-CRITICAL REQUIREMENTS:
-1. Generate data for ALL ${req.schema.length} tables, in this order: ${tableOrder}
-2. After one table's records, IMMEDIATELY output the next ###TABLE:name### marker.
-3. Total records to generate: ${totalRows}. Do not stop early.
-
-OUTPUT FORMAT:
-- Output ONLY raw NDJSON — one complete JSON object per line.
-- No arrays, wrapper keys, markdown, code fences or explanations.
-- Before each table's records output a single marker line: ###TABLE:table_name###
-
-DATA QUALITY:
-- Realistic values (names, emails, addresses, phones, companies, cities).
-- Proper types: numbers for quantities, ISO 8601 for timestamps, UUID strings for ids.
-- Always include an "id" column (UUID string) and created_at/updated_at timestamps when relevant.
-- Internally consistent data and referential integrity (foreign keys reference existing primary keys).
-
-Example:
-###TABLE:users###
-{"id":"a1b2c3d4-5678-9012-abcd-ef1234567890","name":"Alice Johnson","email":"alice@example.com","created_at":"2024-01-15T10:30:00Z"}
-###TABLE:orders###
-{"id":"c3d4e5f6-7890-1234-cdef-123456789012","user_id":"a1b2c3d4-5678-9012-abcd-ef1234567890","total":99.99,"created_at":"2024-02-01T09:15:00Z"}
-
-Start with ###TABLE:${req.schema[0]?.name}###`
-}
-
-function buildContinuationPrompt(
+/** One table, compact output: a header row of column names, then one JSON array per row. */
+function buildTablePrompt(
+  req: GenerationRequest,
   table: GenerationSchema,
   rowCount: number,
-  existingSample: unknown[],
-  related: Record<string, unknown[]>,
+  parentHints: string[],
 ): string {
-  const colDefs = table.columns.map(c => `  ${c.name}: ${c.type}`).join('\n')
-  const fkHints = Object.entries(related)
-    .filter(([, rows]) => rows.length > 0)
-    .map(([name, rows]) => {
-      const ids = rows.slice(0, 50).map(r => (r as { id?: unknown }).id).filter(Boolean)
-      return ids.length ? `- ${name}.id values you may reference: ${JSON.stringify(ids)}` : ''
-    })
-    .filter(Boolean)
+  const cols = table.columns.map((c, i) => `${i + 1}. ${c.name} (${c.type})`).join('\n')
+  const header = JSON.stringify(table.columns.map(c => c.name))
+  const context = (req.conversationHistory || [])
+    .filter(m => m.role === 'user')
+    .slice(-3)
+    .map(m => m.content.slice(0, 600))
     .join('\n')
-  return `Generate ${rowCount} more realistic records for the "${table.name}" table.
-
-COLUMNS:
-${colDefs}
-${existingSample.length ? `\nEXISTING RECORDS (do not repeat their ids):\n${existingSample.slice(0, 3).map(r => JSON.stringify(r)).join('\n')}\n` : ''}
-${fkHints ? `\nFOREIGN KEYS:\n${fkHints}\n` : ''}
-RULES:
-- Output ONLY raw NDJSON, one complete JSON object per line, no markdown.
-- Start with a single marker line: ###TABLE:${table.name}###
-- Include a new UUID "id" for every record; ISO 8601 timestamps.
-- Generate exactly ${rowCount} records, then stop.`
+  return `You generate realistic synthetic rows for ONE table of the database "${req.databaseName || 'synthetic_db'}".
+${req.instructions ? `\nINSTRUCTIONS: ${req.instructions}\n` : ''}${context ? `\nWHAT THE USER ASKED FOR:\n${context}\n` : ''}
+TABLE: ${table.name}
+OTHER TABLES IN THIS DATABASE: ${req.schema.filter(t => t.name !== table.name).map(t => t.name).join(', ') || '(none)'}
+COLUMNS, in this exact order:
+${cols}
+${parentHints.length ? `\nFOREIGN KEYS — use only these existing ids:\n${parentHints.join('\n')}\n` : ''}
+OUTPUT FORMAT (strict):
+- Line 1: exactly this header: ${header}
+- Then exactly ${rowCount} lines, each ONE JSON array with the values in the column order above.
+- No markdown, no code fences, no comments, no blank lines, no text before or after.
+- ids: UUID strings unless the column type is an integer (then 1, 2, 3…). Dates: ISO 8601.
+- Values must be realistic, varied and domain-appropriate (real-looking names, products, amounts, statuses), with sensible distributions.
+- Emails: use example.com / example.org domains.`
 }
 
-// ─── DeepSeek streaming → content lines ───
-async function streamCompletion(
+// ─── AI calls: streaming, with model / max_tokens self-healing ───
+class AiError extends Error {
+  constructor(message: string, readonly status: number, readonly body: string) { super(message) }
+}
+
+async function streamOnce(
   job: GenerationJob,
+  model: string,
+  maxTokens: number,
   messages: Array<{ role: string; content: string }>,
-  onLine: (line: string) => Promise<void>,
+  onLine: (line: string) => void,
 ): Promise<string> {
   const ctrl = new AbortController()
   const onJobAbort = () => ctrl.abort()
@@ -201,27 +180,24 @@ async function streamCompletion(
     if (idleTimer) clearTimeout(idleTimer)
     idleTimer = setTimeout(() => ctrl.abort(), UPSTREAM_IDLE_TIMEOUT_MS)
   }
-
   try {
     resetIdle()
     const res = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
-      body: JSON.stringify({ model: DEEPSEEK_MODEL, messages, stream: true, max_tokens: DEEPSEEK_MAX_TOKENS }),
+      body: JSON.stringify({ model, messages, stream: true, max_tokens: maxTokens, temperature: 0.9 }),
       signal: ctrl.signal,
     })
     if (!res.ok || !res.body) {
       const text = await res.text().catch(() => '')
-      throw new Error(`AI service error (${res.status})${text ? `: ${text.slice(0, 200)}` : ''}`)
+      throw new AiError(`AI service error (${res.status})${text ? `: ${text.slice(0, 200)}` : ''}`, res.status, text)
     }
-
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
     let sseBuffer = ''
     let content = ''
     let finishReason = ''
-
-    while (true) {
+    for (;;) {
       const { done, value } = await reader.read()
       if (done) break
       resetIdle()
@@ -241,17 +217,61 @@ async function streamCompletion(
           content += choice.delta.content
           const lines = content.split('\n')
           content = lines.pop() || ''
-          for (const line of lines) await onLine(line)
+          for (const line of lines) onLine(line)
         }
         if (choice.finish_reason) finishReason = choice.finish_reason
       }
     }
-    if (content.trim()) await onLine(content)
+    if (content.trim()) onLine(content)
     return finishReason
   } finally {
     if (idleTimer) clearTimeout(idleTimer)
     job.abort.signal.removeEventListener('abort', onJobAbort)
   }
+}
+
+/** Stream a completion, adapting to the API: unknown model → next candidate; max_tokens too high → lower. */
+async function streamCompletion(
+  job: GenerationJob,
+  messages: Array<{ role: string; content: string }>,
+  onLine: (line: string) => void,
+): Promise<string> {
+  const models = workingModel ? [workingModel, ...MODEL_FALLBACKS.filter(m => m !== workingModel)] : MODEL_FALLBACKS
+  let lastErr: unknown = null
+  for (const model of models) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const reason = await streamOnce(job, model, workingMaxTokens, messages, onLine)
+        workingModel = model
+        return reason
+      } catch (err) {
+        lastErr = err
+        if (!(err instanceof AiError)) throw err
+        const body = err.body.toLowerCase()
+        if ([400, 422].includes(err.status) && body.includes('max_tokens')) {
+          const range = err.body.match(/\[\s*\d+\s*,\s*(\d+)\s*\]/) || err.body.match(/(?:max(?:imum)?|at most|<=?)\D{0,20}(\d{3,7})/i)
+          const limit = range ? Number(range[1]) : Math.floor(workingMaxTokens / 2)
+          if (limit > 0 && limit < workingMaxTokens) { workingMaxTokens = limit; continue }
+        }
+        if ([400, 404, 422].includes(err.status) && /model/.test(body)) break // try the next model name
+        if ([429, 500, 502, 503, 504].includes(err.status) && attempt < 2) {
+          await new Promise(r => setTimeout(r, 1000 * (attempt + 1) ** 2))
+          continue
+        }
+        throw err
+      }
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error('AI service unavailable')
+}
+
+/** Run tasks with at most `limit` in flight. */
+async function mapLimit<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  const queue = [...items]
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (let item = queue.shift(); item !== undefined; item = queue.shift()) await fn(item)
+  })
+  await Promise.all(workers)
 }
 
 // ─── The worker ───
@@ -270,12 +290,8 @@ async function runGeneration(job: GenerationJob, fullReq: GenerationRequest, see
   for (const [t, rows] of Object.entries(seed)) if (Array.isArray(rows)) allTableData[t] = [...rows]
   const existingRowCount = countRows(allTableData)
   const baseline: Record<string, number> = Object.fromEntries(req.schema.map(t => [t.name, allTableData[t.name]?.length || 0]))
-  const stillTrying = new Set(req.schema.map(t => t.name))
-  const knownTables = new Set(req.schema.map(t => t.name))
-  const columnsByTable = new Map(req.schema.map(t => [t.name, t.columns.map(c => c.name)]))
   const totalTarget = Object.values(finalCounts).reduce((s, n) => s + n, 0)
 
-  let currentTable = ''
   let generatedThisRun = 0
   let malformed = 0
   let lastPersist = Date.now()
@@ -297,16 +313,16 @@ async function runGeneration(job: GenerationJob, fullReq: GenerationRequest, see
     return persistChain
   }
 
-  const progress = (force = false, message?: string) => {
+  const progress = (table: string, force = false, message?: string) => {
     const now = Date.now()
     if (!force && now - lastProgress < PROGRESS_INTERVAL_MS) return
     lastProgress = now
     emit(job, {
       type: 'progress',
-      table: currentTable,
-      rowsInserted: currentTable ? generatedFor(currentTable) : 0,
+      table,
+      rowsInserted: table ? generatedFor(table) : 0,
       totalInserted: generatedThisRun,
-      targetRows: currentTable ? req.rowCounts[currentTable] || 0 : totalTarget,
+      targetRows: table ? req.rowCounts[table] || 0 : totalTarget,
       message,
     })
     // Persisting rewrites the whole dataset, so slow down for big ones.
@@ -317,100 +333,104 @@ async function runGeneration(job: GenerationJob, fullReq: GenerationRequest, see
     }
   }
 
-  const resolveTableName = (name: string): string => {
-    const trimmed = name.trim()
-    if (knownTables.has(trimmed)) return trimmed
-    const lower = trimmed.toLowerCase()
-    for (const t of knownTables) if (t.toLowerCase() === lower) return t
-    return trimmed
+  /** Parse one streamed line for `table` (compact arrays or objects); returns the row or null. */
+  const parseRow = (table: GenerationSchema, rawLine: string, state: { header: string[] | null }): Record<string, unknown> | null => {
+    const line = rawLine.trim().replace(/,$/, '')
+    if (!line || line.startsWith('```') || /^#{2,3}\s*TABLE/i.test(line)) return null
+    let parsed: unknown
+    try { parsed = JSON.parse(line) } catch { malformed++; return null }
+    const cols = table.columns.map(c => c.name)
+    if (Array.isArray(parsed)) {
+      // Header row: an array of strings that names our columns.
+      if (!state.header && parsed.every(v => typeof v === 'string') && parsed.filter(v => cols.includes(v as string)).length >= Math.min(2, cols.length)) {
+        state.header = parsed as string[]
+        return null
+      }
+      const values = parsed as unknown[]
+      const order = state.header ?? cols
+      if (values.length !== order.length) { malformed++; return null }
+      const obj: Record<string, unknown> = {}
+      order.forEach((c, i) => { obj[c] = values[i] })
+      parsed = obj
+    }
+    if (!parsed || typeof parsed !== 'object') { malformed++; return null }
+    const rec = parsed as Record<string, unknown>
+    if (cols.length === 0) return rec
+    if (cols.filter(c => c in rec).length < Math.min(2, cols.length)) { malformed++; return null }
+    return Object.fromEntries(cols.map(c => [c, rec[c] ?? null]))
   }
 
-  const onLine = async (rawLine: string) => {
-    if (job.cancelRequested) return
-    const line = rawLine.trim().replace(/,$/, '')
-    if (!line || line.startsWith('```')) return
-    const marker = line.match(/^#{2,3}\s*TABLE\s*:\s*(.+?)\s*#{2,3}$/i)
-    if (marker) {
-      if (currentTable) emit(job, { type: 'table_complete', table: currentTable, totalRows: allTableData[currentTable]?.length || 0 })
-      currentTable = resolveTableName(marker[1])
-      progress(true, `Streaming records into [${currentTable}]`)
-      return
-    }
-    if (!currentTable) return
-    // Rows for tables that aren't in the schema are dropped (model drift).
-    if (!knownTables.has(currentTable)) return
-    // Ignore surplus rows beyond what was requested for this table.
-    if (generatedFor(currentTable) >= (req.rowCounts[currentTable] ?? Infinity)) return
-    try {
-      const parsed = JSON.parse(line)
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        // Keep exactly the table's declared columns; a row sharing none of
-        // them belongs to another table (model drift) and is dropped.
-        const cols = columnsByTable.get(currentTable) || []
-        let record: Record<string, unknown> = parsed
-        if (cols.length > 0) {
-          const overlap = cols.filter(c => c in parsed).length
-          if (overlap < Math.min(2, cols.length)) { malformed++; return }
-          record = Object.fromEntries(cols.map(c => [c, parsed[c] ?? null]))
-        }
-        ;(allTableData[currentTable] ||= []).push(record)
-        generatedThisRun++
-        progress()
+  const parentHintsFor = (table: GenerationSchema): string[] => {
+    const rel = relationshipsFor(req.schema, allTableData as Record<string, Record<string, unknown>[]>)[table.name] || {}
+    return Object.entries(rel).map(([col, parent]) => {
+      const ids = (allTableData[parent] || []).slice(0, 40).map(r => (r as { id?: unknown }).id).filter(v => v != null)
+      return ids.length ? `- ${col} → ${parent}.id, one of: ${JSON.stringify(ids)}` : `- ${col} → ${parent}.id`
+    })
+  }
+
+  const aiAvailable = !!DEEPSEEK_API_KEY
+  let aiFailures = 0
+  let lastAiError = ''
+
+  const seedTable = async (table: GenerationSchema) => {
+    const target = req.rowCounts[table.name]
+    for (let attempt = 0; attempt < MAX_ATTEMPTS_PER_TABLE && aiAvailable && !job.cancelRequested; attempt++) {
+      const need = target - generatedFor(table.name)
+      if (need <= 0) break
+      const state = { header: null as string[] | null }
+      progress(table.name, true, `Generating [${table.name}]…`)
+      try {
+        await streamCompletion(job, [
+          { role: 'system', content: buildTablePrompt(req, table, need, parentHintsFor(table)) },
+          { role: 'user', content: `Output the header line and ${need} rows for ${table.name} now.` },
+        ], line => {
+          if (job.cancelRequested || generatedFor(table.name) >= target) return
+          const row = parseRow(table, line, state)
+          if (!row) return
+          ;(allTableData[table.name] ||= []).push(row)
+          generatedThisRun++
+          progress(table.name)
+        })
+      } catch (err) {
+        if (job.cancelRequested) return
+        aiFailures++
+        lastAiError = err instanceof Error ? err.message : String(err)
+        console.warn(`[generate] AI failed for ${table.name}:`, lastAiError)
+        break
       }
-    } catch {
-      if (++malformed <= 5) console.warn('[generate] malformed NDJSON line:', line.slice(0, 120))
+      if (generatedFor(table.name) >= Math.ceil(target * 0.6)) break
     }
+    // Never leave a table empty: fill any shortfall with the built-in generator.
+    const short = target - generatedFor(table.name)
+    if (short > 0 && !job.cancelRequested && generatedFor(table.name) === 0) {
+      const rows = synthesizeTable(table, Math.min(short, SEED_ROWS_PER_TABLE), { seed: startTime + table.name.length })
+      ;(allTableData[table.name] ||= []).push(...rows)
+      generatedThisRun += rows.length
+    }
+    emit(job, { type: 'table_complete', table: table.name, totalRows: allTableData[table.name]?.length || 0 })
   }
 
   try {
-    emit(job, { type: 'progress', table: '', message: 'Generating data…', rowsInserted: 0, totalInserted: 0, targetRows: totalTarget })
-
-    const messages: Array<{ role: string; content: string }> = [{ role: 'system', content: buildGenerationPrompt(req) }]
-    for (const m of req.conversationHistory || []) messages.push(m)
-    messages.push({
-      role: 'user',
-      content: `Generate the data now: ${totalTarget} rows across ${req.schema.length} tables. Begin with ###TABLE:${req.schema[0].name}###`,
+    emit(job, {
+      type: 'progress', table: '', totalInserted: 0, targetRows: totalTarget,
+      message: aiAvailable
+        ? `Generating ${req.schema.length} table${req.schema.length === 1 ? '' : 's'} in parallel…`
+        : 'AI is not configured — using the built-in generator',
     })
-    await streamCompletion(job, messages, onLine)
-    if (currentTable) emit(job, { type: 'table_complete', table: currentTable, totalRows: allTableData[currentTable]?.length || 0 })
-
-    // ─── Continuation: fill tables that are missing or short ───
-    for (let round = 0; round < MAX_CONTINUATION_ROUNDS && !job.cancelRequested; round++) {
-      const incomplete = req.schema.filter(t => stillTrying.has(t.name) && generatedFor(t.name) < req.rowCounts[t.name])
-      if (incomplete.length === 0) break
-      progress(true, `Continuing generation for ${incomplete.length} table${incomplete.length === 1 ? '' : 's'}…`)
-      for (const table of incomplete) {
-        if (job.cancelRequested) break
-        const remaining = req.rowCounts[table.name] - generatedFor(table.name)
-        if (remaining <= 0) continue
-        const before = generatedFor(table.name)
-        currentTable = table.name
-        const related = Object.fromEntries(Object.entries(allTableData).filter(([n]) => n !== table.name))
-        try {
-          await streamCompletion(job, [
-            { role: 'system', content: buildContinuationPrompt(table, remaining, allTableData[table.name] || [], related) },
-            { role: 'user', content: `Generate ${remaining} more records for ${table.name} now.` },
-          ], async (line) => {
-            // All continuation output belongs to this table.
-            if (/^#{2,3}\s*TABLE/i.test(line.trim())) return
-            currentTable = table.name
-            await onLine(line)
-          })
-        } catch (err) {
-          if (job.cancelRequested) break
-          console.warn(`[generate] continuation failed for ${table.name}:`, err instanceof Error ? err.message : err)
-        }
-        emit(job, { type: 'table_complete', table: table.name, totalRows: allTableData[table.name]?.length || 0 })
-        // No progress this round → the model is stuck; stop retrying this table.
-        if (generatedFor(table.name) === before) stillTrying.delete(table.name)
-      }
+    await mapLimit(req.schema, AI_CONCURRENCY, seedTable)
+    if (aiAvailable && aiFailures > 0) {
+      emit(job, {
+        type: 'progress', table: '', totalInserted: generatedThisRun, targetRows: totalTarget,
+        message: `AI failed for ${aiFailures} table${aiFailures === 1 ? '' : 's'} (${lastAiError.slice(0, 120)}) — filled with the built-in generator`,
+      })
     }
+    if (malformed > 0) console.warn(`[generate] job ${job.id}: skipped ${malformed} malformed line(s)`)
   } catch (err) {
     if (!job.cancelRequested) {
       console.error('[generate] job failed:', err)
       await persist(true)
       failJob(job, generatedThisRun > 0
-        ? `Generation stopped early (${err instanceof Error ? err.message : 'stream interrupted'}). ${generatedThisRun} rows were saved.`
+        ? `Generation stopped early (${err instanceof Error ? err.message : 'interrupted'}). ${generatedThisRun} rows were saved.`
         : (err instanceof Error ? err.message : 'Generation failed'))
       return
     }
@@ -490,7 +510,7 @@ export async function POST(request: NextRequest) {
   if (!v.ok) return json({ error: v.error }, 400)
   const req = v.req
 
-  if (!DEEPSEEK_API_KEY) return json({ error: 'AI service is not configured (DEEPSEEK_API_KEY missing)' }, 503)
+  // Without an AI key the built-in generator is used (still fast, schema-driven).
 
   try {
     // Ensure a database record exists (owner-scoped) and seed existing rows so

@@ -248,6 +248,15 @@ function generateValue(m: ColumnModel, rand: () => number, serial: number, idsBy
   }
 }
 
+const CREATED_COL = /^(created_at|createdat|created|signup_date|registered_at|joined_at|order_date|date|timestamp|placed_at)$/i
+
+/** id → row lookup that stays valid while the parent table grows (parents are finished first). */
+function rowIndex(rows: Row[] = []): Map<unknown, Row> {
+  const m = new Map<unknown, Row>()
+  for (const r of rows) if (r.id != null) m.set(r.id, r)
+  return m
+}
+
 /**
  * Expand every table in `seed` to `targets[table]` rows. Parent tables are
  * expanded before children so foreign keys reference final ids.
@@ -291,12 +300,122 @@ export function expandDataset(
     const models: Record<string, ColumnModel> = {}
     for (const c of columns) models[c] = buildModel(c, rows, fksByTable[name][c])
     const seedCount = rows.length
+    // Temporal order: a child row is created after the parent it points to.
+    const dateCol = columns.find(c => CREATED_COL.test(c))
+    const parentLinks = Object.entries(fksByTable[name] || {})
+      .filter(([, parent]) => parent !== name)
+      .map(([col, parent]) => {
+        const parentDate = Object.keys(out[parent]?.[0] || {}).find(k => CREATED_COL.test(k))
+        return parentDate ? { col, parent, parentDate, byId: rowIndex(out[parent]) } : null
+      })
+      .filter((x): x is { col: string; parent: string; parentDate: string; byId: Map<unknown, Row> } => !!x)
     for (let i = seedCount; i < target; i++) {
       const row: Row = {}
       for (const c of columns) row[c] = generateValue(models[c], rand, i + 1, idsByTable, faker)
+      if (dateCol && typeof row[dateCol] === 'string') {
+        let earliest = Number.NEGATIVE_INFINITY
+        for (const link of parentLinks) {
+          const t = Date.parse(String(link.byId.get(row[link.col])?.[link.parentDate] ?? ''))
+          if (!Number.isNaN(t) && t > earliest) earliest = t
+        }
+        const own = Date.parse(String(row[dateCol]))
+        if (Number.isFinite(earliest) && !Number.isNaN(own) && own < earliest) {
+          const shifted = new Date(earliest + Math.floor(rand() * 30 * 86_400_000))
+          const iso = new Date(Math.min(shifted.getTime(), Date.now())).toISOString()
+          row[dateCol] = String(row[dateCol]).length === 10 ? iso.slice(0, 10) : iso
+        }
+      }
       rows.push(row)
       if (row.id != null) idsByTable[name].push(row.id)
     }
   }
   return out
+}
+
+// ─── Schema-only synthesis (no AI) ───────────────────────────────────────────
+// Used when the AI is not configured, fails for a table, or returns nothing:
+// builds realistic seed rows from column names and declared types alone, so a
+// generation never comes back empty. Foreign keys are left null here and are
+// pointed at real parent rows by the integrity repair that runs afterwards.
+
+function typeOf(t: string): 'int' | 'float' | 'bool' | 'date' | 'datetime' | 'uuid' | 'json' | 'text' {
+  const s = (t || '').toLowerCase()
+  if (/uuid/.test(s)) return 'uuid'
+  if (/\b(serial|bigserial|int|integer|bigint|smallint|tinyint)\b/.test(s)) return 'int'
+  if (/\b(numeric|decimal|float|double|real|money)\b/.test(s)) return 'float'
+  if (/\b(bool|boolean)\b/.test(s)) return 'bool'
+  if (/\btimestamp|datetime\b/.test(s)) return 'datetime'
+  if (/\bdate\b/.test(s)) return 'date'
+  if (/\bjsonb?\b/.test(s)) return 'json'
+  return 'text'
+}
+
+const SEMANTIC: Array<[RegExp, (f: Faker, i: number) => unknown]> = [
+  [/^email$|_email$/i, (f, i) => `${f.internet.username().toLowerCase().replace(/[^a-z0-9._]/g, '')}${i}@example.com`],
+  [/^first_?name$/i, f => f.person.firstName()],
+  [/^last_?name$|^surname$/i, f => f.person.lastName()],
+  [/^(full_?|customer_?|user_?|contact_?|employee_?|patient_?|student_?|author_?|owner_?|display_?|person_?|member_?|guest_?|driver_?|doctor_?|teacher_?)?name$/i, f => f.person.fullName()],
+  [/username|^login$|^handle$/i, (f, i) => `${f.internet.username()}${i}`],
+  [/phone|mobile/i, f => f.phone.number()],
+  [/company|organi[sz]ation|employer|vendor|supplier/i, f => f.company.name()],
+  [/^(street|address|address_?line_?1)$/i, f => f.location.streetAddress()],
+  [/^city$/i, f => f.location.city()],
+  [/^(state|province|region)$/i, f => f.location.state()],
+  [/^country$/i, f => f.location.country()],
+  [/^country_?code$/i, f => f.location.countryCode()],
+  [/zip|postal|postcode/i, f => f.location.zipCode()],
+  [/^(lat|latitude)$/i, f => f.location.latitude()],
+  [/^(lng|lon|longitude)$/i, f => f.location.longitude()],
+  [/job_?title|position|designation/i, f => f.person.jobTitle()],
+  [/department|dept/i, f => f.commerce.department()],
+  [/product(_?name)?$|item_?name/i, f => f.commerce.productName()],
+  [/^title$|subject|headline/i, f => f.lorem.sentence({ min: 3, max: 7 }).replace(/\.$/, '')],
+  [/description|bio|summary|notes?$|comment|body|content/i, f => f.lorem.sentence()],
+  [/url|website|homepage|link/i, f => f.internet.url()],
+  [/^(sku|code|reference|ref)$|_code$|_number$/i, (f, i) => `${f.string.alpha({ length: 3, casing: 'upper' })}-${String(1000 + i)}`],
+  [/currency/i, f => f.finance.currencyCode()],
+  [/^(price|amount|total|cost|salary|balance|subtotal|tax|fee)/i, f => Number(f.finance.amount({ min: 5, max: 2000, dec: 2 }))],
+  [/quantity|qty|count|stock/i, f => f.number.int({ min: 1, max: 50 })],
+  [/rating|score/i, f => f.number.int({ min: 1, max: 5 })],
+  [/^age$/i, f => f.number.int({ min: 18, max: 80 })],
+  [/^gender$/i, f => f.helpers.arrayElement(['female', 'male', 'non-binary'])],
+  [/status$/i, f => f.helpers.arrayElement(['active', 'active', 'active', 'pending', 'inactive'])],
+  [/^(type|category|kind|tier|level|priority)$/i, f => f.helpers.arrayElement(['standard', 'premium', 'basic', 'enterprise'])],
+  [/color|colour/i, f => f.color.human()],
+  [/ip(_?address)?$/i, f => f.internet.ipv4()],
+]
+
+export function synthesizeTable(table: ExpandTable, count: number, opts: { seed?: number } = {}): Row[] {
+  const faker = new Faker({ locale: [en] })
+  faker.seed(opts.seed ?? 0xc0ffee)
+  const now = Date.now()
+  const rows: Row[] = []
+  for (let i = 0; i < count; i++) {
+    const row: Row = {}
+    for (const col of table.columns) {
+      const name = col.name
+      const t = typeOf(col.type)
+      if (name === 'id') { row.id = t === 'int' ? i + 1 : faker.string.uuid(); continue }
+      if (/_id$|Id$/.test(name)) { row[name] = null; continue } // repaired to a real parent later
+      const sem = SEMANTIC.find(([re]) => re.test(name))?.[1]
+      if (/^(created|updated|deleted)_?at$|_at$|_date$|^date$/i.test(name) || t === 'date' || t === 'datetime') {
+        const d = new Date(now - faker.number.int({ min: 0, max: 730 }) * 86_400_000 - faker.number.int({ min: 0, max: 86_399 }) * 1000)
+        row[name] = /^deleted/i.test(name) ? null : t === 'date' ? d.toISOString().slice(0, 10) : d.toISOString()
+        continue
+      }
+      if (sem && t !== 'bool') { row[name] = sem(faker, i + 1); continue }
+      switch (t) {
+        case 'uuid': row[name] = faker.string.uuid(); break
+        case 'int': row[name] = faker.number.int({ min: 0, max: 1000 }); break
+        case 'float': row[name] = Number(faker.number.float({ min: 0, max: 1000, fractionDigits: 2 })); break
+        case 'bool': row[name] = faker.datatype.boolean({ probability: 0.7 }); break
+        case 'json': row[name] = { note: faker.lorem.words(3) }; break
+        default: row[name] = faker.lorem.words({ min: 1, max: 3 })
+      }
+    }
+    // updated_at never before created_at
+    if (typeof row.created_at === 'string' && typeof row.updated_at === 'string' && row.updated_at < row.created_at) row.updated_at = row.created_at
+    rows.push(row)
+  }
+  return rows
 }

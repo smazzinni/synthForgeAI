@@ -293,6 +293,7 @@ export function cleanDisplayText(content: string): string {
   const optionsMarker = '{"type":"options"'
   const optionsMarkerLoose = '{"type": "options"'
   cleaned = removeJsonBlocks(cleaned, optionsMarker, optionsMarkerLoose)
+  cleaned = removeJsonBlocks(cleaned, '{"options":{', '{"options": {')
 
   // Remove follow_up and recommendation blocks
   const followUpMarker = '{"type":"follow_up"'
@@ -312,7 +313,7 @@ export function cleanDisplayText(content: string): string {
   cleaned = cleaned.replace(/^\s*\{"(?:type"\s*:\s*"(?:agent_status|options|follow_up|recommendation)"|action"\s*:\s*"BEGIN_GENERATION")[^}]*\}\s*$/gm, '')
 
   // Remove empty code fences left after JSON extraction
-  cleaned = cleaned.replace(/```\s*\n?\s*```/g, '')
+  cleaned = cleaned.replace(/```(?:json)?\s*\n?\s*```/g, '')
 
   // Remove orphaned code fences with only whitespace or JSON commands
   cleaned = cleaned.replace(/```(?:json)?\s*\n?\s*\{"type"\s*:\s*"(?:agent_status|options)"[\s\S]*?\n?\s*```/g, '')

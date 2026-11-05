@@ -1,5 +1,7 @@
 'use client'
 
+import { QuestionForm } from './_components/QuestionForm'
+import { formatAnswers, normalizeInteractiveOptions } from './_lib/answers'
 import { useState, useRef, useEffect, useCallback, Suspense } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { Input } from '@/components/ui/input'
@@ -994,7 +996,7 @@ function StudioPageInner({
       let fullReasoning = ''
       let lastAgentName = 'Orchestrator'
       let lastAgentStatus: AgentStatus | null = null
-      let lastInteractiveOptions: InteractiveOptions | null = null
+      let lastInteractiveOptions: InteractiveOptions[] | null = null
       let reasoningDirty = false
       let contentDirty = false
 
@@ -1022,7 +1024,7 @@ function StudioPageInner({
           }
           const allOptions = parseAllInteractiveOptions(fullContent)
           if (allOptions.length > 0) {
-            lastInteractiveOptions = allOptions[allOptions.length - 1]
+            lastInteractiveOptions = allOptions
           }
           const c = fullContent
           const an = lastAgentName
@@ -1489,6 +1491,7 @@ function StudioPageInner({
     setMessages(
       conv.messages.map(m => ({
         ...m,
+        interactiveOptions: normalizeInteractiveOptions(m.interactiveOptions),
         timestamp: new Date(m.timestamp),
         isStreaming: false,
         sqlBlockExecuting: false,
@@ -3032,7 +3035,7 @@ function StudioPageInner({
 
         {/* Chat Messages */}
         <div ref={chatContainerRef} className="flex-1 overflow-y-auto px-2.5 py-3 space-y-2.5 scroll-smooth">
-          {messages.map((message) => (
+          {messages.map((message, msgIdx) => (
             <div
               key={message.id}
               className={`group relative flex gap-1.5 animate-msg-fade-in ${message.role === 'user' ? 'justify-end' : ''}`}
@@ -3065,13 +3068,27 @@ function StudioPageInner({
                 {renderMessageContent(message)}
 
                 {/* Interactive options buttons - show during streaming too, but disabled */}
-                {message.role === 'assistant' && message.interactiveOptions && (
+                {message.role === 'assistant' && message.interactiveOptions && message.interactiveOptions.length > 1 && !message.isStreaming && (
+                  <QuestionForm
+                    messageId={message.id}
+                    questions={message.interactiveOptions}
+                    submitted={message.optionAnswers}
+                    locked={messages.some((m, i) => i > msgIdx && m.role === 'user')}
+                    onSubmit={(answers) => {
+                      setMessages(prev => prev.map(m =>
+                        m.id === message.id ? { ...m, optionAnswers: answers } : m
+                      ))
+                      sendMessage(formatAnswers(message.interactiveOptions!, answers))
+                    }}
+                  />
+                )}
+                {message.role === 'assistant' && message.interactiveOptions?.length === 1 && (
                   <div className="mt-2 space-y-1.5">
                     <p className="text-[10px] font-medium text-muted-foreground">
-                      {message.interactiveOptions.question}
+                      {message.interactiveOptions[0].question}
                     </p>
                     <div className="flex flex-wrap gap-1">
-                      {message.interactiveOptions.choices.map((choice) => (
+                      {message.interactiveOptions[0].choices.map((choice) => (
                         <button
                           key={choice.value}
                           onClick={() => handleOptionClick(choice, message.id)}
@@ -3079,7 +3096,7 @@ function StudioPageInner({
                           className={`text-[10px] px-2.5 py-1 rounded-full border transition-colors ${
                             message.isStreaming ? 'opacity-50 cursor-not-allowed' : ''
                           } ${
-                            message.interactiveOptions!.multi
+                            message.interactiveOptions![0].multi
                               ? 'border-violet-300 bg-violet-50 dark:bg-violet-950/30 text-violet-700 dark:text-violet-400 hover:bg-violet-100 dark:hover:bg-violet-950/50'
                               : 'border-amber-300 bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-950/50'
                           }`}
