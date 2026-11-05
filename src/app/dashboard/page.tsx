@@ -27,8 +27,6 @@ import {
   FileText,
   FileJson,
   FileSpreadsheet,
-  HardDrive,
-  Server,
   ArrowUpFromLine,
   PlugZap,
   Table2,
@@ -37,6 +35,7 @@ import {
   CircleDot,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import { uploadKind, sampleCsv, sampleJson, sampleSql, sampleXml, sampleSheets, type Sample } from '@/lib/upload-sample'
 import { apiDelete } from '@/lib/api-client'
 
 interface DatabaseItem {
@@ -133,7 +132,10 @@ export default function DashboardPage() {
     : 0
   const readyCount = databases.filter(db => db.status === 'ready').length
 
-  // Sparkline data (simulated from db stats)
+  // Real figures only — no invented trends.
+  const WEEK_MS = 7 * 24 * 60 * 60 * 1000
+  const newThisWeek = databases.filter(db => db.created_at && Date.now() - new Date(db.created_at).getTime() < WEEK_MS).length
+  // Sparkline data from the most recent databases
   const rowsSparkline = databases.slice(0, 7).map(db => db.row_count || 0)
   const qualitySparkline = databases.slice(0, 7).map(db => Math.round((db.quality_score || 0) * 100))
 
@@ -145,9 +147,9 @@ export default function DashboardPage() {
       color: 'text-amber-600',
       bgColor: 'bg-amber-100 dark:bg-amber-900/30',
       gradientBg: 'from-amber-50 to-orange-50 dark:from-amber-950/20 dark:to-orange-950/10',
-      sparkline: rowsSparkline.length > 1 ? <MiniSparkline data={databases.slice(0, 7).map((_, i) => i + 1)} color="#f59e0b" /> : null,
-      change: '+12%',
-      changePositive: true,
+      sparkline: null,
+      change: newThisWeek > 0 ? `+${newThisWeek} this week` : 'none this week',
+      changePositive: newThisWeek > 0 ? true : null,
       progressValue: Math.min(databases.length * 10, 100),
       progressColor: 'bg-amber-500',
     },
@@ -159,8 +161,8 @@ export default function DashboardPage() {
       bgColor: 'bg-emerald-100 dark:bg-emerald-900/30',
       gradientBg: 'from-emerald-50 to-teal-50 dark:from-emerald-950/20 dark:to-teal-950/10',
       sparkline: rowsSparkline.length > 1 ? <MiniSparkline data={rowsSparkline} color="#10b981" /> : null,
-      change: '+8%',
-      changePositive: true,
+      change: databases.length > 0 ? `~${Math.round(totalRows / databases.length).toLocaleString()} per db` : '—',
+      changePositive: null,
       progressValue: Math.min(Math.round(totalRows / 10), 100),
       progressColor: 'bg-emerald-500',
     },
@@ -172,8 +174,8 @@ export default function DashboardPage() {
       bgColor: 'bg-sky-100 dark:bg-sky-900/30',
       gradientBg: 'from-sky-50 to-cyan-50 dark:from-sky-950/20 dark:to-cyan-950/10',
       sparkline: qualitySparkline.length > 1 ? <MiniSparkline data={qualitySparkline} color="#0ea5e9" /> : null,
-      change: '+5%',
-      changePositive: true,
+      change: 'integrity score',
+      changePositive: null,
       progressValue: avgQuality,
       progressColor: 'bg-sky-500',
     },
@@ -185,8 +187,8 @@ export default function DashboardPage() {
       bgColor: 'bg-violet-100 dark:bg-violet-900/30',
       gradientBg: 'from-violet-50 to-purple-50 dark:from-violet-950/20 dark:to-purple-950/10',
       sparkline: null,
-      change: databases.length > 0 ? '-3%' : '0%',
-      changePositive: databases.length > 0 ? false : true,
+      change: databases.length > 0 ? `${Math.round((readyCount / databases.length) * 100)}% of all` : '—',
+      changePositive: null,
       progressValue: databases.length > 0 ? Math.round((readyCount / databases.length) * 100) : 0,
       progressColor: 'bg-violet-500',
     },
@@ -200,38 +202,48 @@ export default function DashboardPage() {
     fileName: string
     fileType: string
     schemaInfo: string
+    sampleNote: string
     content?: string
   } | null>(null)
 
   const handleFileUpload = async (file: File) => {
-    const ext = file.name.split('.').pop()?.toLowerCase() || ''
-    const supportedExts = ['sql', 'csv', 'xlsx', 'xls', 'json', 'xml', 'parquet', 'sqlite', 'db', 'dump', 'sql.gz', 'bson']
-    if (!supportedExts.some(se => ext.endsWith(se))) {
-      toast.error('Unsupported file format')
+    const kind = uploadKind(file.name)
+    if (!kind) {
+      toast.error("This file type isn't supported yet. Export it as CSV, Excel (.xlsx), JSON or SQL.")
       return
     }
-    const typeMap: Record<string, string> = {
-      sql: 'SQL Schema', csv: 'CSV Data', xlsx: 'Excel Spreadsheet', xls: 'Excel Spreadsheet',
-      json: 'JSON Data', xml: 'XML Data', parquet: 'Parquet Data', sqlite: 'SQLite Database',
-      db: 'Database File', dump: 'SQL Dump', bson: 'MongoDB Export',
-    }
-
-    // Read file content for text-based formats (up to 100KB)
-    const textExts = ['sql', 'csv', 'json', 'xml', 'dump']
-    let content: string | undefined
-    if (textExts.includes(ext) && file.size < 100 * 1024) {
-      try {
-        content = await file.text()
-      } catch {
-        // Binary or unreadable — skip content, just pass filename
+    const label = { sql: 'SQL file', csv: 'CSV file', json: 'JSON file', xml: 'XML file', excel: 'Excel workbook' }[kind]
+    const LIMIT = 256 * 1024
+    let sample: Sample
+    try {
+      if (kind === 'excel') {
+        if (file.size > 10 * 1024 * 1024) {
+          toast.error('Excel file is too large (max 10 MB).')
+          return
+        }
+        const { default: readXlsxFile } = await import('read-excel-file/universal')
+        const sheets = await readXlsxFile(file)
+        sample = sampleSheets(sheets.map(s => ({ name: s.sheet, rows: s.data as unknown[][] })))
+      } else {
+        const text = await file.slice(0, LIMIT).text()
+        const complete = file.size <= LIMIT
+        sample =
+          kind === 'csv' ? sampleCsv(text, { complete })
+          : kind === 'json' ? sampleJson(text)
+          : kind === 'sql' ? sampleSql(text)
+          : sampleXml(text)
       }
+    } catch {
+      toast.error("Couldn't read this file. Check that it isn't corrupted or password-protected.")
+      return
     }
 
     setUploadPreview({
       fileName: file.name,
-      fileType: typeMap[ext] || 'Unknown',
-      schemaInfo: `Detected ${typeMap[ext] || 'data'} file (${(file.size / 1024).toFixed(1)} KB)`,
-      content,
+      fileType: label,
+      schemaInfo: `${label} (${(file.size / 1024).toFixed(1)} KB)`,
+      sampleNote: sample.note,
+      content: sample.content,
     })
     toast.success(`File "${file.name}" ready for import`)
   }
@@ -262,9 +274,7 @@ export default function DashboardPage() {
         // sessionStorage might be full — fall back to just the filename prompt
       }
     }
-    const prompt = uploadPreview.content
-      ? `Import and generate data from this ${uploadPreview.fileType} file "${uploadPreview.fileName}". The file content is available in sessionStorage under 'synthforge_upload_content'. Read it, analyze the schema, and generate realistic synthetic data based on it.`
-      : `Import and generate data from this ${uploadPreview.fileType} file: ${uploadPreview.fileName}`
+    const prompt = `Create a synthetic database shaped like the ${uploadPreview.fileType} "${uploadPreview.fileName}": infer the tables, columns, types and relationships from it, keep the same column names, then generate realistic synthetic data.`
     router.push(`/dashboard/studio?q=${encodeURIComponent(prompt)}`)
   }
 
@@ -382,8 +392,6 @@ export default function DashboardPage() {
 
       {/* Connect to a Live DB feature */}
       <div className="mb-6 relative">
-        {/* Animated dashed border */}
-        <div className="absolute -inset-[2px] rounded-xl border-2 border-dashed border-sky-400/50 dark:border-sky-600/50 animate-[spin_20s_linear_infinite] pointer-events-none" />
         <Card className="relative bg-gradient-to-br from-sky-50/50 to-indigo-50/50 dark:from-sky-950/20 dark:to-indigo-950/20 border-sky-300 dark:border-sky-800">
           <CardContent className="pt-6">
             <div className="flex items-start gap-4">
@@ -448,7 +456,7 @@ export default function DashboardPage() {
                 <div className="flex-1 h-1.5 bg-muted/50 rounded-full overflow-hidden">
                   <div className={`h-full rounded-full ${stat.progressColor} transition-all duration-500`} style={{ width: `${Math.min(stat.progressValue, 100)}%` }} />
                 </div>
-                <span className={`text-[10px] font-semibold ${stat.changePositive ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-500 dark:text-red-400'}`}>
+                <span className={`text-[10px] font-semibold whitespace-nowrap ${stat.changePositive === null ? 'text-muted-foreground' : stat.changePositive ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-500 dark:text-red-400'}`}>
                   {stat.change}
                 </span>
               </div>
@@ -481,7 +489,7 @@ export default function DashboardPage() {
                     <input
                       type="file"
                       className="hidden"
-                      accept=".sql,.csv,.xlsx,.xls,.json,.xml,.parquet,.sqlite,.db,.dump,.bson"
+                      accept=".sql,.dump,.csv,.tsv,.json,.xml,.xlsx"
                       onChange={handleFileSelect}
                     />
                     <span className="text-[10px] px-3 py-1.5 rounded-md bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 font-medium hover:bg-amber-200 dark:hover:bg-amber-900/50 transition-colors">
@@ -501,11 +509,6 @@ export default function DashboardPage() {
                   { icon: FileSpreadsheet, label: 'Excel' },
                   { icon: FileJson, label: 'JSON' },
                   { icon: FileText, label: 'XML' },
-                  { icon: HardDrive, label: 'Parquet' },
-                  { icon: Database, label: 'SQLite' },
-                  { icon: Server, label: 'PgSQL' },
-                  { icon: Server, label: 'MySQL' },
-                  { icon: Database, label: 'Mongo' },
                 ].map((ft) => (
                   <span key={ft.label} className="inline-flex items-center gap-1 text-[10px] px-2 py-1 rounded-md border bg-muted/50 text-muted-foreground hover:bg-muted transition-colors">
                     <ft.icon className="h-3 w-3" />
@@ -513,7 +516,7 @@ export default function DashboardPage() {
                   </span>
                 ))}
               </div>
-              <div className="relative group/tooltip" title="SQL, CSV, Excel, JSON, XML, Parquet, SQLite, PostgreSQL, MySQL, MongoDB, and more">
+              <div className="relative group/tooltip" title="SQL schema or dump, CSV/TSV, Excel (.xlsx), JSON or XML. For a live PostgreSQL/MySQL database use DB Connections.">
                 <Info className="h-3.5 w-3.5 text-muted-foreground/50 hover:text-muted-foreground cursor-help" />
               </div>
             </div>
@@ -548,6 +551,7 @@ export default function DashboardPage() {
                     <div className="flex-1 min-w-0">
                       <p className="text-xs font-semibold truncate">{uploadPreview.fileName}</p>
                       <p className="text-[10px] text-muted-foreground">{uploadPreview.schemaInfo}</p>
+                      <p className="text-[10px] text-muted-foreground">Sample: {uploadPreview.sampleNote}</p>
                     </div>
                   </div>
                   <Button

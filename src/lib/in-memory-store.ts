@@ -164,27 +164,7 @@ export function addMessagesInMemory(
   conversationId: string,
   messages: Array<{ role: string; content: string; agentName?: string }>
 ): boolean {
-  // Owner-scoped only.
-  for (const [uid, list] of [[userId, conversationStore.get(userId) || []] as const]) {
-    const idx = list.findIndex(c => c.id === conversationId)
-    if (idx !== -1) {
-      const now = new Date().toISOString()
-      for (const msg of messages) {
-        list[idx].messages.push({
-          id: generateId(),
-          conversation_id: conversationId,
-          role: msg.role,
-          content: msg.content,
-          agent_name: msg.agentName || null,
-          created_at: now,
-        })
-      }
-      list[idx].updated_at = now
-      conversationStore.set(uid, list)
-      return true
-    }
-  }
-  // Fallback to user-scoped
+  // Owner-scoped: only the user's own conversations can be appended to.
   const list = conversationStore.get(userId) || []
   const idx = list.findIndex(c => c.id === conversationId)
   if (idx === -1) return false

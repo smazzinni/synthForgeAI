@@ -318,7 +318,10 @@ function StudioPageInner({
   const [pageSort, setPageSort] = useState<{ col: string; dir: 'asc' | 'desc' } | null>(null)
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [visibleRows, setVisibleRows] = useState(20)
-  const [initialQuerySent, setInitialQuerySent] = useState(false)
+  // A ref, not state: React dev mode runs effects twice on mount, and a state
+  // flag set in the first run isn't visible to the second, so the dashboard
+  // prompt would be sent twice (or, with a cleanup, cancelled entirely).
+  const initialQuerySentRef = useRef(false)
   const [conversationId, setConversationId] = useState(initialConversationId || '')
 
   // ─── Conversation history (localStorage) ───
@@ -1369,9 +1372,9 @@ function StudioPageInner({
     const q = searchParams.get('q')
     const hasConnection = searchParams.get('connectionId')
     const ready = !hasConnection || (activeConnectionId && !connectionLoading)
-    if (q && !initialQuerySent && ready) {
-      setInitialQuerySent(true)
-      const timer = setTimeout(() => {
+    if (q && !initialQuerySentRef.current && ready) {
+      initialQuerySentRef.current = true
+      setTimeout(() => {
         // Check if there's uploaded file content in sessionStorage
         // (from the dashboard's Upload & Import feature)
         let fullPrompt = q
@@ -1390,9 +1393,9 @@ function StudioPageInner({
         }
         sendMessage(fullPrompt)
       }, 100)
-      return () => clearTimeout(timer)
+      // No cleanup on purpose: the send must survive re-renders of this page.
     }
-  }, [searchParams, initialQuerySent, activeConnectionId, connectionLoading])
+  }, [searchParams, activeConnectionId, connectionLoading])
 
   // ─── Auto-save generated data ───
   const autoSaveData = async (
@@ -2789,28 +2792,29 @@ function StudioPageInner({
               />
             </div>
             <div className="min-w-0">
-              <h2 className="text-xs font-semibold truncate flex items-center gap-1.5">
-                {isLiveDbMode ? (activeConnectionName || 'Live DB') : 'SynthForge AI'}
-                {/* Active dialect badge — PostgreSQL / MySQL in live mode,
-                    SQLite for synthetic-data mode. Amber/red theme to stay
-                    consistent with the rest of the chat header. */}
+              <h2 className="text-xs font-semibold flex items-center gap-1.5 min-w-0">
+                <span className="truncate">{isLiveDbMode ? (activeConnectionName || 'Live DB') : 'AI Chat'}</span>
+                {/* Active engine badge — PostgreSQL / MySQL in live mode, the
+                    in-app SQL engine for synthetic data. Amber/red theme to
+                    stay consistent with the rest of the chat header. */}
                 <Badge
                   variant="outline"
-                  className="text-[8px] h-3 px-1 gap-0.5 leading-none shrink-0 border-amber-400/60 text-amber-700 dark:text-amber-400 bg-amber-50/60 dark:bg-amber-950/30"
+                  title={isLiveDbMode ? undefined : 'Synthetic data, queried with the built-in SQL engine'}
+                  className="text-[8px] h-3 px-1 gap-0.5 leading-none shrink-0 whitespace-nowrap border-amber-400/60 text-amber-700 dark:text-amber-400 bg-amber-50/60 dark:bg-amber-950/30"
                 >
                   {isLiveDbMode
                     ? (activeConnectionDialect || 'postgres').toUpperCase()
-                    : 'SQLITE'}
+                    : 'SYNTHETIC'}
                 </Badge>
               </h2>
               <p className="text-[9px] text-muted-foreground truncate">
                 {isLiveDbMode
                   ? `LIVE ${activeConnectionDialect || 'postgres'} · CRUD mode`
-                  : 'DeepSeek v4 · streaming'}
+                  : 'DeepSeek · streaming'}
               </p>
             </div>
           </div>
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1 shrink-0">
             <Button
               variant="ghost"
               size="sm"

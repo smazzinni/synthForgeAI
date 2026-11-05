@@ -44,6 +44,14 @@ const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
     "no-useless-escape": "off",
   },
 }, {
+  // Test scripts: plain Node (CommonJS .cjs uses require) with terse
+  // `ok ? pass() : fail()` assertions.
+  files: ["e2e/**"],
+  rules: {
+    "@typescript-eslint/no-require-imports": "off",
+    "@typescript-eslint/no-unused-expressions": "off",
+  },
+}, {
   ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts", "examples/**", "skills", "server.js", "start.js", "start.sh"]
 }];
 

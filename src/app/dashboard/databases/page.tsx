@@ -193,6 +193,23 @@ export default function MyDatabasesPage() {
     }
   }, [])
 
+  // While any database is still generating (e.g. a run that continues after
+  // the tab was closed), refresh quietly so status and row counts update.
+  const hasGenerating = databases.some(db => db.status === 'generating')
+  useEffect(() => {
+    if (!hasGenerating) return
+    const t = setInterval(async () => {
+      try {
+        invalidateCache('/api/databases')
+        const data = await apiGet<{ databases: DatabaseItem[] }>('/api/databases', { cacheTtl: 0, timeout: 10000 })
+        setDatabases(data.databases || [])
+      } catch {
+        // keep the current list; the next tick retries
+      }
+    }, 5000)
+    return () => clearInterval(t)
+  }, [hasGenerating])
+
   useEffect(() => {
     loadDatabases()
   }, [loadDatabases])
@@ -437,7 +454,7 @@ export default function MyDatabasesPage() {
                       <Icon className="h-5 w-5" />
                     </div>
                     <div className="min-w-0">
-                      <p className="text-xs text-muted-foreground truncate">{stat.label}</p>
+                      <p className="text-xs text-muted-foreground leading-tight">{stat.label}</p>
                       <p className="text-xl md:text-2xl font-bold tracking-tight">{stat.value}</p>
                     </div>
                   </div>

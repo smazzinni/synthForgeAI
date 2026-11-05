@@ -24,50 +24,9 @@ interface Notification {
   read: boolean
 }
 
-const STORAGE_KEY = 'synthforge_notifications'
+const STORAGE_KEY = 'synthforge_notifications_v2'
 
-const seedNotifications: Notification[] = [
-  {
-    id: '1',
-    type: 'success',
-    title: 'Database generated successfully',
-    description: 'E-commerce database with 5 tables created',
-    time: '5m ago',
-    read: false,
-  },
-  {
-    id: '2',
-    type: 'info',
-    title: 'New connection added',
-    description: 'Supabase Test connection configured',
-    time: '1h ago',
-    read: false,
-  },
-  {
-    id: '3',
-    type: 'success',
-    title: 'Quality check passed',
-    description: 'All generated data passed quality validation',
-    time: '2h ago',
-    read: false,
-  },
-  {
-    id: '4',
-    type: 'info',
-    title: 'API key created',
-    description: "New API key 'production-key' was created",
-    time: '1d ago',
-    read: true,
-  },
-  {
-    id: '5',
-    type: 'info',
-    title: 'Weekly summary ready',
-    description: 'Your weekly usage report is available',
-    time: '3d ago',
-    read: true,
-  },
-]
+const seedNotifications: Notification[] = []
 
 function getNotifications(): Notification[] {
   if (typeof window === 'undefined') return seedNotifications

@@ -440,7 +440,9 @@ async function runGeneration(job: GenerationJob, fullReq: GenerationRequest, see
   // ─── Quality Analyst: repair relational integrity of the AI sample ───
   const describeFixes = (r: IntegrityReport) => {
     const fixed = r.issues.filter(i => i.kind !== 'unknown_table').reduce((n, i) => n + i.count, 0)
-    return fixed === 0 ? 'no integrity problems found' : `fixed ${fixed} integrity problem${fixed === 1 ? '' : 's'} (${[...new Set(r.issues.map(i => i.kind.replace(/_/g, ' ')))].join(', ')})`
+    return fixed === 0
+      ? 'all keys and constraints check out'
+      : `repaired ${fixed.toLocaleString('en-US')} value${fixed === 1 ? '' : 's'} so keys and constraints hold (${[...new Set(r.issues.map(i => i.kind.replace(/_/g, ' ')))].join(', ')})`
   }
   if (!job.cancelRequested && generatedThisRun > 0) {
     const { data: repaired, report } = repairDataset(req.schema, allTableData as Record<string, Record<string, unknown>[]>)
