@@ -56,6 +56,14 @@ export default function StudioDatabasePage({ params }: { params: Promise<{ id: s
           return
         }
 
+        // Still being generated (e.g. the tab was closed mid-run): open it via
+        // the studio route that follows the running job, shows progress and
+        // refreshes the data when it finishes.
+        if (db.status === 'generating') {
+          window.location.replace(`/dashboard/studio?databaseId=${encodeURIComponent(id)}`)
+          return
+        }
+
         setDbName((db.name as string) || '')
 
         if (Array.isArray(db.schema_json)) {

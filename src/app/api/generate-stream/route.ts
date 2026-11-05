@@ -55,7 +55,7 @@ const MAX_TOTAL_ROWS = 250_000
 /** Rows per table the AI writes itself; the rest are synthesised locally from them. */
 const SEED_ROWS_PER_TABLE = Math.max(5, Number.parseInt(process.env.GENERATION_SEED_ROWS || '', 10) || 25)
 /** Parallel AI calls (one per table). */
-const AI_CONCURRENCY = Math.max(1, Number.parseInt(process.env.GENERATION_CONCURRENCY || '', 10) || 6)
+const AI_CONCURRENCY = Math.max(1, Number.parseInt(process.env.GENERATION_CONCURRENCY || '', 10) || 10)
 const PERSIST_INTERVAL_MS = 2500     // write progress to storage at most this often (scaled up for big datasets)
 const PROGRESS_INTERVAL_MS = 300     // emit progress events at most this often
 const UPSTREAM_IDLE_TIMEOUT_MS = 90_000
@@ -185,7 +185,8 @@ async function streamOnce(
     const res = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
-      body: JSON.stringify({ model, messages, stream: true, max_tokens: maxTokens, temperature: 0.9 }),
+      // V4 models think by default; row generation must stay fast.
+      body: JSON.stringify({ model, thinking: { type: process.env.GENERATION_THINKING === 'true' ? 'enabled' : 'disabled' }, messages, stream: true, max_tokens: maxTokens, temperature: 0.9 }),
       signal: ctrl.signal,
     })
     if (!res.ok || !res.body) {

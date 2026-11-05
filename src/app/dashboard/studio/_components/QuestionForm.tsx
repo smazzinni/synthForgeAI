@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { InteractiveOptions } from '@/lib/ai-agents'
@@ -25,6 +25,18 @@ export function QuestionForm({ messageId, questions, submitted, locked, onSubmit
   )
   const [custom, setCustom] = useState<string[]>(() => questions.map(() => ''))
   const readOnly = locked || !!submitted
+  const formRef = useRef<HTMLFormElement>(null)
+
+  // The form mounts after the reply finishes streaming, below the fold —
+  // bring a fresh, unanswered form into view so the choices aren't missed.
+  useEffect(() => {
+    if (readOnly) return
+    const el = formRef.current
+    if (!el) return
+    const t = setTimeout(() => el.scrollIntoView({ block: 'end', behavior: 'smooth' }), 50)
+    return () => clearTimeout(t)
+    // Only on mount: later re-renders must not yank the scroll position.
+  }, [])
 
   const answerFor = (i: number): string[] => {
     const c = custom[i]?.trim()
@@ -53,7 +65,8 @@ export function QuestionForm({ messageId, questions, submitted, locked, onSubmit
 
   return (
     <form
-      className="mt-2 space-y-3 rounded-lg border border-amber-300/60 bg-amber-50/40 dark:bg-amber-950/20 p-3"
+      ref={formRef}
+      className="mt-2 space-y-3 scroll-mb-4 rounded-lg border border-amber-300/60 bg-amber-50/40 dark:bg-amber-950/20 p-3"
       aria-label="Questions from the assistant"
       onSubmit={e => {
         e.preventDefault()
@@ -65,29 +78,47 @@ export function QuestionForm({ messageId, questions, submitted, locked, onSubmit
         const inputId = `${messageId}-other-${i}`
         return (
           <fieldset key={i} className="space-y-1.5" disabled={readOnly}>
-            <legend className="text-xs font-medium">
-              {i + 1}. {q.question}
+            <legend className="text-xs font-medium leading-relaxed">
+              {q.header && (
+                <span className="mr-1.5 inline-block rounded bg-amber-200/80 dark:bg-amber-900/60 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide align-middle">
+                  {q.header}
+                </span>
+              )}
+              {questions.length > 1 && `${i + 1}. `}
+              {q.question}
               {q.multi && <span className="ml-1 text-muted-foreground font-normal">(select all that apply)</span>}
             </legend>
             <div className="flex flex-col sm:flex-row sm:flex-wrap gap-1.5">
               {q.choices.map(choice => {
                 const on = !custom[i]?.trim() && (readOnly ? shown : selected[i]).includes(choice.label)
+                const isRecommended = /\(?\brecommended\b\)?/i.test(choice.label)
+                const text = choice.label.replace(/\s*[—–-]?\s*\(?\brecommended\b\)?\s*/i, ' ').trim() || choice.label
                 return (
                   <button
-                    key={choice.value}
+                    key={choice.value + choice.label}
                     type="button"
-                    aria-pressed={on}
+                    role={q.multi ? 'checkbox' : 'radio'}
+                    aria-checked={on}
+                    title={choice.description || undefined}
                     onClick={() => {
                       setCustom(prev => prev.map((c, qi) => (qi === i ? '' : c)))
                       toggle(i, choice.label)
                     }}
-                    className={`min-h-9 px-3 py-1.5 text-xs text-left rounded-md border transition-colors disabled:cursor-default ${
+                    className={`min-h-9 px-3 py-1.5 text-xs text-left rounded-md border transition-colors disabled:cursor-default sm:max-w-[18rem] ${
                       on
-                        ? 'border-amber-500 bg-amber-200 dark:bg-amber-900/60 font-medium'
+                        ? 'border-amber-500 bg-amber-200 dark:bg-amber-900/60'
                         : 'border-border bg-background hover:bg-muted disabled:opacity-60'
                     }`}
                   >
-                    {choice.label}
+                    <span className="font-medium">{text}</span>
+                    {isRecommended && (
+                      <span className="ml-1.5 inline-block rounded-full bg-emerald-100 text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-200 px-1.5 text-[10px] font-semibold align-middle">
+                        Recommended
+                      </span>
+                    )}
+                    {choice.description && (
+                      <span className="mt-0.5 block text-[11px] leading-snug text-muted-foreground">{choice.description}</span>
+                    )}
                   </button>
                 )
               })}

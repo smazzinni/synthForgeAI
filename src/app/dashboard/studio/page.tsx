@@ -114,7 +114,6 @@ import {
   getAgentByName,
   type AgentStatus,
   type InteractiveOptions,
-  type OptionChoice,
   type BeginGenerationSignal,
 } from '@/lib/ai-agents'
 // Extracted types + helpers + sub-components (kept the main file focused)
@@ -1948,18 +1947,6 @@ function StudioPageInner({
   // extracted helper in ./_lib/utils.
   const generateSchemaSQL = (): string => generateSchemaSQLHelper(generatedSchema, databaseName)
 
-  // ─── Handle option button click ───
-  // Collapses the (now answered) question so the bubble doesn't keep
-  // showing stale choice buttons after the user has picked one.
-  const handleOptionClick = (choice: OptionChoice, messageId?: string) => {
-    if (messageId) {
-      setMessages(prev => prev.map(m =>
-        m.id === messageId ? { ...m, interactiveOptions: null } : m
-      ))
-    }
-    sendMessage(choice.value)
-  }
-
   // ─── Start streaming data generation ───
   const startStreamingGeneration = async (signal: BeginGenerationSignal, assistantId: string) => {
     const controller = new AbortController()
@@ -3068,7 +3055,7 @@ function StudioPageInner({
                 {renderMessageContent(message)}
 
                 {/* Interactive options buttons - show during streaming too, but disabled */}
-                {message.role === 'assistant' && message.interactiveOptions && message.interactiveOptions.length > 1 && !message.isStreaming && (
+                {message.role === 'assistant' && message.interactiveOptions && message.interactiveOptions.length >= 1 && !message.isStreaming && (
                   <QuestionForm
                     messageId={message.id}
                     questions={message.interactiveOptions}
@@ -3081,75 +3068,6 @@ function StudioPageInner({
                       sendMessage(formatAnswers(message.interactiveOptions!, answers))
                     }}
                   />
-                )}
-                {message.role === 'assistant' && message.interactiveOptions?.length === 1 && (
-                  <div className="mt-2 space-y-1.5">
-                    <p className="text-[10px] font-medium text-muted-foreground">
-                      {message.interactiveOptions[0].question}
-                    </p>
-                    <div className="flex flex-wrap gap-1">
-                      {message.interactiveOptions[0].choices.map((choice) => (
-                        <button
-                          key={choice.value}
-                          onClick={() => handleOptionClick(choice, message.id)}
-                          disabled={message.isStreaming}
-                          className={`text-[10px] px-2.5 py-1 rounded-full border transition-colors ${
-                            message.isStreaming ? 'opacity-50 cursor-not-allowed' : ''
-                          } ${
-                            message.interactiveOptions![0].multi
-                              ? 'border-violet-300 bg-violet-50 dark:bg-violet-950/30 text-violet-700 dark:text-violet-400 hover:bg-violet-100 dark:hover:bg-violet-950/50'
-                              : 'border-amber-300 bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-950/50'
-                          }`}
-                        >
-                          {choice.label}
-                        </button>
-                      ))}
-                    </div>
-                    {/* Custom answer input — lets the user type their own
-                        answer instead of picking one of the preset choices.
-                        The answer is sent as a normal chat message so the AI
-                        can respond to any free-form input (e.g. "200 rows",
-                        "medium, US locale"). Disabled while the AI is
-                        streaming. Pressing Enter or clicking the send button
-                        submits the custom answer. */}
-                    {!message.isStreaming && (
-                      <form
-                        className="flex items-center gap-1 mt-1.5"
-                        onSubmit={(e) => {
-                          e.preventDefault()
-                          const el = e.currentTarget.elements.namedItem('custom-answer') as HTMLInputElement | null
-                          if (!el) return
-                          const val = el.value.trim()
-                          if (!val) return
-                          el.value = ''
-                          // Collapse the options once the user has answered so
-                          // the bubble doesn't keep showing the (now stale)
-                          // question + buttons.
-                          setMessages(prev => prev.map(m =>
-                            m.id === message.id ? { ...m, interactiveOptions: null } : m
-                          ))
-                          sendMessage(val)
-                        }}
-                      >
-                        <Input
-                          name="custom-answer"
-                          placeholder="Or type your own answer…"
-                          className="h-7 text-[11px] flex-1"
-                          aria-label="Custom answer"
-                        />
-                        <Button
-                          type="submit"
-                          size="sm"
-                          variant="secondary"
-                          className="h-7 px-2 text-[10px] gap-1 shrink-0"
-                          aria-label="Send custom answer"
-                        >
-                          <Send className="h-3 w-3" />
-                          Send
-                        </Button>
-                      </form>
-                    )}
-                  </div>
                 )}
 
                 {/* ─── SQL block(s) (live DB mode) ─── */}
