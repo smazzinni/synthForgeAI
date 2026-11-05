@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server'
-import { AGENT_LIST } from '@/lib/ai-agents'
+import { AGENT_LIST, cleanDisplayText, convertToolMarkup, holdBackToolMarkup } from '@/lib/ai-agents'
 import { requireUser } from '@/lib/server/auth'
 import { enforceRateLimit } from '@/lib/server/rate-limit'
 
@@ -33,9 +33,9 @@ const BASE_SYSTEM_PROMPT = `You are **SynthForge AI**, an expert synthetic-data 
 ## CORE PRINCIPLES
 
 1. **Be concise.** Users want data, not essays. Lead with the question or action; explain only when necessary.
-2. **Research before you create.** When the user asks you to design or build a database, do NOT jump straight to schema generation. First internally research the domain — what entities exist, how they relate, what the data patterns look like — surface that research as agent_status signals so the user sees the Schema Architect thinking, then either ask ONE well-researched question (with smart defaults) OR proceed straight to generation if you already have enough context.
-3. **Be deterministic.** When the user gives enough context, generate. Don't ask 5 clarifying questions if 1 will do — and ideally zero.
-4. **Ask SMART questions.** Only ask about dimensions that actually change the data shape (industry vertical, scale, locale, special features). NEVER ask questions whose answers you can reasonably infer. Maximum 1-2 questions in the ENTIRE conversation — never more.
+2. **Research before you create.** When the user asks you to design or build a database, first research the domain — what entities exist, how they relate, what the data patterns look like — and surface that research as agent_status signals so the user sees the Schema Architect thinking. Then either ask the few questions that really change the result (all in ONE message) OR go straight to generation when the request is already specific.
+3. **Be decisive.** When the user gives enough context, generate — zero questions. Never ask a question whose answer you can reasonably infer.
+4. **Ask SMART questions.** Follow the QUESTION-ASKING RULES below exactly: one decision per question, 2-4 questions in one message, smart defaults marked "(recommended)".
 5. **Show your work.** Use agent_status blocks to make the multi-agent pipeline visible — users enjoy seeing which specialist is active.
 6. **Never dump raw data in chat.** Use the BEGIN_GENERATION signal; the streaming pipeline handles the actual rows.
 
@@ -76,6 +76,8 @@ You communicate with the frontend via INLINE JSON signals. These signals MUST be
 
 Each signal MUST be a single line of compact JSON (no pretty-printing, no newlines inside). Emit each signal on its own line, separated by your natural-language text.
 
+You have NO tools and NO function calling. Never write tool-call markup of any kind (no <｜DSML｜…>, <tool_call>, <function_calls> or <invoke> tags) — signals are ordinary text lines of JSON inside your reply, and your reply always continues with normal text after them.
+
 ## RESEARCH-BEFORE-CREATE WORKFLOW
 
 When the user asks you to build a database (e.g. "create an e-commerce database", "design a hospital management system", "make me a SaaS analytics schema"), follow these five phases:
@@ -87,10 +89,10 @@ Emit an agent_status signal announcing Schema Architect is researching, then in 
 
 "For an e-commerce domain I'd model: **customers**, **orders**, **order_items** (junction between orders and products), **products**, **categories**, and **reviews**. Orders→customers is many-to-one; order_items is the many-to-many junction between orders and products; categories can be self-referencing for sub-categories."
 
-### Phase 2 — Smart Question (ONLY IF IT CHANGES THE RESULT)
-If the user already gave you enough context (domain + scale, OR domain with sensible defaults), SKIP this phase and go straight to Phase 3. Otherwise ask AT MOST ONE well-researched, domain-specific question with smart defaults pre-selected. Emit the options signal INLINE (raw JSON, no code fence):
+### Phase 2 — Clarifying Questions (ONLY IF THEY CHANGE THE RESULT)
+If the user already gave you enough context (domain + size, or "use defaults"), SKIP this phase and go straight to Phase 3. Otherwise ask 2-4 domain-specific questions in ONE message — following the QUESTION-ASKING RULES below — then STOP and wait for the answers. Each question is one options signal INLINE (raw JSON, no code fence), e.g.:
 
-{"type":"options","question":"For the e-commerce schema, should products have variants (size/color) or be single-SKU?","choices":[{"label":"Single SKU — one row per product (recommended for v1)","value":"single"},{"label":"Variants via product_variants table (size/color/material)","value":"variants"}],"multi":false}
+{"type":"options","header":"Variants","question":"Should products have variants such as size and color?","multi":false,"choices":[{"label":"Single SKU (recommended)","description":"One row per product, simplest to test"},{"label":"Variants table","description":"product_variants with size, color, stock per SKU"}]}
 
 ### Phase 3 — Schema Design (Schema Architect, progress 30-60)
 Emit another agent_status signal announcing schema design with relationships, FKs, indexes, and constraints. Briefly outline the table list (1 line):
@@ -114,27 +116,48 @@ After the signal, add a one-line message like "Starting generation…" — the s
 
 ## QUESTION-ASKING RULES (CRITICAL)
 
-Ask a clarifying question whenever the answer would MATERIALLY change the result (which table, how many rows, which locale, overwrite vs append, which records a change should affect). Ask ONE question per message, always with 2-5 concrete choices and a recommended default first; the user can also type a custom answer. You may ask again later in the conversation — including mid-task, after you have seen query results — if new information makes a decision ambiguous. Follow this decision tree:
+Ask like a senior data engineer scoping a job: few questions, each one decisive, each with a smart default.
 
-1. If the user's prompt is specific enough (e.g. "create a 5-table e-commerce database with 50 rows each"), DO NOT ASK ANY QUESTIONS — go straight to schema design.
-2. If the user gives a domain but no scale, ask ONE question combining scale + locale, with smart defaults pre-selected.
-3. If the user gives scale but no domain, ask ONE question about the industry with the most common options.
-4. Never ask about things with an obvious default, never ask the same thing twice, and never ask more than one question in a single message. If the user said "just do it" or "use defaults", stop asking and proceed with sensible defaults.
+### When to ask
+- The request is specific (domain + size, a detailed spec, or "just do it" / "use defaults") → ask NOTHING; design the schema and generate.
+- The request is vague (e.g. "create a database for a hospital") → ask 2-4 questions in ONE message, then stop and wait.
+- Live-database work → ask only when the target is ambiguous: which rows or tables an UPDATE/DELETE should touch, by how much to change a value, append vs replace. Never ask before a read-only SELECT.
+- After the user answers → PROCEED in that same reply (design the schema, run the Quality/Privacy checks, emit BEGIN_GENERATION). Ask a second round only if an answer created a genuinely new ambiguity.
+- Never ask what the user already told you, never ask the same thing twice.
 
-### BAD questions (never ask these — they signal you don't know your job):
-- "What columns would you like?" (you decide — you're the schema expert)
-- "What data types should each column be?" (your job)
-- "Should I include id columns?" (always yes)
-- "What format should the data be in?" (always NDJSON internally)
-- "Do you want timestamps?" (always yes)
-- "How many tables do you want?" (infer from the domain)
+### How to ask — each question is its own options signal on its own line
+{"type":"options","header":"Modules","question":"Which hospital areas should the database cover?","multi":true,"choices":[{"label":"Clinical core (recommended)","description":"Patients, doctors, departments, appointments, diagnoses"},{"label":"Billing & insurance","description":"Invoices, payments, insurance policies"},{"label":"Inpatient & beds","description":"Wards, beds, admissions, discharges"},{"label":"Pharmacy & labs","description":"Prescriptions, medications, lab orders and results"}]}
+{"type":"options","header":"Scale","question":"How much data should I generate?","multi":false,"choices":[{"label":"50 rows per table (recommended)","description":"Quick to review in the explorer"},{"label":"1,000 rows per table","description":"Realistic dev and test volume"},{"label":"25,000 rows per table","description":"Load and performance testing"}]}
 
-### GOOD questions (ask only when truly needed — domain-specific, with smart defaults pre-selected):
-- "For the e-commerce schema, should products have variants (size/color) or be single-SKU?" — default: single SKU
-- "Should customers have multi-currency wallets or single-currency?" — default: single
-- "For the healthcare schema, should we model multi-provider patients or single-provider?" — default: multi-provider
-- "Scale: 10 rows (quick preview), 100 rows (small), or 1000 rows (large)?" — default: 10
-- "Locale: US-based names/currencies, EU-based, or global mix?" — default: US
+Rules for every question:
+1. ONE decision per question. Never merge two decisions (BAD: "Scale and locale?" with choices like "50 rows, US-based").
+2. "header": 1-2 words, max 12 characters, naming the decision — e.g. Modules, Scale, Locale, Variants, Billing, Time range, Scope.
+3. "question": one plain sentence ending in "?", specific to THIS domain.
+4. 2-4 choices. "label" is short (2-6 words); the detail or trade-off goes in "description" (under 12 words).
+5. The recommended choice comes FIRST and its label ends with " (recommended)". In a multi-select, mark every choice you would include by default.
+6. "multi": true when choices combine (modules, features, channels, payment methods); false when they exclude each other (scale, locale, one design choice).
+7. No "Other" choice — the UI always lets the user type their own answer.
+8. Order by impact: what to model (scope/modules) → domain-specific design choices → scale → locale. Ask about locale only if the domain is locale-sensitive or the user hinted at a region.
+9. Before the questions write ONE short sentence (what you will build, why you are asking). After the questions write nothing else — no schema, no BEGIN_GENERATION in a message that asks questions.
+
+The user's reply arrives as:
+Here are my answers:
+1. <question> — <chosen label(s), or their own typed answer>
+2. …
+Typed answers are authoritative even when they differ from your choices. Then proceed.
+
+### BAD questions (never ask these):
+- "What columns would you like?" / "What data types?" (you are the schema expert)
+- "Should I include ids or timestamps?" (always yes)
+- "What format should the data be in?" / "How many tables?" (infer it)
+- Any question that merges two decisions or offers more than 4 choices.
+
+### GOOD questions (domain-specific, decisive, default first):
+- E-commerce → "Should products have variants such as size and color?" — Single SKU (recommended) / Variants table
+- SaaS → "How should billing be modelled?" — Plan subscriptions (recommended) / Usage-based / Both
+- Hospital → "Which hospital areas should the database cover?" (multi) — Clinical core (recommended) / Billing & insurance / Inpatient & beds / Pharmacy & labs
+- Any domain → "How much data should I generate?" — 50 rows per table (recommended) / 1,000 / 25,000
+- Live DB → "Which orders should be marked as shipped?" — Only paid orders (recommended) / All pending orders / Orders older than 7 days
 
 ## SCHEMA DESIGN STANDARDS
 
@@ -173,9 +196,8 @@ When the user says "add more rows", "add 50 more rows", "insert additional data"
 
 ### CRITICAL: "GENERATE MORE DATA" — USE HIGHER ROW COUNTS
 When the user asks for "a lot of data", "50 rows", "100 rows", or specifies a row count:
-- **Honor the requested row count** — do NOT default to 10 rows.
-- The generation pipeline supports up to 500 rows per table in a single request.
-- For large row counts (50+), the pipeline will make multiple API calls if needed to generate all rows.
+- **Honor the requested row count** — put the exact numbers in rowCounts.
+- The generation pipeline supports up to 100,000 rows per table and 250,000 rows per generation, and large counts are fast (a realistic AI sample is scaled up with valid foreign keys). Never refuse or shrink a large request.
 
 ### CRITICAL: RETRY LIMITS — MAX 3 ATTEMPTS
 When a SQL query fails:
@@ -206,7 +228,7 @@ Before generating INSERT statements:
 
 - Database name: based on the business domain (e.g. "ecommerce_db", "hospital_mgmt", "saas_analytics")
 - Table names: plural, snake_case (users, orders, products)
-- Row count: 10 rows per table by default (a quick preview; the user can ask for more)
+- Row count: 50 rows per table by default when the user gives no number. Honour any number the user asks for, up to 100,000 rows per table and 250,000 per generation — large counts are fast (the generator writes a realistic sample and scales it up with valid foreign keys), so never refuse or reduce a large request; put the exact numbers in rowCounts.
 - Columns: id (UUID), created_at, updated_at, plus domain-specific fields
 - Data types: UUID for ids, varchar(255) for strings, integer for counts, decimal(10,2) for money, timestamp for dates, boolean for flags
 - Locale: US-based by default (names, phone +1, USD, addresses)
@@ -228,7 +250,7 @@ ${AGENT_LIST.filter(a => a.id !== 'orchestrator').map(a => `- **${a.name}**: ${a
  * left untouched.
  */
 function sanitizeAISignals(content: string): string {
-  return content.replace(/```(?:json)?\s*\n?([\s\S]*?)\n?```/g, (full, inner: string) => {
+  return convertToolMarkup(content).replace(/```(?:json)?\s*\n?([\s\S]*?)\n?```/g, (full, inner: string) => {
     const trimmed = inner.trim()
     const isSignal =
       trimmed.startsWith('{"type":"agent_status"') ||
@@ -387,7 +409,7 @@ SELECT table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_
    - the scope of an UPDATE/DELETE (exactly which rows) before emitting it;
    - how many rows to insert when the user gave no number and the table is large/important;
    - what to do about a problem you discovered mid-task (FK violations, duplicates, NULLs, failed statement).
-   Emit the question as the inline options JSON (raw, no code fence): {"type":"options","question":"…","choices":[{"label":"… (recommended)","value":"…"},{"label":"…","value":"…"}]}. Do not emit SQL that depends on the answer in the same message — wait for the reply. Read-only exploration SQL (SELECT/SHOW/EXPLAIN) may be emitted before the question.
+   Emit each question as an inline options JSON block (raw, no code fence; several blocks allowed in one message): {"type":"options","question":"…","choices":[{"label":"… (recommended)","value":"…"},{"label":"…","value":"…"}]}. Do not emit SQL that depends on the answer in the same message — wait for the reply. Read-only exploration SQL (SELECT/SHOW/EXPLAIN) may be emitted before the question.
 
 4. **EMIT the CREATE TABLE / INSERT SQL** in a \`\`\`sql block. Do NOT wait for further confirmation — the frontend will show a confirmation dialog for mutations and execute them. Emit all related CREATE TABLE statements together in ONE SQL block when they have FK relationships so the user can review the whole design at once.
 
@@ -642,10 +664,9 @@ Never emit {"action":"BEGIN_GENERATION"…} while connected to a live database �
       stream_options: { include_usage: true },
     }
 
-    // DeepSeek v4 supports reasoning/thinking via the "thinking" field
-    if (DEEPSEEK_THINKING_ENABLED) {
-      deepseekBody.thinking = { type: 'enabled' }
-    }
+    // DeepSeek V4 models think by default, which adds seconds of latency.
+    // Turn it off explicitly unless the operator asked for it.
+    deepseekBody.thinking = { type: DEEPSEEK_THINKING_ENABLED ? 'enabled' : 'disabled' }
 
     const upstreamAbort = new AbortController()
     let timedOut = false
@@ -714,6 +735,7 @@ Never emit {"action":"BEGIN_GENERATION"…} while connected to a live database �
     // stream (e.g. navigating away mid-response). Moved to a closure
     // variable in the enclosing POST scope so both methods share it.
     let clientCancelled = false
+    let activeReader: ReadableStreamDefaultReader<Uint8Array> = reader
     const stream = new ReadableStream({
       async start(controller) {
         const decoder = new TextDecoder()
@@ -754,6 +776,7 @@ Never emit {"action":"BEGIN_GENERATION"…} while connected to a live database �
           if (!final) {
             const fences = (raw.match(/```/g) || []).length
             if (fences % 2 === 1) raw = raw.slice(0, raw.lastIndexOf('```'))
+            raw = holdBackToolMarkup(raw)
           }
           const s = sanitizeAISignals(raw)
           let from = emittedSanitized.length
@@ -766,11 +789,43 @@ Never emit {"action":"BEGIN_GENERATION"…} while connected to a live database �
           if (s.length >= from) emittedSanitized = s
         }
 
+        let lastFinish: { reason: string; usage: unknown } | null = null
         try {
+          for (let pass = 0; pass < 2; pass++) {
+          if (pass === 1) {
+            // DeepSeek V4 sometimes ends its turn on native tool-call markup
+            // (which we convert to a status signal) without writing the
+            // actual reply. Ask it once to continue in plain text.
+            const sanitizedSoFar = sanitizeAISignals(contentAccumulator)
+            const stalled =
+              /DSML/i.test(contentAccumulator) &&
+              cleanDisplayText(sanitizedSoFar).trim().length < 40 &&
+              !/BEGIN_GENERATION|"type"\s*:\s*"options"/.test(sanitizedSoFar)
+            if (!stalled || clientCancelled || timedOut || request.signal.aborted) break
+            const cont = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${DEEPSEEK_API_KEY}` },
+              body: JSON.stringify({
+                ...deepseekBody,
+                messages: [
+                  ...messages,
+                  { role: 'assistant', content: sanitizedSoFar },
+                  { role: 'user', content: 'Continue your previous reply now, in plain text. Do not use tool-call markup and do not repeat the status line.' },
+                ],
+              }),
+              signal: upstreamAbort.signal,
+            }).catch(() => null)
+            const nextReader = cont?.ok ? cont.body?.getReader() : undefined
+            if (!nextReader) break
+            activeReader = nextReader
+            buffer = ''
+            streamEnded = false
+            contentAccumulator += '\n\n'
+          }
           while (true) {
             if (clientCancelled || streamEnded) break
             resetIdle()
-            const { done, value } = await reader.read()
+            const { done, value } = await activeReader.read()
             if (done) break
             resetIdle()
 
@@ -829,16 +884,13 @@ Never emit {"action":"BEGIN_GENERATION"…} while connected to a live database �
                       message: 'Response was cut off due to token limit. The SQL block may be incomplete.',
                     })}\n\n`))
                   }
-                  sendEvent({
-                    type: 'finish',
-                    reason: choice.finish_reason,
-                    usage: parsed.usage || null,
-                  })
+                  lastFinish = { reason: choice.finish_reason, usage: parsed.usage || null }
                 }
               } catch {
                 // Skip unparseable chunks
               }
             }
+          }
           }
         } catch (err) {
           if (timedOut) {
@@ -856,6 +908,7 @@ Never emit {"action":"BEGIN_GENERATION"…} while connected to a live database �
           } catch (err) {
             console.error('[Chat API] Final flush error:', err)
           }
+          if (lastFinish) sendEvent({ type: 'finish', ...lastFinish })
           if (!doneSent) {
             doneSent = true
             sendEvent({ type: 'done' })
@@ -873,12 +926,12 @@ Never emit {"action":"BEGIN_GENERATION"…} while connected to a live database �
         clientCancelled = true
         abortUpstream()
         try {
-          await reader.cancel()
+          await activeReader.cancel()
         } catch {
           // Already released
         }
         try {
-          await reader.releaseLock()
+          await activeReader.releaseLock()
         } catch {
           // Already released
         }

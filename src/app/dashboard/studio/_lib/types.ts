@@ -37,7 +37,9 @@ export interface Message {
   reasoningContent?: string
   agentName?: string
   agentStatus?: AgentStatus | null
-  interactiveOptions?: InteractiveOptions | null
+  interactiveOptions?: InteractiveOptions[] | null
+  /** Labels/custom text chosen per question once a multi-question form was submitted */
+  optionAnswers?: string[][] | null
   generationProgress?: GenerationProgress | null
   timestamp: Date
   isStreaming?: boolean

@@ -14,7 +14,7 @@ function reply(last, sys) {
   }
   if (/list the tables/i.test(last)) return `${status('Schema Architect', 'introspecting', 20)}\nLooking at your schema.\n\n${sql('List tables', "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;")}`
   if (/add some customers/i.test(last)) return 'Before I insert anything, one question.\n\n{"type":"options","question":"How many customers should I add?","choices":[{"label":"3 customers (recommended)","value":"3"},{"label":"10 customers","value":"10"}]}'
-  if (/^\s*3\b/.test(last)) return `${status('Data Generator', 'inserting customers', 60)}\n${sql('Insert 3 customers', "INSERT INTO customers (name, email) VALUES ('Dee', 'dee@example.com'), ('Eve', 'eve@example.com'), ('Fay', 'fay@example.com');")}`
+  if (/^\s*3\b/.test(last) || /^Here are my answers:[\s\S]*— 3 customers/.test(last)) return `${status('Data Generator', 'inserting customers', 60)}\n${sql('Insert 3 customers', "INSERT INTO customers (name, email) VALUES ('Dee', 'dee@example.com'), ('Eve', 'eve@example.com'), ('Fay', 'fay@example.com');")}`
   if (/loyalty_tier column/i.test(last)) return sql('Add loyalty tier', 'ALTER TABLE customers ADD COLUMN loyalty_tier TEXT;')
   if (/mark ann as gold/i.test(last)) return sql('Ann is gold', "UPDATE customers SET loyalty_tier = 'gold' WHERE name = 'Ann';")
   if (/how many products/i.test(last)) return sql('Count products', 'SELECT COUNT(*) AS n FROM produkts;')

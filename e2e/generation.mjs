@@ -83,7 +83,7 @@ check('unknown databaseId → 404', (await api('POST', '/api/generate-stream', {
   check('nasty AI: FKs, PKs, unique emails, date order all valid', ig.fk && ig.pk && ig.emails && ig.dates, JSON.stringify(ig))
   check('nasty AI: numbers coerced', db.data_json.orders.every(o => o.total === null || typeof o.total === 'number'))
   check('nasty AI: real quality score (<1)', typeof db.quality_score === 'number' && db.quality_score < 1)
-  check('nasty AI: Quality Analyst reported fixes', r.events.some(e => /Quality Analyst: fixed/.test(e.message || '')))
+  check('nasty AI: Quality Analyst reported fixes', r.events.some(e => /Quality Analyst: repaired [0-9,]+ value/.test(e.message || '')))
 }
 
 // ─── scale-up keeps integrity ───
@@ -129,13 +129,35 @@ check('unknown databaseId → 404', (await api('POST', '/api/generate-stream', {
   check('server healthy afterwards', (await fetch(B + '/api/health')).status === 200)
 }
 
-// ─── AI service down ───
+// ─── AI service down → built-in generator fills in, generation still succeeds ───
 {
-  const r = await generate({ databaseName: 'ai-down', schema, rowCounts: { users: 3, orders: 3 } })
-  const err = r.events.find(e => e.type === 'error')
-  check('AI down: error event with message', !!err && /AI service error \(503\)/.test(err.message), JSON.stringify(r.events.slice(-2)))
-  const db = (await api('GET', `/api/databases?id=${r.databaseId}`)).json.database
-  check('AI down: database not stuck in generating', db.status !== 'generating', db.status)
+  const r = await generate({ databaseName: 'ai-down', schema, rowCounts: { users: 300, orders: 900 } })
+  const note = r.events.find(e => /built-in generator/.test(e.message || ''))
+  check('AI down: user is told the built-in generator was used', !!note, JSON.stringify(r.events.slice(-3)))
+  const db = (await waitReady(r.databaseId)).json.database
+  const ig = integrity(db)
+  check('AI down: generation completes with all rows', r.events.some(e => e.type === 'complete') && db.table_counts.users === 300 && db.table_counts.orders === 900, JSON.stringify(db.table_counts))
+  check('AI down: fallback data keeps integrity', ig.fk && ig.pk && ig.emails && ig.dates, JSON.stringify(ig))
+}
+
+// ─── thousands of rows across many tables, fast ───
+{
+  const many = ['customers', 'products', 'orders', 'order_items', 'reviews'].map(n => ({ name: n, columns: [
+    { name: 'id', type: 'uuid' },
+    ...(n === 'orders' ? [{ name: 'customer_id', type: 'uuid' }] : []),
+    ...(n === 'order_items' ? [{ name: 'order_id', type: 'uuid' }, { name: 'product_id', type: 'uuid' }, { name: 'quantity', type: 'int' }] : []),
+    ...(n === 'reviews' ? [{ name: 'product_id', type: 'uuid' }, { name: 'customer_id', type: 'uuid' }, { name: 'rating', type: 'int' }] : []),
+    { name: 'name', type: 'text' }, { name: 'created_at', type: 'timestamp' },
+  ] }))
+  const t0 = Date.now()
+  const r = await generate({ databaseName: 'bulk', schema: many, rowCounts: { customers: 5000, products: 2000, orders: 20000, order_items: 50000, reviews: 10000 } })
+  const secs = (Date.now() - t0) / 1000
+  const db = (await waitReady(r.databaseId)).json.database
+  check(`bulk: 87,000 rows across 5 tables (${secs.toFixed(1)}s)`, db.row_count === 87000 && secs < 60, `${db.row_count} rows in ${secs}s`)
+  const d = db.data_json
+  const ids = Object.fromEntries(Object.entries(d).map(([t, rows]) => [t, new Set(rows.map(x => x.id))]))
+  const fkOk = d.orders.every(o => ids.customers.has(o.customer_id)) && d.order_items.every(i => ids.orders.has(i.order_id) && ids.products.has(i.product_id)) && d.reviews.every(v => ids.products.has(v.product_id) && ids.customers.has(v.customer_id))
+  check('bulk: every foreign key points at a real row', fkOk)
 }
 
 // ─── another user cannot see or stop my jobs ───

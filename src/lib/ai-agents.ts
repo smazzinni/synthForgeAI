@@ -193,14 +193,32 @@ export function parseAllInteractiveOptions(content: string): InteractiveOptions[
         // Handle both {"type":"options",...} and {"options":{...}} formats
         const opts = parsed?.type === 'options' ? parsed : (parsed?.options || null)
         if (opts && Array.isArray(opts.choices)) {
-          results.push({
-            question: String(opts.question || ''),
-            choices: opts.choices.map((c: { label?: string; value?: string }) => ({
-              label: String(c.label || c.value || ''),
-              value: String(c.value || c.label || ''),
-            })),
-            multi: Boolean(opts.multi),
-          })
+          const choices: OptionChoice[] = []
+          const seen = new Set<string>()
+          for (const raw of opts.choices as Array<Record<string, unknown> | string>) {
+            const c = typeof raw === 'string' ? { label: raw } : raw || {}
+            let label = String(c.label || c.value || '').trim()
+            if (!label) continue
+            // Accept {"recommended": true} as well as a "(recommended)" suffix.
+            if (c.recommended === true && !/recommended/i.test(label)) label += ' (recommended)'
+            if (seen.has(label)) continue
+            seen.add(label)
+            const description = typeof c.description === 'string' ? c.description.trim() : ''
+            choices.push({
+              label,
+              value: String(c.value || c.label || label),
+              ...(description ? { description } : {}),
+            })
+          }
+          if (choices.length > 0) {
+            const header = typeof opts.header === 'string' ? opts.header.trim().slice(0, 24) : ''
+            results.push({
+              question: String(opts.question || ''),
+              choices,
+              multi: Boolean(opts.multi),
+              ...(header ? { header } : {}),
+            })
+          }
         }
       } catch {
         // Not parseable, skip
@@ -223,12 +241,125 @@ export function parseAllInteractiveOptions(content: string): InteractiveOptions[
 export interface OptionChoice {
   label: string
   value: string
+  /** Optional one-line trade-off shown under the label. */
+  description?: string
 }
 
 export interface InteractiveOptions {
   question: string
   choices: OptionChoice[]
   multi: boolean
+  /** Optional short topic chip, e.g. "Scale" or "Modules". */
+  header?: string
+}
+
+/**
+ * Some models (DeepSeek V4) occasionally answer with their native tool-call
+ * markup instead of the plain-text JSON signals we ask for, e.g.
+ *   <｜DSML｜function_calls>
+ *   <｜DSML｜invoke name="agent_status" agent="Schema Architect" progress="10">
+ *   </｜DSML｜invoke>
+ *   </｜DSML｜function_calls>
+ * Convert each invoke into the equivalent one-line JSON signal and drop the
+ * remaining markup so users never see it. Parameters may come as tag
+ * attributes or as <parameter name="x">value</parameter> children.
+ */
+const TOOL_TAG = /<\/?\s*[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*([a-z_]*)([^>]*?)\/?>/gi
+const KNOWN_SIGNALS = new Set(['agent_status', 'options', 'follow_up', 'recommendation'])
+
+function readAttrs(s: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const m of s.matchAll(/([a-zA-Z_][\w-]*)\s*=\s*"([^"]*)"/g)) out[m[1]] = m[2]
+  return out
+}
+
+function coerce(v: string): unknown {
+  const t = v.trim()
+  if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t)
+  if (t === 'true' || t === 'false') return t === 'true'
+  if (/^[[{]/.test(t)) {
+    try { return JSON.parse(t) } catch { /* keep as text */ }
+  }
+  return t
+}
+
+/**
+ * While streaming, hold back an unfinished tool-call block (or a tag that is
+ * still being written) so the client never sees half-converted markup. The
+ * final flush releases everything.
+ */
+export function holdBackToolMarkup(raw: string): string {
+  if (/DSML/i.test(raw)) {
+    const opens = [...raw.matchAll(/<\s*[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*(?:function_)?calls\b/gi)]
+    const closes = [...raw.matchAll(/<\/\s*[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*(?:function_)?calls\b/gi)]
+    const lastOpen = opens.length ? opens[opens.length - 1].index! : -1
+    const lastClose = closes.length ? closes[closes.length - 1].index! : -1
+    if (lastOpen > lastClose) return raw.slice(0, lastOpen)
+    const inv = [...raw.matchAll(/<\s*[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*invoke\b[^>]*?(\/?)>/gi)]
+    const invClose = [...raw.matchAll(/<\/\s*[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*invoke\b/gi)]
+    const lastInv = inv.length && !inv[inv.length - 1][1] ? inv[inv.length - 1].index! : -1
+    const lastInvClose = invClose.length ? invClose[invClose.length - 1].index! : -1
+    if (lastInv > lastInvClose) return raw.slice(0, lastInv)
+  }
+  const lt = raw.lastIndexOf('<')
+  if (lt >= 0 && raw.indexOf('>', lt) === -1 && raw.length - lt < 120) return raw.slice(0, lt)
+  return raw
+}
+
+export function convertToolMarkup(text: string): string {
+  if (!/DSML/i.test(text)) return text
+  // Collect invokes with their parameters, in order, then rebuild.
+  type Inv = { name: string; params: Record<string, unknown> }
+  const out: string[] = []
+  let cur: Inv | null = null
+  let paramName: string | null = null
+  let paramStart = 0
+  let last = 0
+  const flush = (inv: Inv | null) => {
+    if (!inv) return
+    const name = inv.name
+    if (name === 'BEGIN_GENERATION' || inv.params.action === 'BEGIN_GENERATION') {
+      out.push('\n' + JSON.stringify({ action: 'BEGIN_GENERATION', ...inv.params }) + '\n')
+    } else if (KNOWN_SIGNALS.has(name)) {
+      const { type: _t, ...rest } = inv.params
+      void _t
+      out.push('\n' + JSON.stringify({ type: name, ...rest }) + '\n')
+    }
+  }
+  for (const m of text.matchAll(TOOL_TAG)) {
+    const idx = m.index!
+    const closing = m[0].startsWith('</')
+    const kind = m[1].toLowerCase()
+    const between = text.slice(last, idx)
+    if (paramName && cur) {
+      // text between <parameter> and </parameter> is the value
+      if (closing && kind === 'parameter') {
+        cur.params[paramName] = coerce(text.slice(paramStart, idx))
+        paramName = null
+      }
+    } else if (!cur) {
+      out.push(between)
+    }
+    if (!closing && kind === 'invoke') {
+      const attrs = readAttrs(m[2])
+      const { name = '', ...rest } = attrs
+      cur = { name, params: Object.fromEntries(Object.entries(rest).map(([k, v]) => [k, coerce(v)])) }
+      if (/\/>$/.test(m[0])) { flush(cur); cur = null }
+    } else if (!closing && kind === 'parameter' && cur) {
+      const attrs = readAttrs(m[2])
+      if (attrs.name && !/\/>$/.test(m[0])) { paramName = attrs.name; paramStart = idx + m[0].length }
+    } else if (closing && kind === 'invoke') {
+      flush(cur)
+      cur = null
+    }
+    last = idx + m[0].length
+  }
+  // An invoke still open at the end (cut-off reply): keep what we parsed,
+  // drop its unterminated body.
+  const unterminated = cur !== null
+  flush(cur)
+  if (!unterminated) out.push(text.slice(last))
+  return out.join('')
 }
 
 // ─── BEGIN_GENERATION signal types ───
@@ -282,7 +413,7 @@ export function parseBeginGeneration(content: string): BeginGenerationSignal | n
  * Handles multiline JSON, nested objects, and various format variations.
  */
 export function cleanDisplayText(content: string): string {
-  let cleaned = content
+  let cleaned = convertToolMarkup(content)
 
   // Remove agent_status blocks — find each one and remove it
   const agentStatusMarker = '{"type":"agent_status"'
@@ -293,6 +424,7 @@ export function cleanDisplayText(content: string): string {
   const optionsMarker = '{"type":"options"'
   const optionsMarkerLoose = '{"type": "options"'
   cleaned = removeJsonBlocks(cleaned, optionsMarker, optionsMarkerLoose)
+  cleaned = removeJsonBlocks(cleaned, '{"options":{', '{"options": {')
 
   // Remove follow_up and recommendation blocks
   const followUpMarker = '{"type":"follow_up"'
@@ -312,7 +444,7 @@ export function cleanDisplayText(content: string): string {
   cleaned = cleaned.replace(/^\s*\{"(?:type"\s*:\s*"(?:agent_status|options|follow_up|recommendation)"|action"\s*:\s*"BEGIN_GENERATION")[^}]*\}\s*$/gm, '')
 
   // Remove empty code fences left after JSON extraction
-  cleaned = cleaned.replace(/```\s*\n?\s*```/g, '')
+  cleaned = cleaned.replace(/```(?:json)?\s*\n?\s*```/g, '')
 
   // Remove orphaned code fences with only whitespace or JSON commands
   cleaned = cleaned.replace(/```(?:json)?\s*\n?\s*\{"type"\s*:\s*"(?:agent_status|options)"[\s\S]*?\n?\s*```/g, '')

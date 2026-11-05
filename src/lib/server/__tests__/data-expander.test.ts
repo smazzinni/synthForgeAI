@@ -83,3 +83,42 @@ describe('expandDataset — realism', () => {
     expect(new Set(out.c.map(r => r.company)).size).toBeGreaterThan(20)
   })
 })
+
+describe('synthesizeTable (no-AI fallback)', () => {
+  it('builds typed, realistic rows from the schema alone', async () => {
+    const { synthesizeTable } = await import('../data-expander')
+    const rows = synthesizeTable({ name: 'customers', columns: [
+      { name: 'id', type: 'uuid' }, { name: 'full_name', type: 'varchar(100)' }, { name: 'email', type: 'varchar' },
+      { name: 'age', type: 'int' }, { name: 'is_active', type: 'boolean' }, { name: 'balance', type: 'numeric(10,2)' },
+      { name: 'created_at', type: 'timestamp' }, { name: 'updated_at', type: 'timestamp' }, { name: 'account_id', type: 'uuid' },
+    ] }, 50, { seed: 1 })
+    expect(rows).toHaveLength(50)
+    expect(new Set(rows.map(r => r.id)).size).toBe(50)
+    expect(new Set(rows.map(r => r.email)).size).toBe(50)
+    for (const r of rows) {
+      expect(typeof r.age).toBe('number')
+      expect(typeof r.is_active).toBe('boolean')
+      expect(typeof r.balance).toBe('number')
+      expect(String(r.full_name).split(' ').length).toBeGreaterThanOrEqual(2)
+      expect(r.account_id).toBeNull()
+      expect(String(r.updated_at) >= String(r.created_at)).toBe(true)
+    }
+  })
+})
+
+describe('expandDataset — temporal order', () => {
+  it('dates expanded children at or after their parent', () => {
+    const t = [
+      { name: 'users', columns: [{ name: 'id', type: 'uuid' }, { name: 'created_at', type: 'timestamp' }] },
+      { name: 'orders', columns: [{ name: 'id', type: 'uuid' }, { name: 'user_id', type: 'uuid' }, { name: 'created_at', type: 'timestamp' }] },
+    ]
+    const seed = {
+      users: [{ id: 'u1', created_at: '2024-01-01T00:00:00.000Z' }, { id: 'u2', created_at: '2025-06-01T00:00:00.000Z' }],
+      orders: [{ id: 'o1', user_id: 'u1', created_at: '2024-02-01T00:00:00.000Z' }, { id: 'o2', user_id: 'u2', created_at: '2025-07-01T00:00:00.000Z' }],
+    }
+    const out = expandDataset(t, seed, { users: 500, orders: 3000 }, { seed: 9 })
+    const byId = new Map(out.users.map(u => [u.id, u]))
+    const bad = out.orders.filter(o => String(o.created_at) < String(byId.get(o.user_id)?.created_at))
+    expect(bad).toHaveLength(0)
+  })
+})

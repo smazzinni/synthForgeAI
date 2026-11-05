@@ -152,29 +152,26 @@ export async function addMessagesPrisma(
   conversationId: string,
   messages: Array<{ role: string; content: string; agentName?: string }>
 ): Promise<boolean> {
-  try {
-    // Verify the conversation exists
-    const conv = await db.conversation.findFirst({ where: { id: conversationId, userId } })
-    if (!conv) return false
+  // Errors propagate so callers can fall back to the in-memory store;
+  // a missing (or someone else's) conversation returns false.
+  const conv = await db.conversation.findFirst({ where: { id: conversationId, userId } })
+  if (!conv) return false
 
-    await db.$transaction([
-      db.message.createMany({
+  await db.$transaction([
+    db.message.createMany({
       data: messages.map(m => ({
         conversationId,
         role: m.role,
         content: m.content,
         agentName: m.agentName || null,
       })),
-      }),
-      db.conversation.update({
-        where: { id: conversationId },
-        data: { updatedAt: new Date() },
-      }),
-    ])
-    return true
-  } catch {
-    return false
-  }
+    }),
+    db.conversation.update({
+      where: { id: conversationId },
+      data: { updatedAt: new Date() },
+    }),
+  ])
+  return true
 }
 
 export async function deleteConversationPrisma(userId: string, id: string): Promise<boolean> {
